@@ -2,6 +2,7 @@
 // `/api/admin/:tool` endpoint. Callers must already have checked the admin key.
 import { z } from "zod";
 import { describeApp } from "./describe.ts";
+import { visibilityOf } from "./storage.ts";
 import type { Engine } from "./engine.ts";
 import { VERSION } from "./version.ts";
 
@@ -122,6 +123,25 @@ export function adminTools(engine: Engine): Record<string, AdminTool> {
       run: async (a) => {
         await engine.writeTx((s) => s.delete(a.id));
         return { deleted: a.id };
+      },
+    },
+    admin_file_url: {
+      description: "Download URL for a stored file (_storage id). Private files get a signed URL valid for expiresIn seconds.",
+      input: z.object({ id: z.string(), expiresIn: z.number().positive().max(7 * 24 * 3600).default(3600) }),
+      readOnly: true,
+      run: async (a) => {
+        const doc = (await engine.readTx((s) => s.get("_storage", a.id))).result;
+        if (!doc) throw new Error(`File "${a.id}" not found`);
+        return { url: engine.storage.urlFor(doc, { expiresIn: a.expiresIn }), visibility: visibilityOf(doc) };
+      },
+    },
+    admin_set_file_visibility: {
+      description: "Make a stored file public (plain URL works) or private (only signed, expiring URLs work).",
+      input: z.object({ id: z.string(), visibility: z.enum(["public", "private"]) }),
+      readOnly: false,
+      run: async (a) => {
+        await engine.writeTx((s) => engine.storage.setVisibilityIn(s, a.id, a.visibility));
+        return (await engine.readTx((s) => s.get("_storage", a.id))).result;
       },
     },
     admin_run_function: {

@@ -42,6 +42,11 @@ export const send = mutation({
   handler: async (ctx, args) => {
     const user = await ctx.auth.requireUser();
     if (!(await ctx.db.get(args.channel))) throw new IncibaseError({ code: "NOT_FOUND", message: "No such channel" });
+    // Only attach your own uploads; otherwise anyone could reference someone else's file by id.
+    if (args.attachment) {
+      const file = await ctx.storage.getMetadata(args.attachment);
+      if (!file || file.ownerId !== user._id) throw new IncibaseError({ code: "FORBIDDEN", message: "You can only attach your own files" });
+    }
     const messageId = await ctx.db.insert("messages", { ...args, author: user._id });
     await ctx.scheduler.runAfter(0, internal.messages.bumpCount, { key: "messages" });
     return messageId;

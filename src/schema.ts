@@ -101,7 +101,17 @@ export type SystemDataModel = {
     indexes: { by_creation_time: ["_creationTime"]; by_email: ["email"] };
   };
   _storage: {
-    document: Expand<SystemFields<"_storage"> & { contentType?: string; size: number; sha256: string }>;
+    /** `visibility` is missing on files stored before it existed; treat that as "public". */
+    document: Expand<
+      SystemFields<"_storage"> & {
+        contentType?: string;
+        size: number;
+        sha256: string;
+        visibility?: "public" | "private";
+        /** The user who uploaded it; missing for admin uploads and files stored before ownership existed. */
+        ownerId?: Id<"_users">;
+      }
+    >;
     insert: never;
     indexes: { by_creation_time: ["_creationTime"] };
   };

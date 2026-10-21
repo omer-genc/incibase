@@ -225,6 +225,120 @@ describe("storage", () => {
     expect(await res.text()).toBe("hello file");
   });
 
+  test("private files open only through signed, unexpired URLs", async () => {
+    const uploadUrl = await alice.mutation(api.files.generateUploadUrl, { visibility: "private" });
+    const id = await alice.storage.upload(uploadUrl, new Blob(["secret"], { type: "text/plain" }));
+    expect((await alice.query(api.files.url, { id }))).toContain("&sig=");
+
+    const plain = await fetch(`${t.url}/api/storage/${id}`);
+    expect(plain.status).toBe(403);
+
+    const signed = (await alice.query(api.files.url, { id }))!;
+    const res = await fetch(signed);
+    expect(await res.text()).toBe("secret");
+    expect(res.headers.get("cache-control")).toStartWith("private");
+
+    const tampered = signed.replace(/sig=[^&]+/, "sig=AAAA");
+    expect((await fetch(tampered)).status).toBe(403);
+    const otherFile = await alice.action(api.files.storeText, { text: "x", visibility: "private" });
+    expect((await fetch(signed.replace(id, otherFile))).status).toBe(403);
+  });
+
+  test("signed URLs expire and are stable within their time bucket", async () => {
+    const id = await alice.action(api.files.storeText, { text: "short", visibility: "private" });
+    const a = (await alice.query(api.files.url, { id, expiresIn: 1 }))!;
+    const b = (await alice.query(api.files.url, { id, expiresIn: 1 }))!;
+    expect(a).toBe(b);
+    expect((await fetch(a)).status).toBe(200);
+    await Bun.sleep(2100);
+    const expired = await fetch(a);
+    expect(expired.status).toBe(403);
+    expect(await expired.text()).toContain("expired");
+  });
+
+  test("public files keep plain URLs; visibility can change later", async () => {
+    const id = await alice.action(api.files.storeText, { text: "hello", visibility: "public" });
+    const url = (await alice.query(api.files.url, { id }))!;
+    expect(url).toBe(`${t.url}/api/storage/${id}`);
+    expect((await fetch(url)).status).toBe(200);
+
+    await alice.mutation(api.files.setVisibility, { id, visibility: "private" });
+    expect((await fetch(url)).status).toBe(403);
+    expect((await alice.query(api.files.url, { id }))).toContain("&sig=");
+
+    await alice.mutation(api.files.setVisibility, { id, visibility: "public" });
+    expect((await fetch(url)).status).toBe(200);
+  });
+
+  test("other users cannot read, change or attach someone else's private file", async () => {
+    const uploadUrl = await alice.mutation(api.files.generateUploadUrl, { visibility: "private" });
+    const payslip = await alice.storage.upload(uploadUrl, new Blob(["salary: 100"], { type: "application/pdf" }));
+    expect((await alice.query(api.files.url, { id: payslip }))).toContain("&sig=");
+
+    // Bob knows the id but gets no URL, cannot flip it public, and cannot attach it to a message.
+    expect(await bob.query(api.files.url, { id: payslip })).toBeNull();
+    const flip = await bob.mutation(api.files.setVisibility, { id: payslip, visibility: "public" }).catch((e) => e);
+    expect(flip.data.code).toBe("FORBIDDEN");
+    const attach = await bob.mutation(api.messages.send, { channel: general, body: "look", attachment: payslip }).catch((e) => e);
+    expect(attach.data.code).toBe("FORBIDDEN");
+    expect((await fetch(`${t.url}/api/storage/${payslip}`)).status).toBe(403);
+    expect(await t.client().query(api.files.url, { id: payslip })).toBeNull();
+
+    // Code that checked access itself can share it explicitly.
+    const res = await fetch(`${t.url}/api/query`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${t.engine.adminKey}` },
+      body: JSON.stringify({ path: "files:urlForReviewer", args: { id: payslip } }),
+    });
+    const shared = ((await res.json()) as { value: string }).value;
+    expect(await (await fetch(shared)).text()).toBe("salary: 100");
+  });
+
+  test("uploads are owned by the user who asked for the upload URL", async () => {
+    const uploadUrl = await bob.mutation(api.files.generateUploadUrl, {});
+    const id = await bob.storage.upload(uploadUrl, new Blob(["bob's"]));
+    const meta = (await (
+      await fetch(`${t.url}/api/admin/admin_get_document`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${t.engine.adminKey}` },
+        body: JSON.stringify({ id }),
+      })
+    ).json()) as any;
+    expect(meta.value.document.ownerId).toBe((await bob.auth.me())!._id);
+    expect(meta.value.document.visibility).toBe("public");
+  });
+
+  test("HR uploads a payslip on an employee's behalf; access follows the payslips table", async () => {
+    const carol = t.client();
+    await carol.auth.signUp({ email: "carol@example.com", password: "password123" });
+    const aliceId = (await alice.auth.me())!._id;
+    const bobId = (await bob.auth.me())!._id;
+
+    // Not HR yet.
+    expect((await alice.mutation(api.payslips.generateUploadUrl, { employee: bobId }).catch((e) => e)).data.code).toBe("FORBIDDEN");
+    await t.engine.writeTx((s) => s.insert("hr", { userId: aliceId }));
+
+    const uploadUrl = await alice.mutation(api.payslips.generateUploadUrl, { employee: bobId });
+    const file = await alice.storage.upload(uploadUrl, new Blob(["bob: 100"], { type: "application/pdf" }));
+    await alice.mutation(api.payslips.add, { employee: bobId, month: "2026-09", file });
+
+    // Bob owns the file and sees his payslip; HR sees it through the table; Carol sees nothing.
+    const [mine] = await bob.query(api.payslips.mine);
+    expect(await (await fetch(mine!.url!)).text()).toBe("bob: 100");
+    expect(await bob.query(api.files.url, { id: file })).toContain("&sig=");
+    const [hrView] = await alice.query(api.payslips.forEmployee, { employee: bobId });
+    expect(hrView!.url).toContain("&sig=");
+    expect(await alice.query(api.files.url, { id: file })).toBeNull();
+    expect(await carol.query(api.payslips.mine)).toEqual([]);
+    expect(await carol.query(api.files.url, { id: file })).toBeNull();
+    expect((await carol.query(api.payslips.forEmployee, { employee: bobId }).catch((e) => e)).data.code).toBe("FORBIDDEN");
+
+    // A file uploaded for someone else cannot be filed as a payslip for a third person.
+    const other = await alice.storage.upload(await alice.mutation(api.payslips.generateUploadUrl, { employee: bobId }), new Blob(["x"]));
+    const misfile = await alice.mutation(api.payslips.add, { employee: (await carol.auth.me())!._id, month: "2026-09", file: other }).catch((e) => e);
+    expect(misfile.data.code).toBe("BAD_REQUEST");
+  });
+
   test("upload URLs must be signed", async () => {
     const res = await fetch(`${t.url}/api/storage/upload?token=forged.sig`, { method: "POST", body: "x" });
     expect(res.status).toBe(403);

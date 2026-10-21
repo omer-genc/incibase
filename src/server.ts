@@ -96,20 +96,56 @@ export interface Auth {
   readonly isAdmin: boolean;
 }
 
+export type FileVisibility = "public" | "private";
+
+export interface OwnerCheckOptions {
+  /**
+   * Files belong to the user who uploaded them. Private files can only be read,
+   * and any file can only be changed or deleted, by its owner (or the admin).
+   * Pass true when your code has checked access itself, e.g. an HR role
+   * reading an employee's payslip.
+   */
+  bypassOwnerCheck?: boolean;
+}
+
+export interface UploadOptions {
+  visibility?: FileVisibility;
+  /**
+   * Who owns the new file. Defaults to the calling user. Set it to upload on
+   * someone's behalf (e.g. HR uploading an employee's payslip makes the
+   * employee the owner), or null for a file only server code can hand out.
+   */
+  ownerId?: Id<"_users"> | null;
+}
+
 export interface StorageReader {
-  getUrl(id: Id<"_storage">): Promise<string | null>;
+  /**
+   * URL to download a file. Public files get a plain, permanent URL. Private
+   * files get a signed URL that stops working after `expiresIn` seconds
+   * (default 3600), and only for their owner unless `bypassOwnerCheck`.
+   * Null if the file does not exist or the caller may not read it.
+   */
+  getUrl(id: Id<"_storage">, options?: OwnerCheckOptions & { expiresIn?: number }): Promise<string | null>;
+  /** Includes `ownerId`, so code can check a file belongs to the user before storing a reference to it. */
   getMetadata(id: Id<"_storage">): Promise<SystemDataModel["_storage"]["document"] | null>;
 }
 
 export interface StorageWriter extends StorageReader {
-  /** A short-lived URL the client can POST a file body to. The response is `{ storageId }`. */
-  generateUploadUrl(): Promise<string>;
-  delete(id: Id<"_storage">): Promise<void>;
+  /**
+   * A one-hour URL the client can POST a file body to; the response is
+   * `{ storageId }`. The file is public unless `visibility: "private"`.
+   */
+  generateUploadUrl(options?: UploadOptions): Promise<string>;
+  /** Owner only (see OwnerCheckOptions). Making a file private invalidates its plain URL. */
+  setVisibility(id: Id<"_storage">, visibility: FileVisibility, options?: OwnerCheckOptions): Promise<void>;
+  /** Owner only (see OwnerCheckOptions). */
+  delete(id: Id<"_storage">, options?: OwnerCheckOptions): Promise<void>;
 }
 
 export interface StorageActionWriter extends StorageWriter {
-  get(id: Id<"_storage">): Promise<Blob | null>;
-  store(blob: Blob, options?: { contentType?: string }): Promise<Id<"_storage">>;
+  /** The file's contents; null if missing or private to someone else. */
+  get(id: Id<"_storage">, options?: OwnerCheckOptions): Promise<Blob | null>;
+  store(blob: Blob, options?: UploadOptions & { contentType?: string }): Promise<Id<"_storage">>;
 }
 
 type SchedulableReference = FunctionReference<"mutation" | "action", FunctionVisibility>;

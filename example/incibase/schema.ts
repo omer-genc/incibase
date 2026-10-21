@@ -14,6 +14,16 @@ export default defineSchema({
     pinned: z.boolean().default(false),
   }).index("by_channel", ["channel"]),
 
+  /** Users allowed to upload and read everyone's payslips. Add rows from the dashboard. */
+  hr: defineTable({ userId: id("_users") }).index("by_user", ["userId"], { unique: true }),
+
+  payslips: defineTable({
+    employee: id("_users"),
+    month: z.string().regex(/^\d{4}-\d{2}$/),
+    file: id("_storage"),
+    uploadedBy: id("_users"),
+  }).index("by_employee", ["employee", "month"]),
+
   stats: defineTable({
     key: z.string(),
     value: z.number(),

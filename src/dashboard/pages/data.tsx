@@ -4,7 +4,9 @@ import {
   DatabaseIcon,
   ExternalLinkIcon,
   FilterIcon,
+  GlobeIcon,
   Loader2Icon,
+  LockIcon,
   PencilIcon,
   PlusIcon,
   RefreshCwIcon,
@@ -28,7 +30,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { admin, ID_PATTERN, type AppInfo, type Doc, type Page, type TableInfo } from "@/lib/api";
 import { formatDateTime, plural } from "@/lib/format";
-import { useNow, useStoredState } from "@/lib/hooks";
+import { useAsync, useNow, useStoredState } from "@/lib/hooks";
 import { describeSchema, refTable, sample } from "@/lib/schema";
 import { cn } from "@/lib/utils";
 
@@ -517,7 +519,9 @@ function DocumentSheet({ app, table, doc, onClose, onChanged }: { app: AppInfo; 
                       </div>
                     ))}
                 </dl>
-                {top?.table === "_storage" && <StoragePreview doc={current} />}
+                {top?.table === "_storage" && (
+                  <StoragePreview doc={current} onUpdated={(updated) => setStack((st) => [...st.slice(0, -1), { table: "_storage", doc: updated }])} />
+                )}
               </TabsContent>
               <TabsContent value="json" className="mt-3">
                 <JsonView value={current} />
@@ -576,17 +580,55 @@ function FieldValue({ value, refTo, onOpen }: { value: unknown; refTo?: string; 
   return <ValueCell value={value} />;
 }
 
-function StoragePreview({ doc }: { doc: Doc }) {
-  const url = `/api/storage/${doc._id}`;
+function StoragePreview({ doc, onUpdated }: { doc: Doc; onUpdated: (doc: Doc) => void }) {
   const type = typeof doc.contentType === "string" ? doc.contentType : "";
+  const visibility = doc.visibility === "private" ? "private" : "public";
+  const [busy, setBusy] = useState(false);
+  // Private files only open through a signed URL, so ask the server for one.
+  const link = useAsync(() => admin<{ url: string }>("admin_file_url", { id: doc._id, expiresIn: 600 }), [doc._id, visibility]);
+
+  const toggle = async () => {
+    setBusy(true);
+    try {
+      const next = visibility === "public" ? "private" : "public";
+      const updated = await admin<Doc>("admin_set_file_visibility", { id: doc._id, visibility: next });
+      toast.success(next === "private" ? "File is now private" : "File is now public", {
+        description: next === "private" ? "Its plain URL stops working; apps get signed, expiring URLs." : "Anyone with its URL can open it.",
+      });
+      onUpdated(updated);
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
-    <div className="mt-4 space-y-3">
-      {type.startsWith("image/") && <img src={url} alt="" className="max-h-72 rounded-lg border object-contain" />}
-      <Button variant="outline" size="sm" asChild>
-        <a href={url} target="_blank" rel="noreferrer">
-          <ExternalLinkIcon /> Open file
-        </a>
-      </Button>
+    <div className="mt-4 space-y-3 rounded-lg border p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge variant={visibility === "private" ? "secondary" : "outline"}>
+          {visibility === "private" ? <LockIcon /> : <GlobeIcon />} {visibility}
+        </Badge>
+        <span className="text-xs text-muted-foreground">
+          {visibility === "private" ? "Opens only through signed, expiring URLs." : "Anyone with the URL can open it."}
+        </span>
+        <Button variant="outline" size="sm" className="ml-auto" onClick={toggle} disabled={busy}>
+          {busy && <Loader2Icon className="animate-spin" />}
+          Make {visibility === "public" ? "private" : "public"}
+        </Button>
+      </div>
+      {link.data && type.startsWith("image/") && <img src={link.data.url} alt="" className="max-h-72 rounded-md border object-contain" />}
+      {link.error && <ErrorAlert error={link.error} />}
+      {link.data && (
+        <div className="flex items-center gap-2">
+          <Button variant="outline" size="sm" asChild>
+            <a href={link.data.url} target="_blank" rel="noreferrer">
+              <ExternalLinkIcon /> Open file
+            </a>
+          </Button>
+          <CopyButton value={link.data.url} label={visibility === "private" ? "Copy signed URL (valid 10 min)" : "Copy URL"} />
+        </div>
+      )}
     </div>
   );
 }

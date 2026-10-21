@@ -76,12 +76,31 @@ export const send = mutation({
 
 `ctx.db`: `get`, `query(...).withIndex/where/filter/order/collect/take/first/unique/paginate/count`, `insert`, `patch`, `replace`, `delete`.
 `ctx.auth`: `getUserId`, `getUser`, `requireUser`, `isAdmin`.
-`ctx.storage`: `getUrl`, `getMetadata`, `generateUploadUrl`, `delete` (action'larda ayrıca `get`, `store`).
+`ctx.storage`: `getUrl`, `getMetadata`, `generateUploadUrl`, `setVisibility`, `delete` (action'larda ayrıca `get`, `store`) — bkz. [Dosyalar ve erişim](#dosyalar-ve-erişim).
 `ctx.scheduler`: `runAfter`, `runAt`, `cancel`; mutation içinde transaction'ın parçasıdır.
 
 Mutation'lar sırayla, her biri ayrı bir SQLite transaction'ında çalışır; hata atarsa her şey geri alınır. Query'ler ayrı bir okuma bağlantısında son commit edilmiş snapshot'ı görür. İstemciye gitmesi gereken hatalar için `throw new IncibaseError({ code, message })`.
 
 `crons.ts` (`cronJobs()` + `interval`/`cron`) ve `http.ts` (`httpRouter()` + `httpAction`) default export olarak tanınır.
+
+## Dosyalar ve erişim
+
+```ts
+// Yükleme: istemci bu URL'ye dosyayı POST eder, yanıt { storageId }.
+await ctx.storage.generateUploadUrl();                          // public, sahibi çağıran kullanıcı
+await ctx.storage.generateUploadUrl({ visibility: "private" }); // gizli
+await ctx.storage.generateUploadUrl({ visibility: "private", ownerId: employee }); // başkası adına
+
+await ctx.storage.getUrl(id);                     // public: kalıcı link; private: sahibine 1 saatlik imzalı link
+await ctx.storage.getUrl(id, { expiresIn: 600 }); // imzalı link süresi (sn)
+await ctx.storage.setVisibility(id, "private");
+```
+
+- **public** (varsayılan): `/api/storage/<id>` linkini bilen herkes açar.
+- **private**: yalnızca imzalı, süreli linkle açılır; düz link 403 döner. Süre bir aralığa yuvarlanır, böylece canlı sorgular her yeniden çalıştığında aynı linki üretir.
+- **Sahiplik:** Her dosyanın bir sahibi vardır (yükleme URL'sini isteyen kullanıcı ya da `ownerId`). Private dosyanın linki yalnızca sahibine verilir (başkasına `getUrl` → `null`); `setVisibility` ve `delete` yalnızca sahibine açıktır (`FORBIDDEN`). Böylece birinin id'sini öğrenip başkasının dosyasına erişmek mümkün olmaz.
+- **Asıl yetki senin verinde:** "Bu dosyayı kim görebilir?" sorusunun cevabı genellikle kendi tablolarındadır (ör. `payslips: { employee, file }`). Sorgu erişimi bu tabloya göre kontrol eder, sonra `getUrl(id, { bypassOwnerCheck: true })` ile linki verir. Örnek: `example/incibase/payslips.ts` (İK çalışan adına yükler, çalışan ve İK görür, başkası göremez).
+- Başkasının dosya id'sini kendi kaydına bağlamayı engellemek için yazarken `getMetadata(id).ownerId` kontrol et (bkz. `messages.send`).
 
 ## İstemci
 

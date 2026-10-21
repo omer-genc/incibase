@@ -138,15 +138,23 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
         POST: async (req) => {
           const url = new URL(req.url);
           const identity = engine.auth.identifyRequest(req);
-          if (!identity.admin && !engine.storage.verifyUploadToken(url.searchParams.get("token"))) {
+          // The signed upload URL decides visibility; an admin may pass ?visibility= directly.
+          const grant = identity.admin
+            ? { visibility: (url.searchParams.get("visibility") ?? undefined) as "public" | "private" | undefined, ownerId: null }
+            : engine.storage.verifyUploadToken(url.searchParams.get("token"));
+          if (!grant) {
             throw new IncibaseError({ code: "FORBIDDEN", message: "Invalid or expired upload URL" });
           }
           const blob = await req.blob();
-          const storageId = await engine.storage.store(blob, req.headers.get("content-type") ?? undefined);
+          const storageId = await engine.storage.store(blob, {
+            contentType: req.headers.get("content-type") ?? undefined,
+            visibility: grant.visibility,
+            ownerId: grant.ownerId,
+          });
           return Response.json({ storageId });
         },
       }),
-      "/api/storage/:id": route({ GET: (req) => engine.storage.serve(req.params.id!) }),
+      "/api/storage/:id": route({ GET: (req) => engine.storage.serve(req.params.id!, new URL(req.url)) }),
 
       "/api/schema": route({
         GET: (req) => {

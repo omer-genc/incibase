@@ -4,12 +4,16 @@
  */
 import { anyApi, type ApiFromModules, type FilterApi } from "incibase";
 import type * as channels from "../channels";
+import type * as files from "../files";
 import type * as messages from "../messages";
+import type * as payslips from "../payslips";
 import type * as stats from "../stats";
 
 declare const fullApi: ApiFromModules<{
   "channels": typeof channels;
+  "files": typeof files;
   "messages": typeof messages;
+  "payslips": typeof payslips;
   "stats": typeof stats;
 }>;
 

@@ -291,7 +291,7 @@ export class Engine {
     return {
       db: session.reader(),
       auth: this.authFor(identity, () => session.get(identity.userId!)),
-      storage: this.storage.reader(session),
+      storage: this.storage.reader(session, identity),
     };
   }
 
@@ -299,7 +299,7 @@ export class Engine {
     return {
       db: session.writer(),
       auth: this.authFor(identity, () => session.get(identity.userId!)),
-      storage: this.storage.writer(session),
+      storage: this.storage.writer(session, identity),
       scheduler: this.scheduler.forSession(session),
     };
   }
@@ -312,7 +312,7 @@ export class Engine {
       runMutation: run("mutation"),
       runAction: run("action"),
       auth: this.authFor(identity, async () => (await this.readTx((s) => s.get(identity.userId!))).result),
-      storage: this.storage.actionWriter(),
+      storage: this.storage.actionWriter(identity),
       scheduler: this.scheduler.standalone(),
     } as unknown as ActionCtx;
   }
