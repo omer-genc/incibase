@@ -88,6 +88,8 @@ export class Engine {
   readonly adminKey: string;
   readonly migration: MigrationReport;
   readonly logs: LogEntry[] = [];
+  /** When this engine started; changes on every (dev) restart. */
+  readonly startedAt = Date.now();
 
   private readonly readLock = new Mutex();
   private readonly writeLock = new Mutex();

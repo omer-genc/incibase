@@ -107,7 +107,7 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
     hostname: options.hostname,
     maxRequestBodySize: engine.storage.maxUploadBytes + 1024 * 1024,
     routes: {
-      "/api/health": route({ GET: () => Response.json({ ok: true, version: VERSION }) }),
+      "/api/health": route({ GET: () => Response.json({ ok: true, version: VERSION, startedAt: engine.startedAt }) }),
       "/api/query": callRoute("query"),
       "/api/mutation": callRoute("mutation"),
       "/api/action": callRoute("action"),

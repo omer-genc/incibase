@@ -30,7 +30,9 @@
     // Lets the example and tests import the package by name.
     "paths": {
       "incibase": ["./src/index.ts"],
-      "incibase/*": ["./src/*.ts"]
+      "incibase/*": ["./src/*.ts"],
+      // Dashboard-internal imports (shadcn/ui convention).
+      "@/*": ["./src/dashboard/*"]
     }
   },
   "exclude": ["node_modules", "dist"]

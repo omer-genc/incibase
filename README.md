@@ -150,13 +150,15 @@ claude mcp add --transport http incibase http://localhost:3210/mcp --header "Aut
 
 Sunucu `/_/` adresinde bir yönetim paneli sunar (ör. `http://localhost:3210/_/`). Giriş için admin anahtarı gerekir: `incibase dev` açılışta yazdırır, aksi halde `incibase admin-key`.
 
-- **Overview:** çalışma süresi, tablo başına doküman sayıları, fonksiyonlar, canlı abonelikler, son hatalar, cron'lar ve HTTP route'ları.
-- **Data:** tablolar arasında gezinme, `alan = değer` filtresi, sıralama, sayfalama, canlı yenileme; dokümanı görüntüleme/düzenleme/silme, yeni doküman (şemadan iskelet), `_users` için yeni kullanıcı. Id alanları tıklanınca bağlı dokümanı açar; `_storage` dokümanlarında dosya linki.
-- **Functions:** tüm fonksiyonlar (internal dahil), argüman şeması; JSON argümanla çalıştırma, isteğe bağlı olarak bir kullanıcı adına.
-- **Logs:** fonksiyon çağrıları, süreleri ve hataları (canlı).
-- **SQL:** salt-okunur SQL konsolu. **Schema:** alanlar ve index'ler.
+- **Overview:** çalışma süresi, tablo başına doküman sayıları, fonksiyonlar, canlı abonelikler, son hatalar, uç noktalar (kopyalanabilir), Claude Code MCP komutu, cron'lar ve HTTP route'ları.
+- **Data:** tablolar arasında gezinme, `alan = değer` filtresi, sıralama, sayfalama, canlı yenileme; dokümanı görüntüleme (alanlar / JSON), şemaya karşı doğrulanan düzenleme, onaylı silme, şemadan iskeletle yeni doküman, `_users` için yeni kullanıcı (test token'ı ile). Id alanları bağlı dokümanı açar (geri dönülebilir); `_storage` dokümanlarında dosya linki ve görsel önizleme.
+- **Functions:** tüm fonksiyonlar (internal dahil), argüman tablosu (tip, zorunluluk, kısıtlar, varsayılan), JSON argümanla çalıştırma, bir kullanıcı adına çalıştırma, sonuç ve süre.
+- **Logs:** fonksiyon çağrıları; tip, fonksiyon ve hata filtresi, canlı akış.
+- **SQL:** salt-okunur SQL konsolu ve hazır örnekler. **Schema:** alanlar, referanslar, index'ler, JSON Schema.
 
-Panel tek, kendi kendine yeten bir HTML dosyasıdır (React, ~240 KB) ve hem standalone binary'ye hem `incibase build` çıktısına gömülür. Kaynaktan çalışırken ilk istekte derlenir. Kapatmak için `--no-dashboard`. Panelin kullandığı uç noktalar: `POST /api/admin/<araç>` (MCP admin araçlarıyla aynı uygulama, admin anahtarı ister).
+Açık/koyu/sistem teması, mobil düzen ve sunucu takibi vardır: `dev` yeniden başlayınca şema ve fonksiyon listesi kendiliğinden yenilenir, sunucuya ulaşılamazsa uyarı çıkar.
+
+Panel React + [shadcn/ui](https://ui.shadcn.com) + Tailwind v4 ile yazılmıştır (`src/dashboard/`) ve tek, kendi kendine yeten bir HTML dosyasına derlenip hem standalone binary'ye hem `incibase build` çıktısına gömülür; kaynaktan çalışırken ilk istekte derlenir. Kapatmak için `--no-dashboard`. Panelin kullandığı uç noktalar: `POST /api/admin/<araç>` (MCP admin araçlarıyla aynı uygulama, admin anahtarı ister). Yeni shadcn bileşeni eklemek için: `bunx shadcn@latest add <bileşen>`.
 
 ## Başka bir projede kullanmak
 

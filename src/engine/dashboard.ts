@@ -11,11 +11,16 @@ export function setEmbeddedDashboard(html: string) {
 }
 
 export async function buildDashboardHtml(): Promise<string> {
+  // Built at runtime so the bundler cannot resolve it: binaries embed the
+  // finished HTML and must not carry Tailwind (~800 KB).
+  const pluginName = ["bun-plugin", "tailwind"].join("-");
+  const tailwind = (await import(pluginName)).default;
   const result = await Bun.build({
     entrypoints: [join(import.meta.dir, "..", "dashboard", "index.html")],
     compile: true,
     target: "browser",
     minify: true,
+    plugins: [tailwind],
     define: { "process.env.NODE_ENV": JSON.stringify("production") },
   });
   if (!result.success || !result.outputs[0]) {

@@ -12,8 +12,6 @@ export interface AdminTool {
   run: (args: any) => Promise<unknown>;
 }
 
-const startedAt = Date.now();
-
 const rangeOp = z.object({
   field: z.string(),
   op: z.enum(["eq", "gt", "gte", "lt", "lte"]),
@@ -32,8 +30,8 @@ export function adminTools(engine: Engine): Record<string, AdminTool> {
         return {
           version: VERSION,
           dev: !!engine.options.dev,
-          startedAt,
-          uptimeMs: Date.now() - startedAt,
+          startedAt: engine.startedAt,
+          uptimeMs: Date.now() - engine.startedAt,
           publicUrl: engine.options.publicUrl,
           tables: Object.fromEntries(Object.entries(app.tables).map(([name, t]) => [name, { system: t.system, documentCount: t.documentCount }])),
           functions: {
@@ -151,12 +149,13 @@ export function adminTools(engine: Engine): Record<string, AdminTool> {
       input: z.object({
         limit: z.number().int().min(1).max(1000).default(50),
         path: z.string().optional(),
+        type: z.enum(["query", "mutation", "action", "http", "cron", "scheduled"]).optional(),
         errorsOnly: z.boolean().default(false),
       }),
       readOnly: true,
       run: async (a) =>
         engine.logs
-          .filter((l) => (!a.path || l.path.includes(a.path)) && (!a.errorsOnly || !l.ok))
+          .filter((l) => (!a.path || l.path.includes(a.path)) && (!a.type || l.type === a.type) && (!a.errorsOnly || !l.ok))
           .slice(-a.limit)
           .reverse(),
     },
