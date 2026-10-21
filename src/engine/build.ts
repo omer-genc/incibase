@@ -2,13 +2,14 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { BunPlugin } from "bun";
+import { buildDashboardHtml } from "./dashboard.ts";
 import { embeddedRuntime } from "./embedded.ts";
 import { discoverModules } from "./loader.ts";
 import { VERSION } from "./version.ts";
 
 export const IS_COMPILED = import.meta.path.includes("$bunfs") || import.meta.path.includes("~BUN");
 
-type FrameworkModule = "index" | "server" | "client" | "cli" | "zod";
+type FrameworkModule = "index" | "server" | "client" | "cli" | "zod" | "dashboard";
 
 /** Absolute paths of the framework entry points to bundle user apps against. */
 async function frameworkPaths(): Promise<Record<FrameworkModule, string>> {
@@ -20,6 +21,7 @@ async function frameworkPaths(): Promise<Record<FrameworkModule, string>> {
       client: join(src, "client.ts"),
       cli: join(src, "cli.ts"),
       zod: Bun.resolveSync("zod", src),
+      dashboard: "",
     };
   }
   // Standalone binary: unpack the embedded runtime bundle, once per content hash.
@@ -40,6 +42,7 @@ async function frameworkPaths(): Promise<Record<FrameworkModule, string>> {
     client: join(dir, "client.js"),
     cli: join(dir, "cli.js"),
     zod: join(dir, "zod.js"),
+    dashboard: join(dir, "dashboard.html"),
   };
 }
 
@@ -101,16 +104,20 @@ export async function buildApp(options: BuildOptions): Promise<void> {
   const work = join(tmpdir(), `incibase-build-${process.pid}-${Date.now()}`);
   mkdirSync(work, { recursive: true });
   const entry = join(work, "entry.ts");
+  const dashboard = join(work, "dashboard.html");
+  writeFileSync(dashboard, paths.dashboard ? await Bun.file(paths.dashboard).text() : await buildDashboardHtml());
   writeFileSync(
     entry,
     [
       `import { runCli } from ${JSON.stringify(paths.cli)};`,
+      `import dashboardHtml from "./dashboard.html" with { type: "text" };`,
       schemaFile ? `import schema from ${JSON.stringify(schemaFile)};` : `const schema = undefined;`,
       ...modules.map((m, i) => `import * as m${i} from ${JSON.stringify(m.absolutePath)};`),
       `await runCli(process.argv.slice(2), {`,
       `  embedded: { schema, modules: {`,
       ...modules.map((m, i) => `    ${JSON.stringify(m.modulePath)}: m${i},`),
       `  } },`,
+      `  dashboardHtml,`,
       `});`,
       ``,
     ].join("\n"),

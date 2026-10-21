@@ -146,6 +146,18 @@ Sunucu `/mcp` adresinde Streamable HTTP MCP sunar.
 claude mcp add --transport http incibase http://localhost:3210/mcp --header "Authorization: Bearer <admin key>"
 ```
 
+## Admin paneli
+
+Sunucu `/_/` adresinde bir yönetim paneli sunar (ör. `http://localhost:3210/_/`). Giriş için admin anahtarı gerekir: `incibase dev` açılışta yazdırır, aksi halde `incibase admin-key`.
+
+- **Overview:** çalışma süresi, tablo başına doküman sayıları, fonksiyonlar, canlı abonelikler, son hatalar, cron'lar ve HTTP route'ları.
+- **Data:** tablolar arasında gezinme, `alan = değer` filtresi, sıralama, sayfalama, canlı yenileme; dokümanı görüntüleme/düzenleme/silme, yeni doküman (şemadan iskelet), `_users` için yeni kullanıcı. Id alanları tıklanınca bağlı dokümanı açar; `_storage` dokümanlarında dosya linki.
+- **Functions:** tüm fonksiyonlar (internal dahil), argüman şeması; JSON argümanla çalıştırma, isteğe bağlı olarak bir kullanıcı adına.
+- **Logs:** fonksiyon çağrıları, süreleri ve hataları (canlı).
+- **SQL:** salt-okunur SQL konsolu. **Schema:** alanlar ve index'ler.
+
+Panel tek, kendi kendine yeten bir HTML dosyasıdır (React, ~240 KB) ve hem standalone binary'ye hem `incibase build` çıktısına gömülür. Kaynaktan çalışırken ilk istekte derlenir. Kapatmak için `--no-dashboard`. Panelin kullandığı uç noktalar: `POST /api/admin/<araç>` (MCP admin araçlarıyla aynı uygulama, admin anahtarı ister).
+
 ## Başka bir projede kullanmak
 
 Paketi bağlama, ayrı repodan tipleri alma, React tekilleştirme ve diğer notlar: [docs/baska-projede-kullanim.md](docs/baska-projede-kullanim.md).
@@ -171,14 +183,14 @@ Standalone `incibase` binary'sinin kendisi: `bun run build:binary` → `dist/inc
 | `init` | Başlangıç dosyaları |
 | `admin-key` | Admin anahtarını yazdırır |
 
-Bayraklar: `--dir` (incibase), `--data` (incibase_data), `--port` (3210 / `$PORT`), `--host`, `--url` (dışarıdan erişilen adres; dosya URL'leri için), `--outfile`, `--target`.
+Bayraklar: `--dir` (incibase), `--data` (incibase_data), `--port` (3210 / `$PORT`), `--host`, `--url` (dışarıdan erişilen adres; dosya URL'leri için), `--outfile`, `--target`, `--no-dashboard`.
 
 Ortam değişkenleri: `INCIBASE_ADMIN_KEY`, `INCIBASE_URL`, `INCIBASE_STORAGE=s3` (+ Bun'ın `S3_*` değişkenleri).
 
 ## Geliştirme
 
 ```bash
-bun test            # motor, HTTP, realtime, auth, storage, scheduler, MCP, React hook'ları
+bun test            # motor, HTTP, realtime, auth, storage, scheduler, MCP, panel, React hook'ları
 bun check           # test/types.check.ts tip çıkarımını da doğrular
 bun run build:binary
 ```

@@ -4,7 +4,9 @@ import { join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { buildApp, IS_COMPILED } from "./engine/build.ts";
 import { codegen, writeIfChanged } from "./engine/codegen.ts";
+import { setEmbeddedDashboard } from "./engine/dashboard.ts";
 import { describeApp } from "./engine/describe.ts";
+import { embeddedRuntime } from "./engine/embedded.ts";
 import { Engine, type AppDefinition } from "./engine/engine.ts";
 import { startServer } from "./engine/http.ts";
 import { loadAppFromDir } from "./engine/loader.ts";
@@ -32,10 +34,13 @@ Options:
   --url <url>       Public base URL (default: http://localhost:<port>)
   --outfile <path>  Output for build (default: ./app)
   --target <t>      Build target, e.g. bun-linux-x64 (default: this machine)
+  --no-dashboard    Do not serve the admin dashboard at /_/
 `;
 
 interface CliOptions {
   embedded?: AppDefinition;
+  /** Pre-built dashboard HTML (built apps carry it). */
+  dashboardHtml?: string;
 }
 
 function parse(argv: string[]) {
@@ -50,6 +55,7 @@ function parse(argv: string[]) {
       url: { type: "string" },
       outfile: { type: "string", default: "./app" },
       target: { type: "string" },
+      "no-dashboard": { type: "boolean", default: false },
       dev: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -62,6 +68,8 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
   const { values, command: given } = parse(argv);
   if (values.version) return console.log(VERSION);
   const command = given ?? (options.embedded ? "serve" : undefined);
+  if (options.dashboardHtml) setEmbeddedDashboard(options.dashboardHtml);
+  else if (embeddedRuntime["dashboard.html"]) setEmbeddedDashboard(await Bun.file(embeddedRuntime["dashboard.html"]).text());
   if (values.help || !command) return console.log(HELP);
 
   if (options.embedded && !["serve", "start", "admin-key"].includes(command)) {
@@ -135,7 +143,8 @@ async function serve(values: Values, embedded?: AppDefinition) {
   if (m.rewrittenDocuments) console.log(`~ ${m.rewrittenDocuments} document(s) updated to the new schema`);
 
   engine.start();
-  const server = startServer(engine, { port, hostname: values.host ?? (dev ? "localhost" : "0.0.0.0") });
+  const dashboard = !values["no-dashboard"];
+  const server = startServer(engine, { port, hostname: values.host ?? (dev ? "localhost" : "0.0.0.0"), dashboard });
 
   const mcpUrl = `${publicUrl}/mcp`;
   const tableCount = [...engine.store.tables.values()].filter((t) => !t.system).length;
@@ -145,7 +154,7 @@ async function serve(values: Values, embedded?: AppDefinition) {
   } else {
     console.log(`
 \x1b[1mincibase ${VERSION}\x1b[0m${dev ? " (dev)" : ""}  ${engine.functions.size} function(s), ${tableCount} table(s)
-  API       ${publicUrl}/api
+  API       ${publicUrl}/api${dashboard ? `\n  Dashboard ${publicUrl}/_/` : ""}
   Realtime  ${publicUrl.replace(/^http/, "ws")}/api/ws
   MCP       ${mcpUrl}
   Data      ${resolve(values.data)}`);

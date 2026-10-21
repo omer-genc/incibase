@@ -1,7 +1,11 @@
 import type { Server } from "bun";
+import { z } from "zod";
 import { getFunctionPath, type FunctionType } from "../api.ts";
 import { IncibaseError } from "../errors.ts";
+import { adminTools } from "./admin.ts";
+import { dashboardHtml } from "./dashboard.ts";
 import { describeApp } from "./describe.ts";
+import { ValidationError } from "./database.ts";
 import { toErrorPayload, type Engine, type Identity } from "./engine.ts";
 import { handleMcp } from "./mcp.ts";
 import type { SocketData } from "./realtime.ts";
@@ -12,6 +16,8 @@ export interface ServeOptions {
   hostname?: string;
   /** Allowed CORS origins. Default `*` (auth uses bearer tokens, not cookies). */
   corsOrigins?: string[] | "*";
+  /** Serve the admin dashboard at `/_/`. Default true. */
+  dashboard?: boolean;
 }
 
 type Handler = (req: Request & { params: Record<string, string> }, server: Server<SocketData>) => Response | Promise<Response | undefined> | undefined;
@@ -148,6 +154,32 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
           return Response.json(describeApp(engine, { counts: true }));
         },
       }),
+
+      "/api/admin/:tool": route({
+        POST: async (req) => {
+          requireAdmin(req);
+          const tool = adminTools(engine)[req.params.tool!];
+          if (!tool) throw new IncibaseError({ code: "NOT_FOUND", message: `Unknown admin tool "${req.params.tool}"` });
+          const parsed = tool.input.safeParse(await readJson(req));
+          if (!parsed.success) throw new ValidationError(`Invalid arguments:\n${z.prettifyError(parsed.error)}`, parsed.error.issues);
+          return Response.json({ value: (await tool.run(parsed.data)) ?? null });
+        },
+      }),
+
+      ...(options.dashboard === false
+        ? {}
+        : {
+            "/_": () => Response.redirect("/_/", 302),
+            "/_/": async () =>
+              new Response(await dashboardHtml(), {
+                headers: {
+                  "content-type": "text/html; charset=utf-8",
+                  "cache-control": "no-cache",
+                  "x-frame-options": "DENY",
+                  "referrer-policy": "no-referrer",
+                },
+              }),
+          }),
 
       "/api/ws": (req: Request, server: Server<SocketData>) => {
         if (server.upgrade(req, { data: { identity: engine.auth.identifyRequest(req), subs: new Map() } })) return undefined;

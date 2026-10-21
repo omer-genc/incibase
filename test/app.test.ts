@@ -285,3 +285,43 @@ describe("mcp", () => {
     expect((await rpc({ jsonrpc: "2.0", id: 9, method: "tools/list" }, "bogus")).status).toBe(401);
   });
 });
+
+describe("dashboard", () => {
+  const callAdmin = (tool: string, args: unknown, key: string | null = t.engine.adminKey) =>
+    fetch(`${t.url}/api/admin/${tool}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) },
+      body: JSON.stringify(args),
+    });
+
+  test("serves a self-contained HTML page at /_/", async () => {
+    const res = await fetch(`${t.url}/_/`);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    const html = await res.text();
+    expect(html).toContain('<div id="root">');
+    expect(html).not.toContain('src="./app.tsx"');
+    expect((await fetch(`${t.url}/_`, { redirect: "manual" })).headers.get("location")).toBe("/_/");
+  }, 20_000);
+
+  test("admin endpoints require the admin key", async () => {
+    expect((await callAdmin("admin_overview", {}, null)).status).toBe(403);
+    const token = (await alice.auth.signIn({ email: "alice@example.com", password: "password123" })) && alice.getToken();
+    expect((await callAdmin("admin_overview", {}, token)).status).toBe(403);
+    const res = await callAdmin("admin_overview", {});
+    const { value } = (await res.json()) as any;
+    expect(value.tables.messages.documentCount).toBeGreaterThan(0);
+    expect(value.httpRoutes).toEqual([{ method: "GET", path: "/hello" }]);
+    expect((await callAdmin("admin_nope", {})).status).toBe(404);
+  });
+
+  test("get returns the table; replace removes left-out fields", async () => {
+    const id = await alice.mutation(api.messages.send, { channel: general, body: "to replace" });
+    const got = (await (await callAdmin("admin_get_document", { id })).json()) as any;
+    expect(got.value.table).toBe("messages");
+    const { _id, _creationTime, ...fields } = got.value.document;
+    const res = await callAdmin("admin_replace_document", { id, document: { ...fields, body: "replaced" } });
+    expect(((await res.json()) as any).value.body).toBe("replaced");
+    const bad = await callAdmin("admin_replace_document", { id, document: { body: "missing fields" } });
+    expect(bad.status).toBe(400);
+  });
+});
