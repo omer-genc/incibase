@@ -1,0 +1,44 @@
+{
+  "name": "incibase",
+  "version": "0.1.0",
+  "description": "Zod-typed backend-as-a-service in a single Bun binary: realtime queries, auth, storage, scheduling and MCP.",
+  "type": "module",
+  "module": "src/index.ts",
+  "bin": {
+    "incibase": "./src/cli.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/server.ts",
+    "./client": "./src/client.ts",
+    "./react": "./src/react.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "bun check",
+    "test": "bun test",
+    "build:binary": "bun scripts/build-binary.ts"
+  },
+  "dependencies": {
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "happy-dom": "21.0.4",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "typescript": "^7"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  }
+}
