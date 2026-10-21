@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { z } from "zod";
 import { IncibaseError } from "../errors.ts";
 import type { IndexDefinition } from "../schema.ts";
+import type { Change, RangeRead, ReadSet } from "./readset.ts";
 import { fieldExpr, quoteIdent, rowToDoc, type Document, type DocumentRow, type Store, type TableInfo } from "./store.ts";
 
 type Primitive = string | number | boolean | null;
@@ -95,7 +96,8 @@ function decodeCursor(cursor: string): unknown[] {
 
 export class QueryBuilder {
   private index: IndexDefinition | null = null;
-  private conditions: { field: string; op: Op; value: unknown }[] = [];
+  private rangeOps: { field: string; op: Op; value: unknown }[] = [];
+  private whereOps: { field: string; value: unknown }[] = [];
   private predicates: ((doc: any) => boolean)[] = [];
   private direction: "asc" | "desc" = "asc";
 
@@ -115,7 +117,7 @@ export class QueryBuilder {
     if (range) {
       const builder = new IndexRangeBuilder(index.fields);
       range(builder);
-      this.conditions.push(...builder.ops);
+      this.rangeOps.push(...builder.ops);
     }
     return this;
   }
@@ -123,7 +125,8 @@ export class QueryBuilder {
   where(fields: Record<string, unknown>) {
     for (const [field, value] of Object.entries(fields)) {
       if (value === undefined) continue;
-      this.conditions.push({ field, op: "eq", value });
+      toSqlValue(value, field); // validate early
+      this.whereOps.push({ field, value });
     }
     return this;
   }
@@ -139,6 +142,24 @@ export class QueryBuilder {
     return this;
   }
 
+  /** The rows this query can see, for realtime invalidation (JS filters only narrow it further). */
+  private readRange(): RangeRead {
+    const read: RangeRead = { kind: "range", table: this.table.name, eq: [] };
+    for (const op of this.rangeOps) {
+      const value = toSqlValue(op.value, op.field);
+      if (op.op === "eq") {
+        read.eq.push([op.field, value]);
+        continue;
+      }
+      read.range ??= { field: op.field };
+      const bound = { value, inclusive: op.op === "gte" || op.op === "lte" };
+      if (op.op === "gt" || op.op === "gte") read.range.lower = bound;
+      else read.range.upper = bound;
+    }
+    for (const w of this.whereOps) read.eq.push([w.field, toSqlValue(w.value, w.field)]);
+    return read;
+  }
+
   private orderColumns(): string[] {
     const fields = this.index && this.index.name !== "by_creation_time" ? this.index.fields : [];
     return [...fields.map(fieldExpr), "_creationTime", "_id"];
@@ -146,7 +167,7 @@ export class QueryBuilder {
 
   /** Runs the query in keyset-paginated batches so JS filters never hold a statement open. */
   private fetch(max: number, after: unknown[] | null): { docs: Document[]; last: unknown[] | null; done: boolean } {
-    this.session.trackRead(this.table.name);
+    this.session.track(this.readRange());
     const cols = this.orderColumns();
     const dir = this.direction === "asc" ? "ASC" : "DESC";
     const docs: Document[] = [];
@@ -155,7 +176,10 @@ export class QueryBuilder {
 
     while (true) {
       const params: unknown[] = [];
-      const where = this.conditions.map((c) => condition(c.field, c.op, c.value, params));
+      const where = [
+        ...this.rangeOps.map((c) => condition(c.field, c.op, c.value, params)),
+        ...this.whereOps.map((c) => condition(c.field, "eq", c.value, params)),
+      ];
       if (last) {
         if (last.length !== cols.length) throw new IncibaseError({ code: "INVALID_CURSOR", message: "Cursor does not match this query" });
         where.push(`(${cols.join(", ")}) ${this.direction === "asc" ? ">" : "<"} (${cols.map(() => "?").join(", ")})`);
@@ -220,8 +244,10 @@ export class QueryBuilder {
  * read (for realtime invalidation) and written (to know whom to notify).
  */
 export class DbSession {
-  readonly readTables = new Set<string>();
-  readonly writtenTables = new Set<string>();
+  /** What this execution read; a subscription reruns only when a change affects one of these. */
+  readonly reads: ReadSet[] = [];
+  /** Documents this transaction wrote, with their before/after state. */
+  readonly changes: Change[] = [];
   private readonly commitHooks: (() => void)[] = [];
 
   constructor(
@@ -230,8 +256,13 @@ export class DbSession {
     readonly writable: boolean,
   ) {}
 
-  trackRead(table: string) {
-    this.readTables.add(table);
+  track(read: ReadSet) {
+    this.reads.push(read);
+  }
+
+  /** For writes made with raw SQL that touch an unknown set of documents. */
+  markTableChanged(table: string) {
+    this.changes.push({ table, all: true });
   }
 
   onCommit(hook: () => void) {
@@ -308,7 +339,7 @@ export class DbSession {
     const id = maybeId ?? tableOrId;
     const table = this.store.tableOfId(id);
     if (!table || (maybeId !== undefined && table.name !== tableOrId)) return null;
-    this.trackRead(table.name);
+    this.track({ kind: "doc", table: table.name, id });
     return this.load(table, id);
   }
 
@@ -363,26 +394,32 @@ export class DbSession {
 
   insertRaw(table: TableInfo, data: string, id = this.store.newId(table)): string {
     this.assertWritable();
+    const creationTime = this.store.nextCreationTime();
     this.unique(() =>
       this.conn
         .query(`INSERT INTO ${quoteIdent(table.name)} (_id, _creationTime, data) VALUES (?, ?, ?)`)
-        .run(id, this.store.nextCreationTime(), data),
+        .run(id, creationTime, data),
     );
-    this.writtenTables.add(table.name);
+    this.changes.push({ table: table.name, id, before: null, after: rowToDoc({ _id: id, _creationTime: creationTime, data }) });
     return id;
   }
 
   updateRaw(table: TableInfo, id: string, data: string) {
     this.assertWritable();
+    const before = this.load(table, id);
     this.unique(() => this.conn.query(`UPDATE ${quoteIdent(table.name)} SET data = ? WHERE _id = ?`).run(data, id));
-    this.writtenTables.add(table.name);
+    if (before) {
+      const after = rowToDoc({ _id: id, _creationTime: before._creationTime, data });
+      this.changes.push({ table: table.name, id, before, after });
+    }
   }
 
   deleteRaw(table: TableInfo, id: string) {
     this.assertWritable();
+    const before = this.load(table, id);
     const result = this.conn.query(`DELETE FROM ${quoteIdent(table.name)} WHERE _id = ?`).run(id);
     if (result.changes === 0) throw new IncibaseError({ code: "NOT_FOUND", message: `Document "${id}" not found` });
-    this.writtenTables.add(table.name);
+    this.changes.push({ table: table.name, id, before, after: null });
   }
 
   systemTable(name: string): TableInfo {

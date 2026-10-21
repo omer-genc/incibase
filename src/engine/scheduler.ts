@@ -213,7 +213,7 @@ export class Scheduler {
            AND json_extract(data, '$.completedAt') < ?`,
         )
         .run(cutoff);
-      if (result.changes) session.writtenTables.add("_scheduled");
+      if (result.changes) session.markTableChanged("_scheduled");
     });
   }
 }

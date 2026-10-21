@@ -10,6 +10,7 @@ import { AuthService } from "./auth.ts";
 import { DbSession, ValidationError } from "./database.ts";
 import { argsSchemaOf } from "./jsonschema.ts";
 import { migrate, type MigrationReport } from "./migrate.ts";
+import type { ReadSet } from "./readset.ts";
 import { Realtime } from "./realtime.ts";
 import { Scheduler } from "./scheduler.ts";
 import { StorageService, type StorageOptions } from "./storage.ts";
@@ -177,7 +178,7 @@ export class Engine {
         throw err;
       }
       session.runCommitHooks();
-      if (session.writtenTables.size) this.realtime.invalidate(session.writtenTables);
+      if (session.changes.length) this.realtime.invalidate(session.changes);
       return result;
     });
   }
@@ -229,25 +230,25 @@ export class Engine {
     return (await this.callTracked(path, args, identity, options)).value;
   }
 
-  /** Like `call`, but also returns the tables a query read (for subscriptions). */
+  /** Like `call`, but also returns what a query read (for subscriptions). */
   async callTracked(
     path: string,
     args: unknown,
     identity: Identity,
     options: CallOptions = {},
-  ): Promise<{ value: unknown; readTables: Set<string> }> {
+  ): Promise<{ value: unknown; reads: ReadSet[] }> {
     const fn = this.resolve(path, options);
     const started = performance.now();
     try {
       const parsed = this.parseArgs(fn, args);
       let value: unknown;
-      let readTables = new Set<string>();
+      let reads: ReadSet[] = [];
       if (fn.type === "query") {
         const { result, session } = await this.readTx(async (session) =>
           this.finish(fn, await fn.handler(this.queryCtx(session, identity), parsed)),
         );
         value = result;
-        readTables = session.readTables;
+        reads = session.reads;
       } else if (fn.type === "mutation") {
         value = await this.writeTx(async (session) =>
           this.finish(fn, await fn.handler(this.mutationCtx(session, identity), parsed)),
@@ -256,7 +257,7 @@ export class Engine {
         value = this.finish(fn, await fn.handler(this.actionCtx(identity), parsed));
       }
       this.log({ type: fn.type, path, durationMs: performance.now() - started, ok: true, userId: identity.userId });
-      return { value, readTables };
+      return { value, reads };
     } catch (err) {
       this.log({
         type: fn.type,

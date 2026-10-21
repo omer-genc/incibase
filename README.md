@@ -5,7 +5,7 @@ Bun üzerinde çalışan, tek bir binary olarak dağıtılabilen backend-as-a-se
 - **Zod şema → tablo + tip + JSON Schema.** `schema.ts` tek doğruluk kaynağı; SQLite tabloları, index'ler, TypeScript tipleri ve JSON Schema buradan üretilir.
 - **Fonksiyonlar:** `query` (realtime, salt-okunur), `mutation` (transaction), `action` (dış dünya, `fetch`), `internal*` varyantları, HTTP route'ları.
 - **Uçtan uca tipler:** `client.query(api.messages.list, { channel })` dönüş tipini sunucu koddan çıkarır; codegen kullanıcı kodunu çalıştırmaz, sadece dosya adlarından tip dosyası üretir.
-- **Realtime:** WebSocket abonelikleri, yazılan tablolara göre yeniden çalışır, sonuç değişmediyse gönderilmez.
+- **Realtime:** WebSocket abonelikleri. Her sorgunun okuduğu aralık (index `eq`/aralık koşulları, `where` eşitlikleri, `get(id)`) kaydedilir; bir yazma yalnızca belgenin önceki ya da sonraki hâli o aralığa giriyorsa aboneliği yeniden çalıştırır. Yazma patlamaları 10 ms'lik pencerede birleştirilir, sonuç değişmediyse istemciye gönderilmez.
 - **Auth** (e-posta/şifre, bearer token), **dosya depolama** (yerel disk veya S3), **zamanlayıcı** (`ctx.scheduler`, cron), **otomatik migration**.
 - **MCP:** `/mcp` endpoint'i. `mcp: true` işaretli fonksiyonlar AI ajanlarına tool olur; admin anahtarıyla bağlanan ajan şemayı, veriyi ve logları görür.
 
