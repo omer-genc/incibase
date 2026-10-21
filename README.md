@@ -126,7 +126,7 @@ function Chat({ channel }: { channel: Id<"channels"> }) {
 ```
 
 - `useQuery(ref, args | "skip")`: canlı sonuç; hata error boundary'ye fırlatılır. Fırlatmayan sürüm: `useQueryResult` → `{ data, error, isLoading }`.
-- Aynı query + args'ı kullanan bileşenler tek WebSocket aboneliğini paylaşır; unmount sonrası 5 sn önbellekte kalır.
+- Aynı query + args'ı kullanan bileşenler tek WebSocket aboneliğini paylaşır; unmount sonrası `keepAliveMs` (varsayılan 5000) kadar önbellekte kalır, geri dönünce sonuç anında gelir. `new IncibaseClient(url, { keepAliveMs: 0 })` hemen kapatır. Bu yüzden sayfalar arasında gezinirken paneldeki "Live subscriptions" sayısı geçici olarak artar.
 - `usePaginatedQuery`: query `paginationOpts: paginationOptsValidator` almalı ve `.paginate(paginationOpts)` dönmeli. Sayfalar cursor zinciriyle bağlıdır; önceki sayfa değişirse sonraki onu takip eder (boşluk/tekrar olmaz).
 - `useMutation`, `useAction`, `useAuth` (`user`, `isLoading`, `signIn`, `signUp`, `signOut`).
 - `client.watchQuery(ref, args)` framework'ten bağımsız paylaşılan canlı query'dir (Vue/Svelte bağlamaları için temel).

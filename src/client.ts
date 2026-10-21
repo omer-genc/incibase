@@ -44,6 +44,12 @@ export interface ClientOptions {
   token?: string;
   fetch?: typeof fetch;
   WebSocket?: typeof WebSocket;
+  /**
+   * How long a live query stays subscribed after its last listener leaves, so
+   * navigating back shows the cached result at once. Default 5000 ms; 0 stops
+   * it immediately.
+   */
+  keepAliveMs?: number;
 }
 
 function defaultStorage(): TokenStorage {
@@ -90,14 +96,14 @@ interface WatchEntry {
 }
 
 const LOADING: QueryState = { status: "loading", value: undefined, error: undefined };
-/** How long an unused watch keeps its subscription, so remounts reuse the result. */
-const WATCH_KEEP_ALIVE_MS = 5_000;
+const DEFAULT_KEEP_ALIVE_MS = 5_000;
 
 export class IncibaseClient {
   readonly url: string;
   private readonly tokenStorage: TokenStorage;
   private readonly fetchImpl: typeof fetch;
   private readonly WS: typeof WebSocket;
+  private readonly keepAliveMs: number;
   private readonly authListeners = new Set<(token: string | null) => void>();
 
   private ws: WebSocket | null = null;
@@ -115,6 +121,7 @@ export class IncibaseClient {
     if (options.token) this.tokenStorage.set(options.token);
     this.fetchImpl = options.fetch ?? fetch.bind(globalThis);
     this.WS = options.WebSocket ?? WebSocket;
+    this.keepAliveMs = Math.max(0, options.keepAliveMs ?? DEFAULT_KEEP_ALIVE_MS);
   }
 
   // -------------------------------------------------------------------------
@@ -207,11 +214,15 @@ export class IncibaseClient {
         );
         return () => {
           if (!e.listeners.delete(listener) || e.listeners.size > 0) return;
-          e.releaseTimer = setTimeout(() => {
+          const release = () => {
+            e.releaseTimer = null;
             if (e.listeners.size > 0) return;
             e.stop?.();
+            e.stop = null;
             if (this.watches.get(key) === e) this.watches.delete(key);
-          }, WATCH_KEEP_ALIVE_MS);
+          };
+          if (this.keepAliveMs === 0) release();
+          else e.releaseTimer = setTimeout(release, this.keepAliveMs);
         };
       },
     };

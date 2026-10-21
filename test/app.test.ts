@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { IncibaseError, type Id } from "incibase";
-import { IncibaseRequestError, type IncibaseClient } from "incibase/client";
+import { IncibaseClient, IncibaseRequestError } from "incibase/client";
 import { api } from "../example/incibase/_generated/api";
-import { nextValue, startTestServer } from "./helpers.ts";
+import { memoryStorage, nextValue, startTestServer } from "./helpers.ts";
 
 let t: Awaited<ReturnType<typeof startTestServer>>;
 let alice: IncibaseClient;
@@ -166,6 +166,38 @@ describe("realtime", () => {
     const extra = await values.next(300).catch(() => "none");
     expect(extra).toBe("none");
     unsubscribe();
+  });
+});
+
+describe("watchQuery keep-alive", () => {
+  const settle = () => Bun.sleep(150);
+
+  test("unused queries stay subscribed for keepAliveMs, then stop", async () => {
+    const channel = await alice.mutation(api.channels.create, { name: "keepalive" });
+    const base = t.engine.realtime.subscriptionCount;
+    const lingering = new IncibaseClient(t.url, { tokenStorage: memoryStorage(), keepAliveMs: 300 });
+    const stop = lingering.watchQuery(api.messages.list, { channel }).subscribe(() => {});
+    await settle();
+    expect(t.engine.realtime.subscriptionCount).toBe(base + 1);
+    stop();
+    await settle();
+    expect(t.engine.realtime.subscriptionCount).toBe(base + 1);
+    await Bun.sleep(350);
+    expect(t.engine.realtime.subscriptionCount).toBe(base);
+    lingering.close();
+  });
+
+  test("keepAliveMs: 0 unsubscribes as soon as the last listener leaves", async () => {
+    const channel = await alice.mutation(api.channels.create, { name: "no-keepalive" });
+    const base = t.engine.realtime.subscriptionCount;
+    const eager = new IncibaseClient(t.url, { tokenStorage: memoryStorage(), keepAliveMs: 0 });
+    const stop = eager.watchQuery(api.messages.list, { channel }).subscribe(() => {});
+    await settle();
+    expect(t.engine.realtime.subscriptionCount).toBe(base + 1);
+    stop();
+    await settle();
+    expect(t.engine.realtime.subscriptionCount).toBe(base);
+    eager.close();
   });
 });
 
