@@ -30,6 +30,8 @@ export interface EngineOptions {
   adminKey?: string;
   storage?: StorageOptions;
   quiet?: boolean;
+  /** Let a migration delete stored fields the schema no longer has (otherwise it is refused). */
+  allowFieldRemoval?: boolean;
 }
 
 export interface Identity {
@@ -104,7 +106,7 @@ export class Engine {
     mkdirSync(options.dataDir, { recursive: true });
     this.store = new Store(join(options.dataDir, "data.db"));
     try {
-      this.migration = migrate(this.store, app.schema);
+      this.migration = migrate(this.store, app.schema, { allowFieldRemoval: options.allowFieldRemoval });
     } catch (err) {
       this.store.close();
       throw err;

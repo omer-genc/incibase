@@ -1,27 +1,71 @@
 import { z } from "zod";
 import type { IndexDefinition, SchemaDefinition } from "../schema.ts";
-import { storageFieldsOf } from "./files.ts";
+import { collectHeldIds, storageFieldsOf, WRAPPERS } from "./files.ts";
 import { toJsonSchema } from "./jsonschema.ts";
 import { FIRST_USER_TABLE_NUMBER, quoteIdent, type DocumentRow, type Store } from "./store.ts";
+
+/** A stored field the new schema no longer has. */
+export interface RemovedField {
+  table: string;
+  /** Dotted path; `[]` stands for array items and `*` for record values, e.g. `items[].sku`, `prices.*.old`. */
+  field: string;
+  /** Documents that hold a value for it. */
+  documents: number;
+}
+
+export interface MigrationOptions {
+  /** Let the migration delete stored fields the schema no longer has; otherwise it is refused. */
+  allowFieldRemoval?: boolean;
+}
 
 export interface MigrationReport {
   createdTables: string[];
   deactivatedTables: string[];
   addedIndexes: string[];
   droppedIndexes: string[];
-  /** Documents rewritten because the new schema changed their stored form (defaults, stripped keys). */
+  /** Documents rewritten because the new schema changed their stored form (defaults, removed fields). */
   rewrittenDocuments: number;
+  /** Fields whose stored data was deleted (only with `allowFieldRemoval`). */
+  removedFields: RemovedField[];
 }
 
-export class MigrationError extends Error {
-  constructor(readonly problems: { table: string; id: string; message: string }[]) {
-    super(
+type Problem = { table: string; id: string; message: string };
+
+const LISTED = 20;
+
+function describeProblems(problems: Problem[], removedFields: RemovedField[]) {
+  const parts: string[] = [];
+  if (problems.length) {
+    parts.push(
       `Schema does not match ${problems.length} existing document(s):\n` +
         problems
-          .slice(0, 20)
+          .slice(0, LISTED)
           .map((p) => `  ${p.table} ${p.id}: ${p.message.replaceAll("\n", "\n    ")}`)
           .join("\n"),
     );
+  }
+  if (removedFields.length) {
+    parts.push(
+      `Schema would delete stored data from ${removedFields.length} field(s):\n` +
+        removedFields
+          .slice(0, LISTED)
+          .map((f) => `  ${f.table}.${f.field}: ${f.documents} document(s)`)
+          .join("\n") +
+        (removedFields.length > LISTED ? `\n  ...and ${removedFields.length - LISTED} more` : "") +
+        `\nKeep the field(s) in the schema (e.g. with .optional()), or start with --allow-field-removal` +
+        ` (EngineOptions.allowFieldRemoval) to delete this data.`,
+    );
+  }
+  return parts.join("\n");
+}
+
+export class MigrationError extends Error {
+  constructor(
+    readonly problems: Problem[],
+    readonly removedFields: RemovedField[] = [],
+    message = describeProblems(problems, removedFields),
+  ) {
+    super(message);
     this.name = "MigrationError";
   }
 }
@@ -39,15 +83,20 @@ interface TableRow {
  * creates tables, syncs indexes and, when a table's validator changed,
  * re-validates every document (rewriting those whose parsed form differs).
  * Throws MigrationError, leaving the database untouched, when any document no
- * longer validates. Tables removed from the schema keep their data.
+ * longer validates, when a rewrite would delete stored fields (unless
+ * `allowFieldRemoval`), or when no schema was loaded but tables exist.
+ * Tables removed from the schema keep their data. Pending files a re-validated
+ * document holds stop being pending, so cleanup keeps them even when the field
+ * is no longer an `id("_storage")`.
  */
-export function migrate(store: Store, schema: SchemaDefinition | undefined): MigrationReport {
+export function migrate(store: Store, schema: SchemaDefinition | undefined, options: MigrationOptions = {}): MigrationReport {
   const report: MigrationReport = {
     createdTables: [],
     deactivatedTables: [],
     addedIndexes: [],
     droppedIndexes: [],
     rewrittenDocuments: 0,
+    removedFields: [],
   };
   const db = store.write;
   const tables = schema?.tables ?? {};
@@ -56,11 +105,27 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined): Mig
     const existing = new Map(
       (db.query(`SELECT * FROM _incibase_tables`).all() as TableRow[]).map((r) => [r.name, r]),
     );
+    if (!schema) {
+      // A missing schema file would otherwise read as "every table removed".
+      const active = [...existing.values()].filter((r) => r.active).map((r) => r.name);
+      if (active.length) {
+        throw new MigrationError(
+          [],
+          [],
+          `No schema was loaded, but the database has ${active.length} table(s): ${active.join(", ")}.\n` +
+            `Add the schema (schema.ts with \`export default defineSchema({...})\`); to remove every table on purpose, export defineSchema({}).`,
+        );
+      }
+    }
     let nextNumber = Math.max(FIRST_USER_TABLE_NUMBER - 1, ...[...existing.values()].map((r) => r.number)) + 1;
-    const problems: { table: string; id: string; message: string }[] = [];
+    const problems: Problem[] = [];
+    const removedFields: RemovedField[] = [];
+    let pendingFiles: Set<string> | undefined;
 
     for (const [name, def] of Object.entries(tables)) {
-      const jsonSchema = JSON.stringify(toJsonSchema(def.validator));
+      // Both sides: a transform's output is unrepresentable (`{}`), so a change
+      // inside a transformed field shows only in the input schema.
+      const fingerprint = JSON.stringify({ output: toJsonSchema(def.validator), input: toJsonSchema(def.validator, "input") });
       const indexes = [...def.indexes];
       const row = existing.get(name);
       let number: number;
@@ -71,13 +136,18 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined): Mig
         db.query(`INSERT INTO _incibase_tables (name, number, json_schema, indexes, active) VALUES (?, ?, ?, '[]', 1)`).run(
           name,
           number,
-          jsonSchema,
+          fingerprint,
         );
         report.createdTables.push(name);
       } else {
         number = row.number;
-        if (row.json_schema !== jsonSchema || !row.active) {
-          report.rewrittenDocuments += revalidate(store, name, def.validator, problems);
+        if (row.json_schema !== fingerprint || !row.active) {
+          pendingFiles ??= new Set(
+            (db.query(`SELECT _id FROM _storage WHERE json_extract(data, '$.pending') = 1`).all() as { _id: string }[]).map((r) => r._id),
+          );
+          const removed = new Map<string, number>();
+          report.rewrittenDocuments += revalidate(store, name, def.validator, problems, removed, pendingFiles);
+          for (const [field, documents] of removed) removedFields.push({ table: name, field, documents });
         }
       }
 
@@ -102,7 +172,7 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined): Mig
       }
 
       db.query(`UPDATE _incibase_tables SET json_schema = ?, indexes = ?, active = 1 WHERE name = ?`).run(
-        jsonSchema,
+        fingerprint,
         JSON.stringify(indexes),
         name,
       );
@@ -117,7 +187,9 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined): Mig
       }
     }
 
-    if (problems.length) throw new MigrationError(problems);
+    const refusedFields = options.allowFieldRemoval ? [] : removedFields;
+    if (problems.length || refusedFields.length) throw new MigrationError(problems, refusedFields);
+    report.removedFields = removedFields;
   });
 
   run.immediate();
@@ -128,26 +200,99 @@ function sameIndex(a: IndexDefinition, b: IndexDefinition) {
   return a.unique === b.unique && a.fields.join("\0") === b.fields.join("\0");
 }
 
+/**
+ * Re-parses every document and rewrites those whose stored form changed.
+ * Stored keys the rewrite would drop are counted per field in `removed`.
+ * (Values a `.catch()` replaces are rewritten without being counted.)
+ * Pending files a document holds (from `pendingFiles`) are marked not pending
+ * and dropped from the set: the new schema may no longer say they are file ids.
+ */
 function revalidate(
   store: Store,
   table: string,
   validator: z.ZodObject<any, any>,
-  problems: { table: string; id: string; message: string }[],
+  problems: Problem[],
+  removed: Map<string, number>,
+  pendingFiles: Set<string>,
 ): number {
   let rewritten = 0;
+  const held = new Set<string>();
   const update = store.write.query(`UPDATE ${quoteIdent(table)} SET data = ? WHERE _id = ?`);
   const rows = store.write.query(`SELECT _id, _creationTime, data FROM ${quoteIdent(table)}`).all() as DocumentRow[];
   for (const row of rows) {
-    const result = validator.safeParse(JSON.parse(row.data));
+    const stored = JSON.parse(row.data);
+    if (pendingFiles.size) collectHeldIds(stored, pendingFiles, held);
+    const result = validator.safeParse(stored);
     if (!result.success) {
       problems.push({ table, id: row._id, message: z.prettifyError(result.error) });
       continue;
     }
     const data = JSON.stringify(result.data);
     if (data !== row.data) {
+      const fields = new Set<string>();
+      droppedKeys(JSON.parse(row.data), JSON.parse(data), validator, "", fields);
+      for (const field of fields) removed.set(field, (removed.get(field) ?? 0) + 1);
       update.run(data, row._id);
       rewritten++;
     }
   }
+  const release = store.write.query(`UPDATE _storage SET data = json_remove(data, '$.pending', '$.detachedAt') WHERE _id = ?`);
+  for (const fileId of held) {
+    release.run(fileId);
+    pendingFiles.delete(fileId);
+  }
   return rewritten;
+}
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * Adds the path of every key `stored` has and `next` lacks, nested objects and
+ * array items included. `node` is the validator of `stored` when known: keys of
+ * a record are one field (`prices.*.old`), not one field per key.
+ */
+function droppedKeys(stored: unknown, next: unknown, node: z.ZodType | undefined, path: string, out: Set<string>) {
+  if (Array.isArray(stored)) {
+    if (Array.isArray(next)) stored.forEach((item, i) => droppedKeys(item, next[i], childOf(node, i).node, `${path}[]`, out));
+    return;
+  }
+  if (!isObject(stored) || !isObject(next)) return;
+  for (const [key, value] of Object.entries(stored)) {
+    const { node: child, dynamic } = childOf(node, key);
+    const name = dynamic ? "*" : key;
+    const at = path ? `${path}.${name}` : name;
+    if (Object.hasOwn(next, key)) droppedKeys(value, next[key], child, at, out);
+    else out.add(at);
+  }
+}
+
+/** The definition that parses a value of `node`, past optional, default, lazy, pipes and the like. */
+function defOf(node: z.ZodType | undefined): any {
+  for (let depth = 0; node && depth < 64; depth++) {
+    const def = (node as any)._zod.def;
+    if (WRAPPERS.has(def.type)) node = def.innerType;
+    else if (def.type === "lazy") node = def.getter();
+    else if (def.type === "pipe") node = def.out._zod.def.type === "transform" ? def.in : def.out;
+    else return def;
+  }
+  return undefined;
+}
+
+/** The validator of `key` (an index for arrays) in a value of `node`; `dynamic` for record keys. */
+function childOf(node: z.ZodType | undefined, key: string | number): { node?: z.ZodType; dynamic?: boolean } {
+  const def = defOf(node);
+  if (typeof key === "number") {
+    if (def?.type === "array") return { node: def.element };
+    if (def?.type === "tuple") return { node: def.items[key] ?? def.rest };
+  } else {
+    if (def?.type === "object") return Object.hasOwn(def.shape, key) ? { node: def.shape[key] } : { node: def.catchall, dynamic: !!def.catchall };
+    if (def?.type === "record") return { node: def.valueType, dynamic: true };
+  }
+  const options = def?.type === "union" ? def.options : def?.type === "intersection" ? [def.left, def.right] : [];
+  for (const option of options) {
+    const child = childOf(option, key);
+    if (child.node) return child;
+  }
+  return {};
 }

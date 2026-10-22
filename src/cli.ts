@@ -35,6 +35,10 @@ Options:
   --outfile <path>  Output for build (default: ./app)
   --target <t>      Build target, e.g. bun-linux-x64 (default: this machine)
   --no-dashboard    Do not serve the admin dashboard at /_/
+  --allow-field-removal
+                    Let a migration delete the stored data of fields removed
+                    from the schema (serve, dev); otherwise it is refused.
+                    dev drops it once a server has started
 `;
 
 interface CliOptions {
@@ -56,6 +60,7 @@ function parse(argv: string[]) {
       outfile: { type: "string", default: "./app" },
       target: { type: "string" },
       "no-dashboard": { type: "boolean", default: false },
+      "allow-field-removal": { type: "boolean", default: false },
       dev: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -122,7 +127,7 @@ async function serve(values: Values, embedded?: AppDefinition) {
   let engine: Engine;
   try {
     const app = embedded ?? (await loadAppFromDir(values.dir));
-    engine = new Engine(app, { dataDir: values.data, dev, publicUrl });
+    engine = new Engine(app, { dataDir: values.data, dev, publicUrl, allowFieldRemoval: values["allow-field-removal"] });
   } catch (err) {
     if (err instanceof MigrationError) {
       console.error(`\x1b[31m${err.message}\x1b[0m\nFix the schema (or the data) and save again.`);
@@ -140,6 +145,7 @@ async function serve(values: Values, embedded?: AppDefinition) {
   for (const i of m.addedIndexes) console.log(`+ index ${i}`);
   for (const i of m.droppedIndexes) console.log(`- index ${i}`);
   for (const t of m.deactivatedTables) console.log(`- table ${t} (removed from schema; data kept)`);
+  for (const f of m.removedFields) console.log(`- field ${f.table}.${f.field} (data deleted from ${f.documents} document(s))`);
   if (m.rewrittenDocuments) console.log(`~ ${m.rewrittenDocuments} document(s) updated to the new schema`);
 
   engine.start();
@@ -191,7 +197,10 @@ async function dev(argv: string[], values: Values) {
     console.error(`No ${values.dir}/ directory. Create one with: incibase init`);
     process.exit(1);
   }
-  const childArgs = ["serve", "--dev", ...argv.filter((a) => a !== "dev")];
+  const childArgs = ["serve", "--dev", ...argv.filter((a) => a !== "dev" && a !== "--allow-field-removal")];
+  // Only for the removal the developer started with: once a server has run
+  // with it, a restart (e.g. a half-edited schema.ts) is refused again.
+  let allowFieldRemoval = values["allow-field-removal"];
   let child: ReturnType<typeof Bun.spawn> | null = null;
   let restarting: Promise<void> | null = null;
 
@@ -199,7 +208,7 @@ async function dev(argv: string[], values: Values) {
   const start = () => {
     const { changed } = codegen(dir);
     if (changed.length) console.log(`\x1b[2mgenerated ${changed.join(", ")}\x1b[0m`);
-    child = Bun.spawn([...selfCommand(), ...childArgs], {
+    child = Bun.spawn([...selfCommand(), ...childArgs, ...(allowFieldRemoval ? ["--allow-field-removal"] : [])], {
       stdio: ["inherit", "inherit", "inherit"],
       env: { ...process.env, ...(restarts++ ? { INCIBASE_RESTART: "1" } : {}) },
     });
@@ -213,6 +222,11 @@ async function dev(argv: string[], values: Values) {
     const old = child;
     child = null;
     if (old) {
+      // Still running means it migrated (or stops before committing); a refused one has exited.
+      if (old.exitCode === null && allowFieldRemoval) {
+        allowFieldRemoval = false;
+        console.log(`\x1b[2m--allow-field-removal applied to the first start only\x1b[0m`);
+      }
       old.kill("SIGTERM");
       await old.exited;
     }
