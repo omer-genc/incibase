@@ -1,6 +1,7 @@
 // Admin operations shared by the MCP admin tools and the dashboard's
 // `/api/admin/:tool` endpoint. Callers must already have checked the admin key.
 import { z } from "zod";
+import { runAdminSql, SQL_MAX_ROWS, SQL_TIMEOUT_MS } from "./adminsql.ts";
 import { describeApp } from "./describe.ts";
 import { visibilityOf } from "./storage.ts";
 import type { Engine } from "./engine.ts";
@@ -156,13 +157,10 @@ export function adminTools(engine: Engine): Record<string, AdminTool> {
         engine.call(a.path, a.args, { userId: a.asUser ?? null, admin: true }, { allowInternal: true }),
     },
     admin_sql: {
-      description: "Run a read-only SQL query against the SQLite database. Documents live in tables named after the schema tables with columns _id, _creationTime, data (JSON; use json_extract).",
+      description: `Run one read-only SQL query (SELECT, WITH or EXPLAIN) against the SQLite database. Documents live in tables named after the schema tables with columns _id, _creationTime, data (JSON; use json_extract). Returns at most ${SQL_MAX_ROWS} rows and stops after ${SQL_TIMEOUT_MS / 1000}s; _incibase_meta, _passwords and _sessions cannot be read.`,
       input: z.object({ query: z.string(), params: z.array(z.union([z.string(), z.number(), z.null()])).default([]) }),
       readOnly: true,
-      run: async (a) => {
-        const rows = (await engine.readTx((s) => s.conn.query(a.query).all(...a.params) as unknown[])).result;
-        return { rows: rows.slice(0, 1000), truncated: rows.length > 1000 };
-      },
+      run: async (a) => runAdminSql(engine.store.path, a.query, a.params),
     },
     admin_logs: {
       description: "Recent function executions (newest first) with duration and errors.",
