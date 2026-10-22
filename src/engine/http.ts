@@ -247,9 +247,9 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
   const notFound = (req: Request) => withCors(req, Response.json({ error: { code: "NOT_FOUND", message: "Not found" } }, { status: 404 }));
 
   const mcp = route({
-    GET: (req) => handleMcp(engine, req),
-    POST: (req) => handleMcp(engine, req, () => readText(req)),
-    DELETE: (req) => handleMcp(engine, req),
+    GET: (req) => handleMcp(engine, req, undefined, surface),
+    POST: (req) => handleMcp(engine, req, () => readText(req), surface),
+    DELETE: (req) => handleMcp(engine, req, undefined, surface),
   });
 
   /** Runs the app's httpAction for `req`, if one matches. */
@@ -290,7 +290,10 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
     maxRequestBodySize: Math.max(engine.storage.maxUploadBytes, maxJsonBytes) + 1024 * 1024,
     error: (err) => errorResponse(err),
     routes: routesFor(surface, refuse, notFound, {
-      "/api/health": route({ GET: () => Response.json({ ok: true, version: VERSION, startedAt: engine.startedAt }) }),
+      // `generation` tells a host's deploy gate which release this process runs (it sets INCIBASE_GENERATION per start).
+      "/api/health": route({
+        GET: () => Response.json({ ok: true, version: VERSION, startedAt: engine.startedAt, generation: process.env.INCIBASE_GENERATION || null }),
+      }),
       "/api/query": callRoute("query"),
       "/api/mutation": callRoute("mutation"),
       "/api/action": callRoute("action"),
@@ -350,7 +353,7 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
       "/api/admin/:tool": route({
         POST: async (req) => {
           requireAdmin(req);
-          const tool = adminTools(engine)[req.params.tool!];
+          const tool = adminTools(engine, { surface })[req.params.tool!];
           if (!tool) throw new IncibaseError({ code: "NOT_FOUND", message: `Unknown admin tool "${req.params.tool}"` });
           const args = await readJson(req);
           try {

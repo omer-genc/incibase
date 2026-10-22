@@ -3,6 +3,7 @@ import type { IndexDefinition, SchemaDefinition } from "../schema.ts";
 import { collectHeldIds, storageFieldsOf, WRAPPERS } from "./files.ts";
 import { EXIT_CODE, ExitCode } from "./exit-codes.ts";
 import { toJsonSchema } from "./jsonschema.ts";
+import { logEvent } from "./log.ts";
 import { FIRST_USER_TABLE_NUMBER, quoteIdent, type DocumentRow, type Store } from "./store.ts";
 
 /** A stored field the new schema no longer has. */
@@ -17,7 +18,21 @@ export interface RemovedField {
 export interface MigrationOptions {
   /** Let the migration delete stored fields the schema no longer has; otherwise it is refused. */
   allowFieldRemoval?: boolean;
+  /** Documents re-validated per page (default PAGE_SIZE); only tests change it. */
+  pageSize?: number;
+  /** Stored JSON (in characters) re-validated per page (default PAGE_BYTES); only tests change it. */
+  pageBytes?: number;
 }
+
+/** Documents a re-validation holds in memory at once: it reads each table in pages of at most this many. */
+export const PAGE_SIZE = 5000;
+/**
+ * Stored JSON a re-validation page holds (in characters): a page ends at
+ * PAGE_SIZE documents or once it holds this much, whichever comes first, so
+ * large documents make smaller pages. A page takes at least one document,
+ * however large.
+ */
+export const PAGE_BYTES = 8 * 1024 * 1024;
 
 export interface MigrationReport {
   createdTables: string[];
@@ -33,16 +48,19 @@ export interface MigrationReport {
 type Problem = { table: string; id: string; message: string };
 
 const LISTED = 20;
+/** Problems a refused migration keeps in full; the rest are only counted, so a table of invalid documents cannot exhaust memory. */
+const KEPT_PROBLEMS = 1000;
 
-function describeProblems(problems: Problem[], removedFields: RemovedField[]) {
+function describeProblems(problems: Problem[], removedFields: RemovedField[], problemCount = problems.length) {
   const parts: string[] = [];
-  if (problems.length) {
+  if (problemCount) {
     parts.push(
-      `Schema does not match ${problems.length} existing document(s):\n` +
+      `Schema does not match ${problemCount} existing document(s):\n` +
         problems
           .slice(0, LISTED)
           .map((p) => `  ${p.table} ${p.id}: ${p.message.replaceAll("\n", "\n    ")}`)
-          .join("\n"),
+          .join("\n") +
+        (problemCount > LISTED ? `\n  ...and ${problemCount - LISTED} more` : ""),
     );
   }
   if (removedFields.length) {
@@ -64,11 +82,14 @@ export class MigrationError extends Error {
   readonly [EXIT_CODE] = ExitCode.MIGRATION_REFUSED;
 
   constructor(
+    /** The first KEPT_PROBLEMS documents that no longer validate. */
     readonly problems: Problem[],
     readonly removedFields: RemovedField[] = [],
-    message = describeProblems(problems, removedFields),
+    message?: string,
+    /** How many documents no longer validate, `problems` and the ones past it. */
+    readonly problemCount = problems.length,
   ) {
-    super(message);
+    super(message ?? describeProblems(problems, removedFields, problemCount));
     this.name = "MigrationError";
   }
 }
@@ -84,7 +105,10 @@ interface TableRow {
 /**
  * Brings the database in line with the schema, in one transaction:
  * creates tables, syncs indexes and, when a table's validator changed,
- * re-validates every document (rewriting those whose parsed form differs).
+ * re-validates every document (rewriting those whose parsed form differs),
+ * a page of documents at a time so memory stays bounded on large tables.
+ * A migration that changed something logs `migration_committed` once it has
+ * committed: the host keeps a release whose migration committed.
  * Throws MigrationError, leaving the database untouched, when any document no
  * longer validates, when a rewrite would delete stored fields (unless
  * `allowFieldRemoval`), or when no schema was loaded but tables exist.
@@ -122,6 +146,7 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined, opti
     }
     let nextNumber = Math.max(FIRST_USER_TABLE_NUMBER - 1, ...[...existing.values()].map((r) => r.number)) + 1;
     const problems: Problem[] = [];
+    const problemCount = { value: 0 };
     const removedFields: RemovedField[] = [];
     let pendingFiles: Set<string> | undefined;
 
@@ -149,7 +174,10 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined, opti
             (db.query(`SELECT _id FROM _storage WHERE json_extract(data, '$.pending') = 1`).all() as { _id: string }[]).map((r) => r._id),
           );
           const removed = new Map<string, number>();
-          report.rewrittenDocuments += revalidate(store, name, def.validator, problems, removed, pendingFiles);
+          report.rewrittenDocuments += revalidate(store, name, def.validator, { problems, problemCount, removed, pendingFiles }, {
+            size: options.pageSize ?? PAGE_SIZE,
+            bytes: options.pageBytes ?? PAGE_BYTES,
+          });
           for (const [field, documents] of removed) removedFields.push({ table: name, field, documents });
         }
       }
@@ -192,11 +220,15 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined, opti
     }
 
     const refusedFields = options.allowFieldRemoval ? [] : removedFields;
-    if (problems.length || refusedFields.length) throw new MigrationError(problems, refusedFields);
+    if (problemCount.value || refusedFields.length) {
+      throw new MigrationError(problems, refusedFields, undefined, problemCount.value);
+    }
     report.removedFields = removedFields;
   });
 
   run.immediate();
+  const changed = [report.createdTables, report.deactivatedTables, report.addedIndexes, report.droppedIndexes, report.removedFields];
+  if (changed.some((l) => l.length) || report.rewrittenDocuments) logEvent("info", { ev: "migration_committed", ...report });
   return report;
 }
 
@@ -204,8 +236,24 @@ function sameIndex(a: IndexDefinition, b: IndexDefinition) {
   return a.unique === b.unique && a.fields.join("\0") === b.fields.join("\0");
 }
 
+/** What re-validating the tables found so far. */
+interface Findings {
+  /** Documents that no longer validate: the first KEPT_PROBLEMS of them. */
+  problems: Problem[];
+  /** How many documents no longer validate. */
+  problemCount: { value: number };
+  /** Stored keys a rewrite would drop, as documents per field. */
+  removed: Map<string, number>;
+  pendingFiles: Set<string>;
+}
+
 /**
- * Re-parses every document and rewrites those whose stored form changed.
+ * Re-parses every document and rewrites those whose stored form changed,
+ * a page at a time in `_id` order (at most `page.size` documents, and no more
+ * once they hold `page.bytes`). The pages are keyset pages read inside the
+ * migration's transaction, so a rewrite (which keeps the `_id`) never moves a
+ * document into a page still to come; each page's cursor is closed before its
+ * rewrites run.
  * Stored keys the rewrite would drop are counted per field in `removed`.
  * (Values a `.catch()` replaces are rewritten without being counted.)
  * Pending files a document holds (from `pendingFiles`) are marked not pending
@@ -215,30 +263,52 @@ function revalidate(
   store: Store,
   table: string,
   validator: z.ZodObject<any, any>,
-  problems: Problem[],
-  removed: Map<string, number>,
-  pendingFiles: Set<string>,
+  { problems, problemCount, removed, pendingFiles }: Findings,
+  page: { size: number; bytes: number },
 ): number {
   let rewritten = 0;
   const held = new Set<string>();
   const update = store.write.query(`UPDATE ${quoteIdent(table)} SET data = ? WHERE _id = ?`);
-  const rows = store.write.query(`SELECT _id, _creationTime, data FROM ${quoteIdent(table)}`).all() as DocumentRow[];
-  for (const row of rows) {
-    const stored = JSON.parse(row.data);
-    if (pendingFiles.size) collectHeldIds(stored, pendingFiles, held);
-    const result = validator.safeParse(stored);
-    if (!result.success) {
-      problems.push({ table, id: row._id, message: z.prettifyError(result.error) });
-      continue;
+  const pageSql = `SELECT _id, _creationTime, data FROM ${quoteIdent(table)} WHERE _id > ? ORDER BY _id LIMIT ?`;
+  let after = "";
+  while (true) {
+    const rows: DocumentRow[] = [];
+    let bytes = 0;
+    // A statement of its own per page: one left mid-iteration (by the break) cannot be run again, only finalized.
+    const read = store.write.prepare(pageSql);
+    try {
+      for (const row of read.iterate(after, page.size) as IterableIterator<DocumentRow>) {
+        rows.push(row);
+        bytes += row.data.length;
+        if (bytes >= page.bytes) break;
+      }
+    } finally {
+      read.finalize();
     }
-    const data = JSON.stringify(result.data);
-    if (data !== row.data) {
-      const fields = new Set<string>();
-      droppedKeys(JSON.parse(row.data), JSON.parse(data), validator, "", fields);
-      for (const field of fields) removed.set(field, (removed.get(field) ?? 0) + 1);
-      update.run(data, row._id);
-      rewritten++;
+    for (const row of rows) {
+      const stored = JSON.parse(row.data);
+      if (pendingFiles.size) collectHeldIds(stored, pendingFiles, held);
+      const result = validator.safeParse(stored);
+      if (!result.success) {
+        if (problemCount.value++ < KEPT_PROBLEMS) problems.push({ table, id: row._id, message: z.prettifyError(result.error) });
+        continue;
+      }
+      const data = JSON.stringify(result.data);
+      if (data !== row.data) {
+        const fields = new Set<string>();
+        droppedKeys(JSON.parse(row.data), JSON.parse(data), validator, "", fields);
+        for (const field of fields) removed.set(field, (removed.get(field) ?? 0) + 1);
+        update.run(data, row._id);
+        rewritten++;
+      }
     }
+    if (rows.length < page.size && bytes < page.bytes) break;
+    after = rows[rows.length - 1]!._id;
+    // The loop never yields, so the page just done (its rows, parses and
+    // rewrites) is only freed if collected here; a large table would
+    // otherwise pile up garbage until it ends.
+    rows.length = 0;
+    Bun.gc(true);
   }
   const release = store.write.query(`UPDATE _storage SET data = json_remove(data, '$.pending', '$.detachedAt') WHERE _id = ?`);
   for (const fileId of held) {
