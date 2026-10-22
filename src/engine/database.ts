@@ -4,6 +4,7 @@ import { IncibaseError } from "../errors.ts";
 import { FIELD_PATH_REGEX, type IndexDefinition } from "../schema.ts";
 import type { Identity } from "./engine.ts";
 import { syncFiles } from "./files.ts";
+import { databaseFullError, isDatabaseFull } from "./limits.ts";
 import { logEvent } from "./log.ts";
 import type { Change, RangeRead, ReadSet } from "./readset.ts";
 import { fieldExpr, quoteIdent, rowToDoc, type Document, type DocumentRow, type Store, type TableInfo } from "./store.ts";
@@ -311,6 +312,10 @@ export class DbSession {
 
   private assertWritable() {
     if (!this.writable) throw new Error("Database writes are only allowed in mutations");
+    // SQLite rolls the whole transaction back on some errors (SQLITE_FULL); a write after that would commit on its own.
+    if (!this.conn.inTransaction) {
+      throw new Error("This mutation's transaction was rolled back by an earlier error (e.g. DATABASE_FULL); it cannot write any more");
+    }
   }
 
   private validate(table: TableInfo, value: unknown): string {
@@ -349,6 +354,7 @@ export class DbSession {
       if (message.includes("UNIQUE constraint failed")) {
         throw new IncibaseError({ code: "UNIQUE_VIOLATION", message: "A document with the same unique index value exists" });
       }
+      if (isDatabaseFull(err)) throw databaseFullError();
       throw err;
     }
   }
