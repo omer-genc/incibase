@@ -125,6 +125,25 @@ function notADatabase(path: string) {
 }
 
 /**
+ * SQLite's answer when `path` cannot be opened or written at all: not a file
+ * (a directory), read-only, or owned by someone else (say after a backup was
+ * restored without its owner). No restart fixes these, so they are
+ * ConfigError (exit 64), as the data dir's own EACCES is; anything else is
+ * returned as it is.
+ */
+export function unusableDatabase(err: unknown, path: string): unknown {
+  const code = String((err as { code?: unknown } | null)?.code ?? "");
+  if (code === "SQLITE_NOTADB") return notADatabase(path);
+  if (code.startsWith("SQLITE_CANTOPEN") || code.startsWith("SQLITE_READONLY") || code === "SQLITE_PERM" || code === "SQLITE_AUTH") {
+    return new ConfigError(
+      `Cannot use ${resolve(path)}: ${(err as Error).message} (${code}). ` +
+        `It must be a file this user owns and may write, as must its directory (check the owner and mode).`,
+    );
+  }
+  return err;
+}
+
+/**
  * Creates an empty `path` (mode 0600), or tightens it, and says whether it
  * created it. SQLite gives -wal and -shm files the mode of their database.
  */
@@ -151,7 +170,12 @@ function ensurePrivateFile(path: string): boolean {
  */
 function openElsewhere(path: string): boolean {
   if (!existsSync(path)) return false;
-  const db = new Database(path, { readwrite: true });
+  let db: Database;
+  try {
+    db = new Database(path, { readwrite: true });
+  } catch (err) {
+    throw unusableDatabase(err, path);
+  }
   try {
     db.run("PRAGMA locking_mode = EXCLUSIVE");
     db.run("BEGIN EXCLUSIVE");
@@ -160,8 +184,7 @@ function openElsewhere(path: string): boolean {
   } catch (err) {
     const code = (err as { code?: string }).code;
     if (code === "SQLITE_BUSY") return true;
-    if (code === "SQLITE_NOTADB") throw notADatabase(path);
-    throw err;
+    throw unusableDatabase(err, path);
   } finally {
     db.close();
   }
@@ -194,7 +217,12 @@ export class DataDirLock {
   constructor(dir: string, database?: string) {
     const path = join(dir, "LOCK");
     const created = ensurePrivateFile(path);
-    const db = new Database(path, { create: true });
+    let db: Database;
+    try {
+      db = new Database(path, { create: true });
+    } catch (err) {
+      throw unusableDatabase(err, path);
+    }
     try {
       db.run("PRAGMA locking_mode = EXCLUSIVE");
       db.run("PRAGMA journal_mode = MEMORY"); // no LOCK-journal file
@@ -209,7 +237,7 @@ export class DataDirLock {
             `If another tool wrote it, move it away; then start again.`,
         );
       }
-      throw err;
+      throw unusableDatabase(err, path);
     }
     try {
       if (created && database && openElsewhere(database)) throw new DataDirLockedError(resolve(dir));
@@ -298,7 +326,7 @@ export class Store {
     } catch (err) {
       write?.close();
       this.lock.release();
-      throw (err as { code?: string }).code === "SQLITE_NOTADB" ? notADatabase(path) : err;
+      throw unusableDatabase(err, path);
     }
   }
 

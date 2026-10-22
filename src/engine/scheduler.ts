@@ -135,6 +135,8 @@ export class Scheduler {
       }
       if (recovered.some((r) => r.requeue)) this.poke();
     });
+    // Uploads a stopped process left half stored (see StorageService.recoverInterrupted).
+    void this.persist("upload recovery", () => this.engine.storage.recoverInterrupted(BACKGROUND));
     const crons = this.engine.crons?.jobs ?? [];
     this.reportSkippedCrons(crons);
     for (const job of crons) this.startCron(job);

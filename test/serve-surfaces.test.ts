@@ -838,10 +838,12 @@ describe("service keys file", () => {
     expect(() => newServiceKey("a_b")).toThrow(/Invalid service key id/);
   });
 
-  test("a reload swaps the keys and reports narrowed ones; a bad file keeps the old keys", () => {
+  test("a reload swaps the keys and reports narrowed ones; a bad file fails closed until a good one is read", () => {
     const root = dir();
     const path = keysFile(join(root, "k.json"), KEYS);
     const keys = new ServiceKeys(path);
+    const sha = (file: string) => new Bun.CryptoHasher("sha256").update(readFileSync(file)).digest("hex");
+    expect(keys.status).toMatchObject({ file: path, sha256: sha(path) });
     keysFile(path, [
       { id: "billing", sha256: internalKey.sha256, scopes: ["internal", "upload"] },
       { id: "support", sha256: impersonateKey.sha256, scopes: [] },
@@ -850,16 +852,31 @@ describe("service keys file", () => {
     ]);
     const quiet = silence();
     try {
-      expect([...keys.reload()!].sort()).toEqual(["bare", "media", "support"]);
+      expect([...keys.reload()].sort()).toEqual(["bare", "media", "support"]);
       expect(keys.match(internalKey.key)?.scopes).toEqual(["internal", "upload"]);
       expect(keys.match(uploadKey.key)).toBeNull();
-      keysFileText(path, "[{");
-      expect(keys.reload()).toBeNull();
-      expect(quiet.errors.join("\n")).toContain("Keeping the service keys read before");
+      expect(keys.status).toMatchObject({ sha256: sha(path), keys: 2 });
+      expect(keys.status.error).toBeUndefined();
+      // Half written, invalid or unreadable: every key that worked stops working.
+      for (const bad of ["[{", '[{"id":"billing"}]', null]) {
+        keysFile(path, [{ id: "billing", sha256: internalKey.sha256, scopes: ["internal"] }]);
+        keys.reload();
+        expect(keys.match(internalKey.key)?.scopes).toEqual(["internal"]);
+        if (bad === null) rmSync(path);
+        else keysFileText(path, bad);
+        expect([...keys.reload()]).toEqual(["billing"]);
+        expect(keys.match(internalKey.key)).toBeNull();
+        expect(keys.status).toMatchObject({ sha256: null, keys: 0 });
+        expect(keys.status.error).toContain(path);
+      }
+      expect(quiet.errors.join("\n")).toContain("No service key works until the file is fixed");
+      keysFile(path, [{ id: "billing", sha256: internalKey.sha256, scopes: ["internal"] }]);
+      expect([...keys.reload()]).toEqual([]);
+      expect(keys.status).toMatchObject({ sha256: sha(path), keys: 1 });
     } finally {
       quiet.restore();
     }
-    expect(keys.match(internalKey.key)?.scopes).toEqual(["internal", "upload"]);
+    expect(keys.match(internalKey.key)?.scopes).toEqual(["internal"]);
   });
 });
 
@@ -1174,13 +1191,33 @@ describe("serve in hosted mode", () => {
     expect(await ws.next()).toMatchObject({ id: "s", type: "error", error: { code: "FUNCTION_NOT_FOUND" } });
     expect(run.events().find((e) => e.ev === "service_keys_reloaded")).toMatchObject({ keys: 1, narrowed: ["first"] });
 
-    // A broken file is logged and the keys stay as they were.
+    // The admin socket says which file the keys came from, so a host can check that its reload took.
+    const fileSha = () => new Bun.CryptoHasher("sha256").update(readFileSync(p.keys)).digest("hex");
+    const health = async () => (await (await over(p.admin, "/api/health")).json()) as { serviceKeys?: Record<string, unknown> };
+    expect((await health()).serviceKeys).toMatchObject({ file: p.keys, sha256: fileSha(), keys: 1 });
+    expect((await (await over(p.pub, "/api/health")).json()).serviceKeys).toBeUndefined();
+
+    // A file that cannot be used fails closed: the key it was meant to revoke does not stay usable.
+    ws.send({ type: "auth", token: second.key });
+    expect(await ws.next()).toEqual({ type: "auth", userId: null });
+    expect(await ws.next()).toEqual({ id: "s", type: "data", value: "second" });
     keysFileText(p.keys, "[{");
     run.proc.kill("SIGHUP");
     await run.until(() => run.events().some((e) => e.ev === "service_keys_reload_failed" && e.level === "error"), "the reload error");
-    expect((await queryOver(p.pub, "app:secret", second.key)).body.value).toBe("second");
+    expect((await queryOver(p.pub, "app:secret", second.key)).status).toBe(404);
+    expect(await ws.next()).toEqual({ type: "auth", userId: null });
+    expect(await ws.next()).toMatchObject({ id: "s", type: "error", error: { code: "FUNCTION_NOT_FOUND" } });
+    const failed = (await health()).serviceKeys!;
+    expect(failed).toMatchObject({ sha256: null, keys: 0 });
+    expect(String(failed.error)).toContain("not JSON");
     expect(run.proc.exitCode).toBeNull();
     expect(run.proc.pid).toBe(pid);
+
+    // A good file brings the keys back.
+    keysFile(p.keys, [{ id: "second", sha256: second.sha256, scopes: ["internal"] }]);
+    run.proc.kill("SIGHUP");
+    await run.until(async () => (await queryOver(p.pub, "app:secret", second.key)).status === 200, "the key back");
+    expect((await health()).serviceKeys).toMatchObject({ sha256: fileSha(), keys: 1 });
     ws.ws.close();
   });
 

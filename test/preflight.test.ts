@@ -664,8 +664,9 @@ describe("auth semaphore", () => {
     }
   });
 
-  test("INCIBASE_AUTH_CONCURRENCY sets the limit (default 4); an invalid value is a ConfigError (exit 64) before the data dir is touched", async () => {
-    expect(open({ modules: {} }, dir()).auth.hashing.limit).toBe(4);
+  test("INCIBASE_AUTH_CONCURRENCY sets the limit (by default none, as in 0.2.0); an invalid value is a ConfigError (exit 64) before the data dir is touched", async () => {
+    expect(open({ modules: {} }, dir()).auth.hashing.limit).toBe(Infinity);
+    expect(open({ modules: {} }, dir(), { auth: { concurrency: 2 } }).auth.hashing.limit).toBe(2);
     await withEnv({ INCIBASE_AUTH_CONCURRENCY: "3" }, () => expect(open({ modules: {} }, dir(), { auth: { concurrency: 2 } }).auth.hashing.limit).toBe(3));
     for (const bad of ["0", "-1", "two", "1.5"]) {
       const data = join(dir(), "never");

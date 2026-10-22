@@ -22,6 +22,12 @@ export interface MigrationOptions {
   pageSize?: number;
   /** Stored JSON (in characters) re-validated per page (default PAGE_BYTES); only tests change it. */
   pageBytes?: number;
+  /**
+   * The database size cap (`INCIBASE_MAX_DB_BYTES`): a migration that grows
+   * the database past it is refused, so a release cannot take a database
+   * over its cap (and leave every later write failing with DATABASE_FULL).
+   */
+  maxDbBytes?: number;
 }
 
 /** Documents a re-validation holds in memory at once: it reads each table in pages of at most this many. */
@@ -111,7 +117,10 @@ interface TableRow {
  * committed: the host keeps a release whose migration committed.
  * Throws MigrationError, leaving the database untouched, when any document no
  * longer validates, when a rewrite would delete stored fields (unless
- * `allowFieldRemoval`), or when no schema was loaded but tables exist.
+ * `allowFieldRemoval`), when a new index cannot hold the data (a unique one
+ * over duplicates), when it would grow the database past `maxDbBytes`, or
+ * when no schema was loaded but tables exist. Other failures (a full disk, an
+ * I/O error) are thrown as they are: a later start may succeed.
  * Tables removed from the schema keep their data. Pending files a re-validated
  * document holds stop being pending, so cleanup keeps them even when the field
  * is no longer an `id("_storage")`.
@@ -128,7 +137,9 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined, opti
   const db = store.write;
   const tables = schema?.tables ?? {};
 
+  const pageCount = () => (db.query("PRAGMA page_count").get() as { page_count: number }).page_count;
   const run = db.transaction(() => {
+    const pagesBefore = pageCount();
     const existing = new Map(
       (db.query(`SELECT * FROM _incibase_tables`).all() as TableRow[]).map((r) => [r.name, r]),
     );
@@ -196,7 +207,9 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined, opti
           try {
             store.createIndex(name, index);
           } catch (err) {
-            // Existing data the index cannot hold (e.g. duplicates for a unique one): refused like any mismatch.
+            // Existing data the index cannot hold (duplicates for a unique one): refused like any mismatch.
+            // Anything else (disk full, I/O) is no verdict on the release and is thrown as it is.
+            if (!String((err as { code?: unknown }).code ?? "").startsWith("SQLITE_CONSTRAINT")) throw err;
             throw new MigrationError([], [], `Cannot create index ${name}.${index.name}: ${(err as Error).message}`);
           }
           report.addedIndexes.push(`${name}.${index.name}`);
@@ -224,6 +237,20 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined, opti
       throw new MigrationError(problems, refusedFields, undefined, problemCount.value);
     }
     report.removedFields = removedFields;
+
+    if (options.maxDbBytes !== undefined) {
+      const { page_size: pageSize } = db.query("PRAGMA page_size").get() as { page_size: number };
+      const pagesAfter = pageCount();
+      // A database already over its cap may still migrate, as long as the migration does not grow it.
+      if (pagesAfter > pagesBefore && pagesAfter * pageSize > options.maxDbBytes) {
+        throw new MigrationError(
+          [],
+          [],
+          `The migration would grow the database from ${pagesBefore * pageSize} to ${pagesAfter * pageSize} bytes, ` +
+            `past INCIBASE_MAX_DB_BYTES (${options.maxDbBytes}). Delete data, or raise the limit, and start again.`,
+        );
+      }
+    }
   });
 
   run.immediate();

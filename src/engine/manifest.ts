@@ -12,49 +12,67 @@ export const MANIFEST_SUFFIX = " */";
 export const MAX_MANIFEST_BYTES = 1024 * 1024;
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** Module paths as the loader discovers them (`"chat/messages"`); other characters would break function paths. */
+export const MODULE_PATH_REGEX = /^[A-Za-z0-9_]+(\/[A-Za-z0-9_]+)*$/;
+/** Export names a function reference (`api.chat.messages.list`) can spell. */
+export const EXPORT_NAME_REGEX = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const FUNCTION_PATH = new RegExp(`^${MODULE_PATH_REGEX.source.slice(1, -1)}:${EXPORT_NAME_REGEX.source.slice(1, -1)}$`);
 
-const functionSchema = z.object({
-  path: z.string(),
+// Root prints what a manifest says, so nothing in it may carry terminal
+// control sequences: text without C0/C1 controls (descriptions may keep tabs
+// and newlines), and printable ASCII where that is all there can be.
+/** Text without control characters, at most `max` characters. */
+const text = (max: number) => z.string().max(max).regex(/^[^\u0000-\u001f\u007f-\u009f]*$/, "must not contain control characters");
+/** Printable ASCII, 1 to `max` characters. */
+const ascii = (max: number) => z.string().regex(/^[\x20-\x7e]+$/, "must be printable ASCII").max(max);
+const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+const functionSchema = z.strictObject({
+  path: z.string().max(512).regex(FUNCTION_PATH, 'must be "module/path:export"'),
   type: z.enum(["query", "mutation", "action"]),
   visibility: z.enum(["public", "internal"]),
-  description: z.string().optional(),
+  description: z
+    .string()
+    .regex(/^[^\u0000-\u0008\u000b-\u001f\u007f-\u009f]*$/, "must not contain control characters other than tabs and newlines")
+    .optional(),
 });
 
-const cronSchema = z.object({
-  name: z.string(),
+const cronSchema = z.strictObject({
+  name: text(256),
   schedule: z.union([
-    z.object({ kind: z.literal("interval"), ms: z.number() }),
-    z.object({ kind: z.literal("cron"), expression: z.string(), tz: z.string().optional() }),
+    z.strictObject({ kind: z.literal("interval"), ms: z.number() }),
+    z.strictObject({ kind: z.literal("cron"), expression: ascii(256), tz: ascii(128).optional() }),
   ]),
-  path: z.string(),
+  path: z.string().max(512).regex(FUNCTION_PATH, 'must be "module/path:export"'),
 });
 
-const routeSchema = z.object({
-  method: z.string(),
-  path: z.string().optional(),
-  pathPrefix: z.string().optional(),
+const routeSchema = z.strictObject({
+  method: z.string().regex(/^[A-Z]{1,16}$/, "must be an HTTP method"),
+  path: ascii(2048).optional(),
+  pathPrefix: ascii(2048).optional(),
 });
 
 /** What the app defines, as `describeApp` reports it, without a database. */
-export const appSummarySchema = z.object({
+export const appSummarySchema = z.strictObject({
   functions: z.array(functionSchema),
   tables: z.record(
-    z.string(),
-    z.object({ indexes: z.array(z.object({ name: z.string(), fields: z.array(z.string()), unique: z.boolean() })) }),
+    text(256),
+    z.strictObject({ indexes: z.array(z.strictObject({ name: text(256), fields: z.array(text(1024)), unique: z.boolean() })) }),
   ),
   crons: z.array(cronSchema),
   http: z.array(routeSchema),
 });
 
-export const manifestSchema = z.object({
+/** Strict throughout: a key the writer never writes is refused, not passed on. */
+export const manifestSchema = z.strictObject({
   format: z.literal(1),
-  incibaseVersion: z.string().min(1),
+  incibaseVersion: z.string().max(64).regex(SEMVER, "must be a version such as 0.3.0"),
   /** Of the bundle's bytes after the manifest line's newline. */
   sha256: z.string().regex(/^[0-9a-f]{64}$/),
   createdAt: z.iso.datetime(),
   app: appSummarySchema,
   /** Environment variables the code reads (`process.env.X`, `Bun.env.X`, `import.meta.env.X`). */
-  envNames: z.array(z.string().regex(ENV_NAME)),
+  envNames: z.array(z.string().max(256).regex(ENV_NAME)),
 });
 
 export type AppSummary = z.infer<typeof appSummarySchema>;
@@ -65,14 +83,23 @@ export function manifestLine(manifest: BundleManifest): string {
   return `${MANIFEST_PREFIX}${JSON.stringify(manifest).replaceAll("*/", "*\\/")}${MANIFEST_SUFFIX}`;
 }
 
-/** Parses and validates a manifest line (without its newline); ConfigError naming `file` otherwise. */
+/**
+ * Parses and validates a manifest line (without its newline); ConfigError naming `file` otherwise.
+ * A raw `*\/` in the JSON is refused: it would end the comment early, and
+ * whatever followed it would run as module code without being in the sha256.
+ * `manifestLine` never writes one.
+ */
 export function parseManifestLine(line: string, file: string): BundleManifest {
   if (!line.startsWith(MANIFEST_PREFIX) || !line.endsWith(MANIFEST_SUFFIX)) {
     throw new ConfigError(`${file} is not an incibase bundle: its first line is not an incibase-manifest comment`);
   }
+  const jsonText = line.slice(MANIFEST_PREFIX.length, -MANIFEST_SUFFIX.length);
+  if (jsonText.includes("*/")) {
+    throw new ConfigError(`${file}: the manifest contains "*/", which would end its comment and run what follows; it was not written by incibase bundle`);
+  }
   let json: unknown;
   try {
-    json = JSON.parse(line.slice(MANIFEST_PREFIX.length, -MANIFEST_SUFFIX.length));
+    json = JSON.parse(jsonText);
   } catch (err) {
     throw new ConfigError(`${file}: the manifest is not valid JSON (${(err as Error).message})`);
   }

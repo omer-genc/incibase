@@ -73,7 +73,10 @@ Options:
                     duration such as 500ms. A second signal cuts at once
                     (serve, dev; default: 10, dev 1)
   --migrate-only    serve: start as usual, migrate the database, then exit 0
-                    without listening (a preflight on a copy of the data)
+                    without listening (a preflight on a copy of the data).
+                    A data dir without a database is refused (exit 64)
+  --allow-empty     --migrate-only: accept a data dir without a database
+                    (the first release of a new app) and create it
 `;
 
 /** The app a built binary carries. */
@@ -113,6 +116,7 @@ function parse(argv: string[]) {
       timeouts: { type: "string" },
       "drain-timeout": { type: "string" },
       "migrate-only": { type: "boolean", default: false },
+      "allow-empty": { type: "boolean", default: false },
       dev: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -181,6 +185,7 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
   if (values["migrate-only"] && !["serve", "start"].includes(command)) {
     exitOnStartError(new ConfigError(`--migrate-only is for serve, not ${command}`));
   }
+  if (values["allow-empty"] && !values["migrate-only"]) exitOnStartError(new ConfigError("--allow-empty is for serve --migrate-only"));
 
   switch (command) {
     case "serve":
@@ -302,6 +307,13 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
       : values.bundle !== undefined
         ? (await loadAppFromBundle(values.bundle)).app
         : await loadAppFromDir(values.dir);
+    // A preflight on a copy that is not there would pass without trying the migration on real data.
+    if (values["migrate-only"] && !values["allow-empty"] && !existsSync(join(values.data, "data.db"))) {
+      throw new ConfigError(
+        `--migrate-only: there is no database at ${join(values.data, "data.db")} to migrate. ` +
+          `Point --data at the copy of the data; for an app with no data yet, pass --allow-empty.`,
+      );
+    }
     engine = new Engine(app, {
       dataDir: values.data,
       dev,
@@ -320,20 +332,8 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
     writeIfChanged(join(values.dir, "_generated", "schema.json"), JSON.stringify(describeApp(engine), null, 2) + "\n");
   }
   const m = engine.migration;
-  if (isJson()) {
-    const changed = [m.createdTables, m.addedIndexes, m.droppedIndexes, m.deactivatedTables, m.removedFields].some((l) => l.length);
-    if (changed || m.rewrittenDocuments) {
-      logEvent("info", {
-        ev: "migration",
-        createdTables: m.createdTables,
-        addedIndexes: m.addedIndexes,
-        droppedIndexes: m.droppedIndexes,
-        deactivatedTables: m.deactivatedTables,
-        removedFields: m.removedFields,
-        rewrittenDocuments: m.rewrittenDocuments,
-      });
-    }
-  } else {
+  // In json mode migrate() already logged migration_committed with the same report.
+  if (!isJson()) {
     for (const t of m.createdTables) console.log(`+ table ${t}`);
     for (const i of m.addedIndexes) console.log(`+ index ${i}`);
     for (const i of m.droppedIndexes) console.log(`- index ${i}`);
@@ -343,17 +343,19 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
   }
   if (values["migrate-only"]) return finishMigrateOnly(engine);
 
-  engine.start();
   const dashboard = !values["no-dashboard"];
   const hostname = values.host ?? (dev ? "localhost" : "0.0.0.0");
   let server: Listeners;
   try {
     server = await startListeners(engine, { port, hostname, dashboard, socket: values.socket, adminSocket: values["admin-socket"] });
   } catch (err) {
+    // The scheduler has not started: no job was claimed that this stop would leave "running".
     await engine.stop().catch(() => {});
     // An address in use may clear up (exit 75); a host that does not resolve or a port this user may not bind will not.
     exitOnStartError(await listenError(err, hostname, port));
   }
+  // Once listening: a listener that fails must not cut a job the scheduler already claimed.
+  engine.start();
   // Only once serving: a startup error must still exit instead of leaving a process that serves nothing.
   installCrashHandlers();
 

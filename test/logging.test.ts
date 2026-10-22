@@ -207,7 +207,9 @@ describe("json log format", () => {
     for (const secret of [ADMIN_KEY, token, "secret-in-query", "p_ssw0rd_secret"]) expect(stdout + stderr).not.toContain(secret);
 
     expect(all.filter((e) => e.ev === "ready")).toHaveLength(1);
-    expect(all.find((e) => e.ev === "migration")?.createdTables).toEqual(["notes"]);
+    // One event per migration: migrate()'s, not a second copy from serve.
+    expect(all.filter((e) => e.ev === "migration_committed").map((e) => e.createdTables)).toEqual([["notes"]]);
+    expect(all.filter((e) => e.ev === "migration")).toEqual([]);
 
     const consoleOf = (msg: string) => all.filter((e) => e.ev === "console" && String(e.msg).startsWith(msg));
     const [first] = consoleOf("hello world");

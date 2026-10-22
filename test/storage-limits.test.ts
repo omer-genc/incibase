@@ -286,9 +286,12 @@ describe("upload concurrency", () => {
     expect(engine.storage.uploads.active).toBe(0);
   });
 
-  test("INCIBASE_UPLOAD_CONCURRENCY sets the limit; the default is 2", () => {
-    expect(start().engine.storage.uploads.limit).toBe(2);
-    expect(withEnv({ INCIBASE_UPLOAD_CONCURRENCY: "5" }, () => start()).engine.storage.uploads.limit).toBe(5);
+  test("INCIBASE_UPLOAD_CONCURRENCY sets the limit; by default there is none, as in 0.2.0", () => {
+    const unlimited = start().engine.storage.uploads;
+    expect(unlimited.limit).toBe(Infinity);
+    expect(unlimited.full).toBe(false);
+    expect(start({ storage: { uploadConcurrency: 3 } }).engine.storage.uploads.limit).toBe(3);
+    expect(withEnv({ INCIBASE_UPLOAD_CONCURRENCY: "5" }, () => start({ storage: { uploadConcurrency: 3 } })).engine.storage.uploads.limit).toBe(5);
   });
 
   test("the gate hands a freed slot to the longest waiter", async () => {

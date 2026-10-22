@@ -459,6 +459,7 @@ describe("bundle verification", () => {
     handMadeBundle(
       file,
       `import { query } from "incibase/server";\nexport const schema = undefined;\nexport const modules = { m: { which: query({ handler: async () => "verified" }) } };\n`,
+      { app: { functions: [{ path: "m:which", type: "query", visibility: "public" }], tables: {}, crons: [], http: [] } },
     );
     const { url } = await serveBundle(file, join(root, "data"));
     expect(await call(url, "query", "m:which")).toBe("verified");
@@ -522,6 +523,80 @@ describe("bundle verification", () => {
     expect(readFileSync(file, "utf8").split("\n")[0]!.indexOf("*/")).toBe(readFileSync(file, "utf8").split("\n")[0]!.length - 2);
     expect(readManifest(file)).toEqual(manifest);
   });
+
+  test("a raw */ in the manifest line is refused: it would run code the sha256 does not cover", async () => {
+    const root = dir();
+    const file = join(root, "a.ib");
+    const marker = join(root, "ran.txt");
+    const body = "export const schema = undefined;\nexport const modules = {};\n";
+    const genuine = handMadeBundle(file, body);
+    // Valid JSON, valid manifest fields, and a comment that ends inside a string.
+    const payload = `*/ require("node:fs").writeFileSync(${JSON.stringify(marker).replaceAll('"', "'")}, 'ran'); /*`;
+    const line = manifestLine(genuine).replace(`"envNames":[]`, `"envNames":[],"x":"${payload}"`);
+    expect(line).toContain(payload);
+    writeFileSync(file, `${line}\n${body}`);
+    for (const read of [readManifest, verifyBundle]) {
+      expect(() => read(file)).toThrow(ConfigError);
+      expect(() => read(file)).toThrow(`the manifest contains "*/"`);
+    }
+    // Without the extra key it is still refused, for the */ alone.
+    writeFileSync(file, `${manifestLine(genuine).replace(`"format":1`, `"format":1,"y":"*/"`)}\n${body}`);
+    expect(() => readManifest(file)).toThrow(`the manifest contains "*/"`);
+    const check = await run(["bundle", "--check", "--out", file]);
+    expect(check.code).toBe(ExitCode.CONFIG);
+    const serve = await run(["serve", "--bundle", file, "--data", join(root, "data"), "--migrate-only", "--allow-empty"]);
+    expect(serve.code).toBe(ExitCode.CONFIG);
+    expect(existsSync(marker)).toBe(false);
+    // An unknown key is refused too.
+    writeFileSync(file, `${manifestLine({ ...genuine, extra: 1 } as BundleManifest)}\n${body}`);
+    expect(() => readManifest(file)).toThrow("invalid manifest at (root)");
+  }, 30_000);
+
+  test("manifest text root prints cannot carry control characters", () => {
+    const root = dir();
+    const file = join(root, "a.ib");
+    const good = handMadeBundle(file, "export {};\n");
+    const fn = (f: Record<string, unknown>) => ({ ...good, app: { ...good.app, functions: [{ path: "a:b", type: "query", visibility: "public", ...f }] } });
+    const refused = (m: unknown, at: string) => {
+      writeFileSync(file, `${manifestLine(m as BundleManifest)}\nexport {};\n`);
+      expect(() => readManifest(file)).toThrow(`invalid manifest at ${at}`);
+    };
+    refused({ ...good, incibaseVersion: "0.2.0\u001b]0;pwned\u0007" }, "incibaseVersion");
+    refused({ ...good, incibaseVersion: "latest" }, "incibaseVersion");
+    refused(fn({ path: "app:act\u001b[31mRED" }), "app.functions.0.path");
+    refused(fn({ path: "../x:y" }), "app.functions.0.path");
+    refused(fn({ description: "ok\u001b[2K" }), "app.functions.0.description");
+    refused(fn({ description: "c1 \u009b" }), "app.functions.0.description");
+    refused({ ...good, app: { ...good.app, crons: [{ name: "n\r", schedule: { kind: "interval", ms: 1 }, path: "a:b" }] } }, "app.crons.0.name");
+    refused({ ...good, app: { ...good.app, crons: [{ name: "n", schedule: { kind: "cron", expression: "* * * * *", tz: "UTC\u0007" }, path: "a:b" }] } }, "app.crons.0.schedule");
+    refused({ ...good, app: { ...good.app, http: [{ method: "GET", path: "/x\u001b" }] } }, "app.http.0.path");
+    refused({ ...good, app: { ...good.app, http: [{ method: "get x", path: "/x" }] } }, "app.http.0.method");
+    refused({ ...good, app: { ...good.app, tables: { "t\u001b": { indexes: [] } } } }, "app.tables");
+    // Tabs and newlines in a description are fine.
+    const multiline = fn({ description: "line one\n\tline two" });
+    writeFileSync(file, `${manifestLine(multiline as BundleManifest)}\nexport {};\n`);
+    expect(readManifest(file).app.functions[0]!.description).toBe("line one\n\tline two");
+  });
+
+  test("serve --bundle refuses a manifest that does not describe the app it loads", async () => {
+    const root = dir();
+    const file = join(root, "app.ib");
+    const body = `import { query } from "incibase/server";\nexport const schema = undefined;\nexport const modules = { m: { which: query({ handler: async () => process.env.WHICH_ONE }) } };\n`;
+    const app = { functions: [{ path: "m:which", type: "query" as const, visibility: "public" as const }], tables: {}, crons: [], http: [] };
+    const args = ["serve", "--bundle", file, "--data", join(root, "data"), "--migrate-only", "--allow-empty"];
+    handMadeBundle(file, body, { app: { ...app, functions: [] }, envNames: ["WHICH_ONE"] });
+    const hidden = await run(args);
+    expect(hidden.code).toBe(ExitCode.CONFIG);
+    expect(hidden.stderr).toContain("its manifest does not describe the app it defines (functions differ)");
+    handMadeBundle(file, body, { app: { ...app, functions: [{ ...app.functions[0]!, visibility: "internal" }] }, envNames: ["WHICH_ONE"] });
+    expect((await run(args)).code).toBe(ExitCode.CONFIG);
+    handMadeBundle(file, body, { app, envNames: [] });
+    const env = await run(args);
+    expect(env.code).toBe(ExitCode.CONFIG);
+    expect(env.stderr).toContain("(envNames differ)");
+    handMadeBundle(file, body, { app, envNames: ["WHICH_ONE"] });
+    expect((await run(args)).code).toBe(0);
+  }, 30_000);
 
   test("envNamesOf finds the env var names code reads", () => {
     const code = `process.env.A; process.env["B_1"]; Bun.env.C; Bun.env['D']; import.meta.env.E; process.env?.F; process.env?.["G"]; process.env[name]; process.env["not ok"]; myprocess.env.H; process.envX.I`;
