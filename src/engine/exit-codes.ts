@@ -10,7 +10,10 @@ export const ExitCode = {
   OK: 0,
   /** A crash, or an error thrown by the app's own code (e.g. on import). A restart may help. */
   CRASH: 1,
-  /** Bad flags or environment, or a database whose system schema is newer than this binary. */
+  /**
+   * Bad flags or environment, an app dir, data dir or address that cannot be
+   * used, or a database that is not one or whose system schema is newer than this binary.
+   */
   CONFIG: 64,
   /** The migration was refused; nothing was committed. */
   MIGRATION_REFUSED: 65,

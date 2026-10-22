@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { watch, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { watch, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { buildApp, IS_COMPILED } from "./engine/build.ts";
@@ -9,7 +9,7 @@ import { describeApp } from "./engine/describe.ts";
 import { embeddedRuntime } from "./engine/embedded.ts";
 import { Engine, type AppDefinition } from "./engine/engine.ts";
 import { ConfigError, DefinitionError, describeExit, exitCodeOf, ExitCode } from "./engine/exit-codes.ts";
-import { startServer } from "./engine/http.ts";
+import { listenError, startServer } from "./engine/http.ts";
 import { loadAppFromDir, schemaOf } from "./engine/loader.ts";
 import { color, isJson, logEvent, parseLogFormat, setLogFormat, stripQuery } from "./engine/log.ts";
 import { MigrationError } from "./engine/migrate.ts";
@@ -82,12 +82,23 @@ function parse(argv: string[]) {
   return { values, command: positionals[0] };
 }
 
+/** The log format `argv` asks for when it does not parse, so a bad flag still fails in the right format. */
+function requestedLogFormat(argv: string[]): string | undefined {
+  let format = process.env.INCIBASE_LOG_FORMAT;
+  for (const [i, arg] of argv.entries()) {
+    if (arg === "--") break;
+    if (arg === "--log-format") format = argv[i + 1];
+    else if (arg.startsWith("--log-format=")) format = arg.slice("--log-format=".length);
+  }
+  return format;
+}
+
 export async function runCli(argv: string[], options: CliOptions = {}) {
   let parsed: ReturnType<typeof parse>;
   try {
     parsed = parse(argv);
   } catch (err) {
-    if (process.env.INCIBASE_LOG_FORMAT === "json") {
+    if (requestedLogFormat(argv) === "json") {
       setLogFormat("json");
       logEvent("error", { ev: "fatal", msg: (err as Error).message, exitCode: ExitCode.CONFIG, reason: describeExit(ExitCode.CONFIG) });
     } else {
@@ -105,7 +116,7 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
 
   if (options.embedded && !["serve", "start", "admin-key"].includes(command)) {
     console.error(`"${command}" is not available in a built app. Use: serve, admin-key`);
-    process.exit(1);
+    process.exit(ExitCode.CONFIG);
   }
 
   if (["serve", "start", "dev"].includes(command)) {
@@ -151,7 +162,7 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
     default:
       console.error(`Unknown command "${command}"\n`);
       console.log(HELP);
-      process.exit(1);
+      process.exit(ExitCode.CONFIG);
   }
 }
 
@@ -207,6 +218,9 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
   try {
     port = portOf(values.port ?? process.env.PORT ?? "3210");
     publicUrl = (values.url ?? process.env.INCIBASE_URL ?? `http://localhost:${port}`).replace(/\/+$/, "");
+    if (!embedded && !statSync(values.dir, { throwIfNoEntry: false })?.isDirectory()) {
+      throw new ConfigError(`No app directory ${values.dir}: pass --dir, or create one with: incibase init`);
+    }
     const app = embedded ? await loadEmbedded(embedded) : await loadAppFromDir(values.dir);
     engine = new Engine(app, { dataDir: values.data, dev, publicUrl, allowFieldRemoval: values["allow-field-removal"] });
   } catch (err) {
@@ -241,13 +255,14 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
 
   engine.start();
   const dashboard = !values["no-dashboard"];
+  const hostname = values.host ?? (dev ? "localhost" : "0.0.0.0");
   let server: ReturnType<typeof startServer>;
   try {
-    server = startServer(engine, { port, hostname: values.host ?? (dev ? "localhost" : "0.0.0.0"), dashboard });
+    server = startServer(engine, { port, hostname, dashboard });
   } catch (err) {
     await engine.stop().catch(() => {});
-    // EADDRINUSE may clear up (exit 75); a port this user may not bind will not.
-    exitOnStartError((err as { code?: string }).code === "EACCES" ? new ConfigError((err as Error).message) : err);
+    // An address in use may clear up (exit 75); a host that does not resolve or a port this user may not bind will not.
+    exitOnStartError(await listenError(err, hostname, port));
   }
   // Only once serving: a startup error must still exit instead of leaving a process that serves nothing.
   installCrashHandlers();

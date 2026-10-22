@@ -105,8 +105,23 @@ function restrictMode(path: string, mode: number) {
 
 /** Creates `dir` (mode 0700), or tightens it if it already exists. */
 export function ensurePrivateDir(dir: string) {
-  mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
+  try {
+    mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
+  } catch (err) {
+    throw unusablePath(err, `Cannot use ${resolve(dir)} as a data directory`);
+  }
   restrictMode(dir, PRIVATE_DIR_MODE);
+}
+
+/** A path that is a file where a directory should be, or one this user may not write, fails the same on every start. */
+function unusablePath(err: unknown, what: string): unknown {
+  const permanent = ["ENOTDIR", "EEXIST", "EISDIR", "EACCES", "EPERM", "EROFS"].includes((err as { code?: string }).code ?? "");
+  return permanent ? new ConfigError(`${what}: ${(err as Error).message}`) : err;
+}
+
+/** For a database file that holds something else; no restart fixes it. */
+function notADatabase(path: string) {
+  return new ConfigError(`${resolve(path)} is not an SQLite database. Restore it from a backup, or move it away to start empty.`);
 }
 
 /**
@@ -122,7 +137,7 @@ function ensurePrivateFile(path: string): boolean {
       writeFileSync(path, "", { flag: "wx", mode: PRIVATE_FILE_MODE });
       created = true;
     } catch (err) {
-      if ((err as { code?: string }).code !== "EEXIST") throw err;
+      if ((err as { code?: string }).code !== "EEXIST") throw unusablePath(err, `Cannot create ${resolve(path)}`);
     }
   }
   restrictMode(path, PRIVATE_FILE_MODE);
@@ -143,7 +158,9 @@ function openElsewhere(path: string): boolean {
     db.run("COMMIT");
     return false;
   } catch (err) {
-    if ((err as { code?: string }).code === "SQLITE_BUSY") return true;
+    const code = (err as { code?: string }).code;
+    if (code === "SQLITE_BUSY") return true;
+    if (code === "SQLITE_NOTADB") throw notADatabase(path);
     throw err;
   } finally {
     db.close();
@@ -187,7 +204,7 @@ export class DataDirLock {
       const code = (err as { code?: string }).code;
       if (code === "SQLITE_BUSY") throw new DataDirLockedError(resolve(dir));
       if (code === "SQLITE_NOTADB") {
-        throw new Error(
+        throw new ConfigError(
           `${resolve(path)} is not an incibase lock file (incibase keeps an empty SQLite database there). ` +
             `If another tool wrote it, move it away; then start again.`,
         );
@@ -281,7 +298,7 @@ export class Store {
     } catch (err) {
       write?.close();
       this.lock.release();
-      throw err;
+      throw (err as { code?: string }).code === "SQLITE_NOTADB" ? notADatabase(path) : err;
     }
   }
 

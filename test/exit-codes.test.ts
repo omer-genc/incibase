@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { cronJobs, defineSchema, defineTable, httpAction, httpRouter, internalAction, z } from "incibase/server";
 import { buildApp } from "../src/engine/build.ts";
 import { Engine, type AppDefinition } from "../src/engine/engine.ts";
+import { listenError } from "../src/engine/http.ts";
 import { ConfigError, DefinitionError, EXIT_CODE, exitCodeOf, ExitCode } from "../src/engine/exit-codes.ts";
 import { MigrationError } from "../src/engine/migrate.ts";
 import { DataDirLockedError, readMeta, SYSTEM_SCHEMA_VERSION, SystemSchemaTooNewError } from "../src/engine/store.ts";
@@ -107,6 +108,29 @@ describe("exitCodeOf", () => {
   });
 });
 
+describe("listenError", () => {
+  test("finds the real cause behind Bun's EADDRINUSE", async () => {
+    const bunError = (port: number) => Object.assign(new Error(`Failed to start server. Is port ${port} in use?`), { code: "EADDRINUSE", errno: 0 });
+    // A port that really is in use stays retryable: the same error back.
+    const taken = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("taken") });
+    try {
+      const inUse = bunError(taken.port!);
+      expect(await listenError(inUse, "127.0.0.1", taken.port!)).toBe(inUse);
+    } finally {
+      taken.stop(true);
+    }
+    const unresolvable = await listenError(bunError(0), "no.such.host.invalid", 0);
+    expect(unresolvable).toBeInstanceOf(ConfigError);
+    expect((unresolvable as Error).message).toBe("Cannot listen on no.such.host.invalid:0: the hostname does not resolve");
+    expect(exitCodeOf(await listenError(bunError(0), "192.0.2.1", 0))).toBe(ExitCode.CONFIG);
+    // A real code from the OS (or a later Bun) is used as is.
+    const denied = await listenError(Object.assign(new Error("denied"), { code: "EACCES" }), "0.0.0.0", 80);
+    expect((denied as Error).message).toBe("Cannot listen on 0.0.0.0:80: permission denied (ports below 1024 need privileges)");
+    const other = new Error("something else");
+    expect(await listenError(other, "127.0.0.1", 0)).toBe(other);
+  });
+});
+
 describe("definitions are checked before the data dir is touched", () => {
   const jobs = { work: internalAction({ handler: async () => {} }) };
 
@@ -174,6 +198,11 @@ describe("definitions are checked before the data dir is touched", () => {
 
     const crons = cronJobs();
     crons.interval("a", { seconds: 1 }, "jobs:work" as never, {} as never);
+    // The imported function itself instead of a reference to it.
+    const notRef = errorOf(() => crons.interval("c", { seconds: 1 }, jobs.work as never, {} as never));
+    expect(notRef).toBeInstanceOf(DefinitionError);
+    expect((notRef as Error).message).toBe(`Cron "c": the target must be a function reference such as internal.jobs.work`);
+    expect(errorOf(() => crons.cron("d", "0 9 * * *", {} as never))).toBeInstanceOf(DefinitionError);
     expect(errorOf(() => crons.interval("a", { seconds: 1 }, "jobs:work" as never, {} as never))).toBeInstanceOf(DefinitionError);
     expect(errorOf(() => crons.interval("b", { seconds: 0 }, "jobs:work" as never, {} as never))).toBeInstanceOf(DefinitionError);
     expect(errorOf(() => defineSchema({ "bad-name": defineTable({}) }))).toBeInstanceOf(DefinitionError);
@@ -264,6 +293,21 @@ describe("incibase serve exit codes", () => {
     expect(snapshot(data)).toEqual(before);
   }, 20_000);
 
+  test("a cron target that is the imported function, not a reference, exits 78", async () => {
+    const { data, source } = await project({
+      "schema.ts": SCHEMA(CUSTOMERS),
+      "jobs.ts": JOBS,
+      "crons.ts":
+        `import { cronJobs } from "incibase/server";\nimport { work } from "./jobs";\nconst crons = cronJobs();\n` +
+        `crons.interval("beat", { minutes: 1 }, work as any);\nexport default crons;\n`,
+    });
+    const before = snapshot(data);
+    const result = await serve(source, data);
+    expect(result.code).toBe(78);
+    expect(result.stderr).toContain(`Cron "beat": the target must be a function reference such as internal.jobs.work`);
+    expect(snapshot(data)).toEqual(before);
+  }, 20_000);
+
   test("a malformed cron spec exits 78", async () => {
     const { data, source } = await project({
       "schema.ts": SCHEMA(CUSTOMERS),
@@ -320,6 +364,19 @@ describe("incibase serve exit codes", () => {
     open({ schema: defineSchema({ customers: defineTable({ name: z.string() }) }), modules: {} }, data);
   }, 20_000);
 
+  test("a host that does not resolve, or an address not on this machine, exits 64 (Bun reports both as in use)", async () => {
+    const { data, source } = await project({ "schema.ts": SCHEMA(CUSTOMERS) });
+    const unresolvable = await serve(source, data, "--host", "no.such.host.invalid");
+    expect(unresolvable.code).toBe(64);
+    expect(unresolvable.stderr).toContain("Cannot listen on no.such.host.invalid:0: the hostname does not resolve");
+    // TEST-NET-1: reserved for documentation, never assigned to a machine.
+    const foreign = await serve(source, data, "--host", "192.0.2.1");
+    expect(foreign.code).toBe(64);
+    expect(foreign.stderr).toContain("Cannot listen on 192.0.2.1:0: the address is not on this machine");
+    // Both released the data dir.
+    open({ schema: defineSchema({ customers: defineTable({ name: z.string() }) }), modules: {} }, data);
+  }, 20_000);
+
   test("a module that throws on import exits 1 (the app's own error)", async () => {
     const { data, source } = await project({
       "schema.ts": SCHEMA(`${CUSTOMERS}, orders: defineTable({ total: z.number() })`),
@@ -362,6 +419,41 @@ describe("incibase serve exit codes", () => {
     });
     expect(await proc.exited).toBe(64);
     expect(await new Response(proc.stderr).text()).toContain("INCIBASE_MAX_JSON_BYTES must be a positive whole number");
+  }, 20_000);
+
+  test("an app dir, data dir, database or lock file that cannot be used exits 64", async () => {
+    const { root, data, source } = await project({ "schema.ts": SCHEMA(CUSTOMERS) });
+    const missing = await serve(join(root, "nope"), join(root, "data2"));
+    expect(missing.code).toBe(64);
+    expect(missing.stderr).toContain(`No app directory ${join(root, "nope")}`);
+    expect(existsSync(join(root, "data2"))).toBe(false);
+    expect((await serve(join(source, "schema.ts"), join(root, "data2"))).code).toBe(64);
+
+    const file = join(root, "a-file");
+    writeFileSync(file, "");
+    for (const dataDir of [join(file, "data"), file]) {
+      const result = await serve(source, dataDir);
+      expect(result.code).toBe(64);
+      expect(result.stderr).toContain("as a data directory");
+    }
+
+    const corrupt = join(root, "corrupt");
+    mkdirSync(corrupt);
+    writeFileSync(join(corrupt, "data.db"), "not a database, just text that is long enough to be read as a header".repeat(20));
+    const notDb = await serve(source, corrupt);
+    expect(notDb.code).toBe(64);
+    expect(notDb.stderr).toContain(`${join(corrupt, "data.db")} is not an SQLite database`);
+
+    writeFileSync(join(data, "LOCK"), "written by some other tool".repeat(40));
+    const badLock = await serve(source, data);
+    expect(badLock.code).toBe(64);
+    expect(badLock.stderr).toContain("is not an incibase lock file");
+  }, 30_000);
+
+  test("an unknown command exits 64", async () => {
+    const proc = Bun.spawn([process.execPath, CLI, "serv", "--dir", "x"], { stdout: "pipe", stderr: "pipe", timeout: 15_000, killSignal: "SIGKILL" });
+    expect(await proc.exited).toBe(64);
+    expect(await new Response(proc.stderr).text()).toContain(`Unknown command "serv"`);
   }, 20_000);
 });
 
@@ -444,5 +536,8 @@ describe("built app exit codes", () => {
     expect(crash.code).toBe(1);
     expect(crash.stderr).toContain("crashed on import");
     expect(crash.created).toBe(false);
+    const notOffered = Bun.spawn([outfile, "codegen"], { stdout: "pipe", stderr: "pipe", timeout: 15_000, killSignal: "SIGKILL" });
+    expect(await notOffered.exited).toBe(64);
+    expect(await new Response(notOffered.stderr).text()).toContain(`"codegen" is not available in a built app`);
   }, 60_000);
 });

@@ -325,7 +325,7 @@ export class CronJobs {
   interval<F extends SchedulableReference>(name: string, schedule: IntervalSchedule, fn: F, ...args: OptionalArgs<F>) {
     const ms = ((schedule.hours ?? 0) * 3600 + (schedule.minutes ?? 0) * 60 + (schedule.seconds ?? 0)) * 1000;
     if (ms < 1000) throw new DefinitionError(`Cron "${name}": interval must be at least 1 second`);
-    this.add({ name, schedule: { kind: "interval", ms }, path: pathOf(fn), args: args[0] ?? {} });
+    this.add({ name, schedule: { kind: "interval", ms }, path: pathOf(name, fn), args: args[0] ?? {} });
   }
 
   /** Standard 5-field cron expression, e.g. `"0 9 * * MON-FRI"`, interpreted in `tz` (default: system zone). */
@@ -336,7 +336,7 @@ export class CronJobs {
     args?: F["_args"],
     options?: { tz?: string },
   ) {
-    this.add({ name, schedule: { kind: "cron", expression, tz: options?.tz }, path: pathOf(fn), args: args ?? {} });
+    this.add({ name, schedule: { kind: "cron", expression, tz: options?.tz }, path: pathOf(name, fn), args: args ?? {} });
   }
 
   private add(job: CronJob) {
@@ -349,6 +349,11 @@ export function cronJobs(): CronJobs {
   return new CronJobs();
 }
 
-function pathOf(ref: FunctionReference): string {
-  return getFunctionPath(ref);
+/** A cron target's path; DefinitionError for anything but a reference (e.g. the imported function itself). */
+function pathOf(name: string, ref: FunctionReference): string {
+  try {
+    return getFunctionPath(ref);
+  } catch {
+    throw new DefinitionError(`Cron "${name}": the target must be a function reference such as internal.jobs.work`);
+  }
 }

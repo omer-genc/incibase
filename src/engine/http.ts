@@ -1,4 +1,6 @@
 import type { Server } from "bun";
+import { lookup } from "node:dns/promises";
+import { createServer } from "node:net";
 import { getFunctionPath, type FunctionType } from "../api.ts";
 import { IncibaseError } from "../errors.ts";
 import { adminTools, invokeAdminTool } from "./admin.ts";
@@ -65,6 +67,42 @@ async function readBody(req: Request, limit: number, error: { code: string; mess
     chunks.push(value as Uint8Array<ArrayBuffer>);
   }
   return new Blob(chunks);
+}
+
+/** Bind failures no restart fixes, and how to say them. */
+const PERMANENT_BIND_ERRORS: Record<string, (port: number) => string> = {
+  EACCES: (port) => (port < 1024 ? "permission denied (ports below 1024 need privileges)" : "permission denied"),
+  EPERM: () => "permission denied",
+  EADDRNOTAVAIL: () => "the address is not on this machine",
+  EAFNOSUPPORT: () => "this machine does not support the address family",
+};
+
+/**
+ * Why `startServer` could not listen on `hostname:port`. Bun reports every
+ * listen failure as EADDRINUSE with errno 0, including a hostname that does
+ * not resolve, an address that is not on this machine and a port this user
+ * may not bind. Those fail the same way on every start, so this resolves the
+ * host and binds the address with node:net to find the real cause: a
+ * ConfigError (exit 64) for those, and `err` itself (exit 75) for an address
+ * in use or one that is free again by now.
+ */
+export async function listenError(err: unknown, hostname: string, port: number): Promise<unknown> {
+  const code = (err as { code?: unknown } | null)?.code;
+  const fail = (reason: string) => new ConfigError(`Cannot listen on ${hostname}:${port}: ${reason}`);
+  if (typeof code === "string" && PERMANENT_BIND_ERRORS[code]) return fail(PERMANENT_BIND_ERRORS[code](port));
+  if (code !== "EADDRINUSE") return err;
+  let address: string;
+  try {
+    ({ address } = await lookup(hostname));
+  } catch {
+    return fail("the hostname does not resolve");
+  }
+  const real = await new Promise<string | undefined>((resolve) => {
+    const probe = createServer();
+    probe.once("error", (e) => resolve((e as { code?: string }).code));
+    probe.listen(port, address, () => probe.close(() => resolve(undefined)));
+  });
+  return real && PERMANENT_BIND_ERRORS[real] ? fail(PERMANENT_BIND_ERRORS[real](port)) : err;
 }
 
 type Handler = (req: Request & { params: Record<string, string> }, server: Server<SocketData>) => Response | Promise<Response | undefined> | undefined;

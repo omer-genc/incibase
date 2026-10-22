@@ -32,6 +32,23 @@ export const hello = query({
   },
 });
 
+export const consoles = query({
+  handler: async () => {
+    console.table([{ a: 1 }, { a: 2 }]);
+    console.dir({ x: { y: { z: 1 } } }, { depth: 0 });
+    console.trace("traced");
+    console.count("c");
+    console.count("c");
+    console.time("t");
+    console.timeEnd("t");
+    console.group("grouped");
+    console.groupEnd();
+    console.assert(false, "asserted %d", 1);
+    console.assert(true, "never printed");
+    return 1;
+  },
+});
+
 export const boom = mutation({ handler: async () => { throw new Error("kaboom internal"); } });
 
 export const denied = query({ handler: async () => { throw new IncibaseError({ code: "FORBIDDEN", message: "nope" }); } });
@@ -140,6 +157,7 @@ describe("json log format", () => {
     const dirty = await post(url, "/api/query", { path: "app:hello", args: { name: "x" } }, { "x-request-id": `${"a".repeat(200)}` });
     expect(dirty.headers.get("x-request-id")).toBe("a".repeat(128));
 
+    expect(await (await post(url, "/api/query", { path: "app:consoles" }, { "x-request-id": "consoles-rid" })).json()).toEqual({ value: 1 });
     expect((await post(url, "/api/mutation", { path: "app:boom" })).status).toBe(500);
     expect((await post(url, "/api/query", { path: "app:denied" })).status).toBe(403);
     expect((await post(url, "/api/query", { path: "app:hello", args: { name: 1 } })).status).toBe(400);
@@ -154,6 +172,9 @@ describe("json log format", () => {
     const admin = { authorization: `Bearer ${ADMIN_KEY}` };
     expect((await post(url, "/api/admin/admin_overview", {}, admin)).status).toBe(200);
     expect((await post(url, "/api/admin/admin_get_document", { nope: 1 }, admin)).status).toBe(400);
+    const badSql = await post(url, "/api/admin/admin_sql", { query: "SELECT p_ssw0rd_secret FROM notes" }, admin);
+    expect(await badSql.text()).toContain("no such column: p_ssw0rd_secret");
+    expect((await post(url, "/api/admin/admin_sql", { query: "SELECT count(*) AS n FROM notes" }, admin)).status).toBe(200);
     const mcp = await post(url, "/mcp", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "admin_schema", arguments: {} } }, admin);
     expect(mcp.status).toBe(200);
 
@@ -183,7 +204,7 @@ describe("json log format", () => {
       expect(typeof e.ev).toBe("string");
     }
     expect(stdout + stderr).not.toContain("\x1b");
-    for (const secret of [ADMIN_KEY, token, "secret-in-query"]) expect(stdout + stderr).not.toContain(secret);
+    for (const secret of [ADMIN_KEY, token, "secret-in-query", "p_ssw0rd_secret"]) expect(stdout + stderr).not.toContain(secret);
 
     expect(all.filter((e) => e.ev === "ready")).toHaveLength(1);
     expect(all.find((e) => e.ev === "migration")?.createdTables).toEqual(["notes"]);
@@ -196,6 +217,20 @@ describe("json log format", () => {
     expect(tenantError.level).toBe("error");
     expect(consoleOf("hello again")[0]!.rid).toBe(generated.headers.get("x-request-id")!);
     expect(consoleOf("hook called")[0]!.rid).toMatch(/^[0-9a-f-]{36}$/);
+
+    // Every console method gives one line, not raw text.
+    const others = all.filter((e) => e.ev === "console" && e.rid === "consoles-rid");
+    expect(others.map((e) => [e.level, e.msg])).toEqual([
+      ["info", "[ { a: 1 }, { a: 2 } ]"],
+      ["info", "{ x: [Object] }"],
+      ["debug", "traced"],
+      ["info", "c: 1"],
+      ["info", "c: 2"],
+      ["info", expect.stringMatching(/^t: \d+\.\d{3}ms$/)],
+      ["info", "grouped"],
+      ["error", "Assertion failed: asserted 1"],
+    ]);
+    expect(others[2]!.stack).toStartWith("Trace: traced\n    at ");
 
     const runs = consoleOf("watch ran with");
     expect(runs.map((e) => e.msg)).toEqual(["watch ran with 0", "watch ran with 1"]);
@@ -219,8 +254,17 @@ describe("json log format", () => {
     expect(adminEvents).toEqual([
       { tool: "admin_overview", via: "http", ok: true },
       { tool: "admin_get_document", via: "http", ok: false },
+      { tool: "admin_sql", via: "http", ok: false },
+      { tool: "admin_sql", via: "http", ok: true },
       { tool: "admin_schema", via: "mcp", ok: true },
     ]);
+    // A failed admin_sql call is logged by its error code and a hash of the query, never the text.
+    const [failedSql, sqlOk] = all.filter((e) => e.ev === "admin" && e.tool === "admin_sql");
+    expect(failedSql).toMatchObject({ code: "SQL_ERROR", sql: expect.stringMatching(/^[0-9a-f]{16}$/) });
+    expect(failedSql!.error).toBeUndefined();
+    expect(sqlOk!.sql).toMatch(/^[0-9a-f]{16}$/);
+    expect(sqlOk!.sql).not.toBe(failedSql!.sql);
+    expect(all.find((e) => e.ev === "admin" && e.tool === "admin_get_document")!.error).toStartWith("Invalid arguments");
     expect(all.slice(-2).map((e) => e.ev)).toEqual(["stopping", "stopped"]);
   }, 30_000);
 
@@ -259,6 +303,19 @@ describe("json log format", () => {
     const { stdout, code } = await run.stop({ kill: false });
     expect(code).toBe(78);
     expect(events(stdout)).toEqual([expect.objectContaining({ ev: "fatal", level: "error", exitCode: 78, reason: "invalid app definition" })]);
+  }, 20_000);
+
+  test("a flag that does not parse is a fatal line too when --log-format json is given", async () => {
+    for (const flag of [["--log-format", "json"], ["--log-format=json"]]) {
+      const { stdout, stderr, code } = await spawn(["serve", ...flag, "--bogus"], {}).stop({ kill: false });
+      expect(code).toBe(64);
+      expect(stderr).toBe("");
+      expect(events(stdout)).toEqual([expect.objectContaining({ ev: "fatal", level: "error", exitCode: 64, msg: expect.stringContaining("--bogus") })]);
+    }
+    // The flag wins over the environment, as when the flags parse.
+    const text = await spawn(["serve", "--log-format", "text", "--bogus"], { INCIBASE_LOG_FORMAT: "json" }).stop({ kill: false });
+    expect(text.code).toBe(64);
+    expect(text.stdout).toContain("Usage: incibase");
   }, 20_000);
 
   test("an unknown format exits 64", async () => {

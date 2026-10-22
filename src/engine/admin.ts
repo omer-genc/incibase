@@ -1,6 +1,7 @@
 // Admin operations shared by the MCP admin tools and the dashboard's
 // `/api/admin/:tool` endpoint. Callers must already have checked the admin key.
 import { z } from "zod";
+import { isIncibaseError } from "../errors.ts";
 import { runAdminSql, SQL_MAX_ROWS, SQL_TIMEOUT_MS } from "./adminsql.ts";
 import { ValidationError } from "./database.ts";
 import { describeApp } from "./describe.ts";
@@ -19,21 +20,37 @@ export interface AdminTool {
 /**
  * Checks `args` against the tool's input and runs it, logging the call in
  * json mode (the tool's name and outcome, never its arguments: they can hold
- * SQL, documents or keys).
+ * SQL, documents or keys). An admin_sql call carries a hash of its query
+ * instead, to tell calls apart.
  */
 export async function invokeAdminTool(name: string, tool: AdminTool, args: unknown, via: "http" | "mcp"): Promise<unknown> {
   const started = performance.now();
+  const query = name === "admin_sql" ? (args as { query?: unknown } | null)?.query : undefined;
+  const sql = typeof query === "string" ? { sql: new Bun.CryptoHasher("sha256").update(query).digest("hex").slice(0, 16) } : {};
   try {
     const parsed = tool.input.safeParse(args);
     if (!parsed.success) throw new ValidationError(`Invalid arguments:\n${z.prettifyError(parsed.error)}`, parsed.error.issues);
     const value = await tool.run(parsed.data);
-    logEvent("info", { ev: "admin", tool: name, via, ok: true, ms: Math.round(performance.now() - started) });
+    logEvent("info", { ev: "admin", tool: name, via, ok: true, ms: Math.round(performance.now() - started), ...sql });
     return value;
   } catch (err) {
-    const error = (err as Error)?.message?.split("\n")[0] ?? String(err);
-    logEvent("warn", { ev: "admin", tool: name, via, ok: false, ms: Math.round(performance.now() - started), error });
+    logEvent("warn", { ev: "admin", tool: name, via, ok: false, ms: Math.round(performance.now() - started), ...sql, ...failureOf(name, err) });
     throw err;
   }
+}
+
+/**
+ * What the log keeps of a failed admin call; the full message goes only to
+ * the admin. An IncibaseError's message is its JSON payload, so it is logged
+ * by its code, and admin_sql errors quote the query (`no such column: ...`).
+ */
+function failureOf(tool: string, err: unknown): { code?: string; error?: string } {
+  if (isIncibaseError(err)) {
+    const code = (err.data as { code?: unknown } | null)?.code;
+    return typeof code === "string" ? { code } : {};
+  }
+  if (tool === "admin_sql") return {};
+  return { error: (err as Error)?.message?.split("\n")[0] ?? String(err) };
 }
 
 const rangeOp = z.object({

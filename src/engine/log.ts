@@ -2,7 +2,7 @@
 // one object per line on stdout for a supervisor (journald) to collect, and
 // turns the app's own console output into lines of the same shape.
 import { AsyncLocalStorage } from "node:async_hooks";
-import { format as utilFormat } from "node:util";
+import { format as utilFormat, inspect as utilInspect } from "node:util";
 import { ConfigError } from "./exit-codes.ts";
 
 export type LogFormat = "text" | "json";
@@ -22,13 +22,58 @@ export const SLOW_CALL_MS = 1000;
 
 // Captured before json mode wraps console, so log lines never come back as console events.
 const write = console.log.bind(console);
-const CONSOLE_LEVELS = { debug: "debug", log: "info", info: "info", warn: "warn", error: "error" } as const;
-const originalConsole = Object.fromEntries(Object.keys(CONSOLE_LEVELS).map((m) => [m, (console as any)[m]]));
 
 let current: LogFormat = "text";
 
 /** console.* arguments as one string, like console.log prints them. */
 const formatArgs = (args: unknown[]) => utilFormat(...(args as [unknown, ...unknown[]]));
+
+const counts = new Map<string, number>();
+const timers = new Map<string, number>();
+const consoleEvent = (level: LogLevel, msg: string, fields: Record<string, unknown> = {}) => emitLine(level, { ev: "console", msg, ...fields });
+const elapsed = (label: string) => `${label}: ${(performance.now() - timers.get(label)!).toFixed(3)}ms`;
+
+/**
+ * What each console method does in json mode: one line, never raw text (which
+ * a collector reading stdout as JSON lines would choke on). Group nesting is
+ * dropped. process.stdout.write is not covered and still writes raw text.
+ */
+const JSON_CONSOLE: Record<string, (...args: any[]) => void> = {
+  debug: (...args) => consoleEvent("debug", formatArgs(args)),
+  log: (...args) => consoleEvent("info", formatArgs(args)),
+  info: (...args) => consoleEvent("info", formatArgs(args)),
+  warn: (...args) => consoleEvent("warn", formatArgs(args)),
+  error: (...args) => consoleEvent("error", formatArgs(args)),
+  table: (...args) => consoleEvent("info", formatArgs(args)),
+  dir: (value, options) => consoleEvent("info", utilInspect(value, options)),
+  dirxml: (...args) => consoleEvent("info", formatArgs(args)),
+  trace: (...args) => {
+    const msg = formatArgs(args);
+    consoleEvent("debug", msg, { stack: `Trace${msg ? `: ${msg}` : ""}\n${new Error().stack?.split("\n").slice(2).join("\n")}` });
+  },
+  assert: (condition, ...args) => {
+    if (!condition) consoleEvent("error", `Assertion failed${args.length ? `: ${formatArgs(args)}` : ""}`);
+  },
+  count: (label = "default") => {
+    const n = (counts.get(String(label)) ?? 0) + 1;
+    counts.set(String(label), n);
+    consoleEvent("info", `${label}: ${n}`);
+  },
+  countReset: (label = "default") => void counts.delete(String(label)),
+  time: (label = "default") => void timers.set(String(label), performance.now()),
+  timeLog: (label = "default", ...args) => {
+    if (timers.has(String(label))) consoleEvent("info", [elapsed(String(label)), ...(args.length ? [formatArgs(args)] : [])].join(" "));
+  },
+  timeEnd: (label = "default") => {
+    if (!timers.has(String(label))) return;
+    consoleEvent("info", elapsed(String(label)));
+    timers.delete(String(label));
+  },
+  group: (...args) => void (args.length && consoleEvent("info", formatArgs(args))),
+  groupCollapsed: (...args) => void (args.length && consoleEvent("info", formatArgs(args))),
+  groupEnd: () => {},
+};
+const originalConsole = Object.fromEntries(Object.keys(JSON_CONSOLE).map((m) => [m, (console as any)[m]]));
 
 /** `--log-format`, falling back to `INCIBASE_LOG_FORMAT`; ConfigError for anything else. */
 export function parseLogFormat(value: string | undefined): LogFormat {
@@ -41,10 +86,7 @@ export function parseLogFormat(value: string | undefined): LogFormat {
 /** Switches the process's log format; json also routes console.* through the logger. */
 export function setLogFormat(format: LogFormat) {
   current = format;
-  for (const [method, level] of Object.entries(CONSOLE_LEVELS)) {
-    (console as any)[method] =
-      format === "json" ? (...args: unknown[]) => emitLine(level, { ev: "console", msg: formatArgs(args) }) : originalConsole[method];
-  }
+  for (const [method, json] of Object.entries(JSON_CONSOLE)) (console as any)[method] = format === "json" ? json : originalConsole[method];
 }
 
 export function logFormat(): LogFormat {
