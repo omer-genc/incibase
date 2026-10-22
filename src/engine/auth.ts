@@ -66,11 +66,11 @@ export class AuthService {
       : null;
     // Verify against a dummy hash when the user is unknown so timing does not reveal it.
     const ok = await Bun.password.verify(password, row?.hash ?? (await (dummyHash ??= Bun.password.hash("incibase-dummy-password"))));
-    if (!userId || !row || !ok) {
+    // A disabled account answers like a wrong password, whatever the password: an account is often
+    // disabled because it is under attack, and a distinct answer would confirm the right guess.
+    if (!userId || !row || !ok || this.isDisabled(userId)) {
       throw new IncibaseError({ code: "INVALID_CREDENTIALS", message: "Invalid email or password" });
     }
-    // Checked only after the password, so it does not reveal which accounts exist.
-    if (this.isDisabled(userId)) throw new IncibaseError({ code: "USER_DISABLED", message: "This account is disabled" });
     return this.createSession(userId);
   }
 

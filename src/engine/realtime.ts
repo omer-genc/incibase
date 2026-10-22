@@ -9,6 +9,8 @@ import { affects, type Change, type ReadSet } from "./readset.ts";
 const BATCH_MS = 10;
 /** Live subscriptions one socket may hold. */
 export const MAX_SUBSCRIPTIONS_PER_SOCKET = 256;
+/** Default for `SocketData.maxSubscriptionBytes`. */
+export const DEFAULT_SUBSCRIPTION_BYTES_PER_SOCKET = 1024 * 1024;
 /** How often sockets' sessions are rechecked against the database (expiry, revocation elsewhere). */
 const SESSION_SWEEP_MS = 60_000;
 
@@ -18,6 +20,13 @@ export interface SocketData {
   session?: SessionRef | null;
   /** Client subscription id → shared subscription key. */
   subs: Map<string, string>;
+  /**
+   * Most JSON characters the socket's subscription keys (function path, args,
+   * user) may add up to, since each subscription keeps its args. The server
+   * passes its message size limit. Signing in may go a little over: it never
+   * drops a subscription.
+   */
+  maxSubscriptionBytes?: number;
 }
 
 const clientId = z.string().max(256);
@@ -135,7 +144,8 @@ export class Realtime {
     ws.send(JSON.stringify({ type: "auth", userId: identity.userId }));
     const current = [...ws.data.subs.entries()].map(([id, key]) => ({ id, sub: this.subs.get(key) }));
     for (const { id, sub } of current) {
-      if (sub) this.subscribe(ws, id, sub.path, sub.args);
+      // Only the user part of each key changes, so this skips the size budget.
+      if (sub) this.subscribe(ws, id, sub.path, sub.args, { rekey: true });
     }
   }
 
@@ -165,7 +175,7 @@ export class Realtime {
     }
   }
 
-  private subscribe(ws: ServerWebSocket<SocketData>, clientId: string, path: string, args: unknown) {
+  private subscribe(ws: ServerWebSocket<SocketData>, clientId: string, path: string, args: unknown, { rekey = false } = {}) {
     const identity = ws.data.identity;
     const key = JSON.stringify([path, args, identity.userId, identity.admin]);
     const previous = ws.data.subs.get(clientId);
@@ -174,6 +184,20 @@ export class Realtime {
       const message = `A connection can hold at most ${MAX_SUBSCRIPTIONS_PER_SOCKET} subscriptions`;
       ws.send(JSON.stringify({ id: clientId, type: "error", error: { code: "TOO_MANY_SUBSCRIPTIONS", message } }));
       return;
+    }
+    if (!rekey) {
+      // The count alone does not bound memory: every subscription keeps its args, failed ones too.
+      const budget = ws.data.maxSubscriptionBytes ?? DEFAULT_SUBSCRIPTION_BYTES_PER_SOCKET;
+      let held = key.length - (previous?.length ?? 0);
+      for (const k of ws.data.subs.values()) held += k.length;
+      if (held > budget) {
+        // A replaced subscription goes too, so the id does not keep pushing results for its old args.
+        if (previous) this.detach(ws, clientId, previous);
+        ws.data.subs.delete(clientId);
+        const message = `A connection's subscriptions can hold at most ${budget} bytes of function paths and args`;
+        ws.send(JSON.stringify({ id: clientId, type: "error", error: { code: "SUBSCRIPTIONS_TOO_LARGE", message } }));
+        return;
+      }
     }
     if (previous) this.detach(ws, clientId, previous);
     ws.data.subs.set(clientId, key);

@@ -106,9 +106,13 @@ async function handleMessage(engine: Engine, identity: Identity, msg: JsonRpcReq
           ...(plainObject ? { structuredContent: value } : {}),
         });
       } catch (err) {
-        // Internal errors carry messages and stack traces; callers see them only in dev.
-        const { error } = toErrorPayload(err, !!engine.options.dev);
-        return rpcResult(msg.id, { content: [{ type: "text", text: `${error.code}: ${error.message}` }], isError: true });
+        // Internal errors carry messages and stack traces; callers see them only in dev. Admins also
+        // get the message (not the stack) in production, so a bad admin_sql query or table name can
+        // be corrected.
+        const dev = !!engine.options.dev;
+        const { status, error } = toErrorPayload(err, dev);
+        const message = status === 500 && identity.admin && !dev ? String(err) : error.message;
+        return rpcResult(msg.id, { content: [{ type: "text", text: `${error.code}: ${message}` }], isError: true });
       }
     }
     default:

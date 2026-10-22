@@ -113,6 +113,8 @@ export class IncibaseClient {
   private nextSubId = 1;
   private readonly subscriptions = new Map<string, Subscription>();
   private readonly watches = new Map<string, WatchEntry>();
+  /** Live query messages held back while a password change is in flight (see `auth.changePassword`). */
+  private held: unknown[] | null = null;
   private closed = false;
 
   constructor(url: string, options: ClientOptions = {}) {
@@ -236,7 +238,9 @@ export class IncibaseClient {
     if (this.ws || this.closed) return;
     const ws = new this.WS(`${this.url.replace(/^http/, "ws")}/api/ws`);
     this.ws = ws;
+    // Handlers ignore a connection that `reconnect` replaced.
     ws.onopen = () => {
+      if (this.ws !== ws) return;
       this.wsOpen = true;
       this.reconnectDelay = 250;
       const token = this.tokenStorage.get();
@@ -244,18 +248,18 @@ export class IncibaseClient {
       for (const [id, sub] of this.subscriptions) this.send({ type: "sub", id, path: sub.path, args: sub.args });
     };
     ws.onmessage = (event) => {
-      let msg: any;
+      if (this.ws !== ws) return;
+      let msg: unknown;
       try {
         msg = JSON.parse(String(event.data));
       } catch {
         return;
       }
-      const sub = msg.id !== undefined ? this.subscriptions.get(msg.id) : undefined;
-      if (!sub) return;
-      if (msg.type === "data") sub.onData(msg.value);
-      else if (msg.type === "error") sub.onError?.(toError(400, msg.error));
+      if (this.held) this.held.push(msg);
+      else this.deliver(msg);
     };
     ws.onclose = () => {
+      if (this.ws !== ws) return;
       this.ws = null;
       this.wsOpen = false;
       if (this.closed || this.subscriptions.size === 0) return;
@@ -263,6 +267,22 @@ export class IncibaseClient {
       this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10_000);
     };
     ws.onerror = () => ws.close();
+  }
+
+  private deliver(msg: any) {
+    const sub = msg?.id !== undefined ? this.subscriptions.get(msg.id) : undefined;
+    if (!sub) return;
+    if (msg.type === "data") sub.onData(msg.value);
+    else if (msg.type === "error") sub.onError?.(toError(400, msg.error));
+  }
+
+  /** Replaces the connection: the new one signs in with the current token and resubscribes. */
+  private reconnect() {
+    const old = this.ws;
+    this.ws = null;
+    this.wsOpen = false;
+    old?.close();
+    if (this.subscriptions.size > 0) this.connect();
   }
 
   close() {
@@ -319,10 +339,28 @@ export class IncibaseClient {
     },
     me: async () => (await this.request<{ user: AuthUser | null }>("/api/auth/me")).user,
     changePassword: async (input: { currentPassword: string; newPassword: string }) => {
-      const result = await this.request<{ token: string; user: AuthUser }>("/api/auth/password", {
-        method: "POST",
-        body: JSON.stringify(input),
-      });
+      // The server ends every session of the user, this connection's too, before the new token
+      // arrives. Live queries would rerun signed out meanwhile and push errors such as "Sign in
+      // required", so their messages wait here; on success they are dropped and a new connection,
+      // signed in with the new token, sends fresh results.
+      const held = (this.held ??= []);
+      let result: { token: string; user: AuthUser };
+      try {
+        result = await this.request<{ token: string; user: AuthUser }>("/api/auth/password", {
+          method: "POST",
+          body: JSON.stringify(input),
+        });
+      } catch (err) {
+        // Nothing changed, so what was held is still current (unless another change replaced the connection).
+        if (this.held === held) {
+          this.held = null;
+          for (const msg of held) this.deliver(msg);
+        }
+        throw err;
+      }
+      this.held = null;
+      this.reconnect();
+      // The new connection opens later and signs in with the token stored here.
       this.setToken(result.token);
       return result.user;
     },

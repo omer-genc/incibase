@@ -1,6 +1,6 @@
 import { rmSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, setSystemTime, spyOn, test } from "bun:test";
-import { defineSchema, defineTable, id, z } from "incibase";
+import { defineSchema, defineTable, id, makeFunctionReference, z } from "incibase";
 import { mutation, query } from "incibase/server";
 import * as dashboard from "../src/engine/dashboard.ts";
 import { Engine } from "../src/engine/engine.ts";
@@ -18,6 +18,10 @@ const modules = {
     /** The caller, plus a read of `notes` so writes there rerun it. */
     me: query({
       handler: async (ctx: any) => ({ userId: await ctx.auth.getUserId(), notes: (await ctx.db.query("notes").collect()).length }),
+    }),
+    /** Like `me`, but signed-out callers get an error. */
+    required: query({
+      handler: async (ctx: any) => ({ userId: (await ctx.auth.requireUser())._id, notes: (await ctx.db.query("notes").collect()).length }),
     }),
     get: query({ args: { id: z.string() }, handler: (ctx: any, { id }: any) => ctx.db.get(id) }),
   },
@@ -261,6 +265,75 @@ describe("request limits", () => {
     s.send({ type: "sub", id: "over", path: "users:me" });
     expect(await s.next((m) => m.id === "over")).toMatchObject({ type: "data" });
   });
+
+  // prod allows 2000 bytes. Keys are JSON [path, args, userId, admin]: 654 characters for these args when anonymous.
+  const bigArgs = (name: string, size = 620) => ({ id: name.padEnd(size, "x") });
+  const tooLarge = { type: "error", error: { code: "SUBSCRIPTIONS_TOO_LARGE" } };
+
+  test("a socket's subscriptions hold at most maxJsonBytes of function paths and args", async () => {
+    const s = await connect(prod.url);
+    // Failed subscriptions count too: they keep their args.
+    s.send({ type: "sub", id: "a", path: "nope:nope", args: bigArgs("a") });
+    expect(await s.next((m) => m.id === "a")).toMatchObject({ type: "error", error: { code: "FUNCTION_NOT_FOUND" } });
+    for (const id of ["b", "c"]) {
+      s.send({ type: "sub", id, path: "users:get", args: bigArgs(id) });
+      expect(await s.next((m) => m.id === id)).toMatchObject({ type: "data", value: null });
+    }
+    s.send({ type: "sub", id: "d", path: "users:get", args: bigArgs("d", 100) });
+    expect(await s.next((m) => m.id === "d")).toMatchObject(tooLarge);
+
+    // Growing an existing subscription past the budget is refused and drops it, which makes room.
+    s.send({ type: "sub", id: "c", path: "users:get", args: bigArgs("c", 700) });
+    expect(await s.next((m) => m.id === "c")).toMatchObject(tooLarge);
+    expect(prod.engine.realtime.stats().some((sub) => (sub.args as { id?: string })?.id?.startsWith("c"))).toBe(false);
+    s.send({ type: "sub", id: "d", path: "users:get", args: bigArgs("d", 100) });
+    expect(await s.next((m) => m.id === "d")).toMatchObject({ type: "data", value: null });
+
+    // Unsubscribing frees room as well.
+    s.send({ type: "sub", id: "e", path: "users:get", args: bigArgs("e") });
+    expect(await s.next((m) => m.id === "e")).toMatchObject(tooLarge);
+    s.send({ type: "unsub", id: "a" });
+    s.send({ type: "sub", id: "e", path: "users:get", args: bigArgs("e") });
+    expect(await s.next((m) => m.id === "e")).toMatchObject({ type: "data", value: null });
+  });
+
+  test("signing in keeps subscriptions even when the user's longer keys pass the budget", async () => {
+    const { token, user } = await prod.engine.auth.signUp({ email: "budget@example.com", password: "password123" });
+    expect(3 * JSON.stringify(["users:get", bigArgs("a"), user._id, false]).length).toBeGreaterThan(2000);
+    const s = await connect(prod.url);
+    for (const id of ["a", "b", "c"]) {
+      s.send({ type: "sub", id, path: "users:get", args: bigArgs(id) });
+      expect(await s.next((m) => m.id === id)).toMatchObject({ type: "data", value: null });
+    }
+    s.send({ type: "auth", token });
+    expect(await s.next((m) => m.type === "auth")).toEqual({ type: "auth", userId: user._id });
+    const rekeyed = new Map<string, unknown>();
+    while (rekeyed.size < 3) {
+      const msg = await s.next((m) => ["a", "b", "c"].includes(m.id));
+      rekeyed.set(msg.id, msg);
+    }
+    for (const msg of rekeyed.values()) expect(msg).toMatchObject({ type: "data", value: null });
+    // Over the budget now, so nothing new fits until something goes.
+    s.send({ type: "sub", id: "d", path: "users:get", args: bigArgs("d", 10) });
+    expect(await s.next((m) => m.id === "d")).toMatchObject(tooLarge);
+  });
+
+  test("INCIBASE_MAX_JSON_BYTES sets the limit when ServeOptions does not", async () => {
+    process.env.INCIBASE_MAX_JSON_BYTES = "500";
+    const server = startServer(prod.engine, { port: 0, hostname: "127.0.0.1" });
+    try {
+      const url = server.url.origin;
+      expect((await post(url, "/api/query", { path: "users:me", args: { pad: "x".repeat(600) } })).status).toBe(413);
+      expect((await json(await post(url, "/api/query", { path: "users:me", args: {} }))).value.userId).toBeNull();
+      for (const bad of ["0", "-5", "1.5", "lots"]) {
+        process.env.INCIBASE_MAX_JSON_BYTES = bad;
+        expect(() => startServer(prod.engine, { port: 0, hostname: "127.0.0.1" })).toThrow("INCIBASE_MAX_JSON_BYTES");
+      }
+    } finally {
+      delete process.env.INCIBASE_MAX_JSON_BYTES;
+      server.stop(true);
+    }
+  });
 });
 
 describe("production errors", () => {
@@ -323,6 +396,34 @@ describe("production errors", () => {
       log.mockRestore();
     }
   });
+
+  test("admins see what went wrong in an admin tool outside dev, without the stack", async () => {
+    const log = quietConsole();
+    try {
+      const key = prod.engine.adminKey;
+      const tool = async (name: string, args: unknown) =>
+        (await rpc(prod.url, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }, key)).result;
+      const failures = [
+        [await tool("admin_sql", { query: "SELECT nope FROM notes" }), "no such column: nope"],
+        [await tool("admin_list_documents", { table: "nope" }), 'Unknown table "nope"'],
+        [await tool("tools_boom", {}), "hunter2"],
+      ] as const;
+      for (const [result, message] of failures) {
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain(message);
+        expect(result.content[0].text).not.toContain("    at ");
+      }
+      // The dashboard's admin endpoint answers the same way.
+      const { error } = await json(await post(prod.url, "/api/admin/admin_sql", { query: "SELECT nope FROM notes" }, key));
+      expect(error.message).toContain("no such column: nope");
+      expect(error.message).not.toContain("    at ");
+      // Other callers still get nothing but the code.
+      const anonymous = await rpc(prod.url, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "tools_boom", arguments: {} } });
+      expect(anonymous.result.content[0].text).toBe("INTERNAL_ERROR: Internal server error");
+    } finally {
+      log.mockRestore();
+    }
+  });
 });
 
 describe("user management", () => {
@@ -339,11 +440,11 @@ describe("user management", () => {
     const { value } = await callAdmin("admin_set_user_disabled", { id: userId, disabled: true });
     expect(value.disabled).toBe(true);
     expect(await me(token)).toBeNull();
+    // The right password gets the same answer as a wrong one, so guesses cannot be confirmed meanwhile.
     const refused = await json(await post(t.url, "/api/auth/signin", { email, password: "password123" }));
-    expect(refused.error.code).toBe("USER_DISABLED");
-    // Without the right password nothing tells the account apart.
     const wrong = await json(await post(t.url, "/api/auth/signin", { email, password: "wrong-password" }));
-    expect(wrong.error.code).toBe("INVALID_CREDENTIALS");
+    expect(refused.error).toEqual(wrong.error);
+    expect(refused.error.code).toBe("INVALID_CREDENTIALS");
 
     const enabled = await callAdmin("admin_set_user_disabled", { id: userId, disabled: false });
     expect(enabled.value.disabled).toBeUndefined();
@@ -471,5 +572,42 @@ describe("live sessions", () => {
     t.engine.store.write.query(`DELETE FROM _sessions WHERE user_id = ?`).run(removed.userId);
     t.engine.realtime.sweepSessions();
     await expectDowngraded(removed.s);
+  });
+
+  test("a client changing its password keeps its live queries signed in, without an error", async () => {
+    const client = t.client();
+    const user = await client.auth.signUp({ email: `user${++users}@example.com`, password: "password123" });
+    const oldToken = client.getToken()!;
+    // Signed out, `me` would push userId null and `required` an UNAUTHENTICATED error.
+    const events: string[] = [];
+    const seen = nextValue<string>();
+    for (const name of ["me", "required"]) {
+      const record = (event: string) => {
+        events.push(`${name} ${event}`);
+        seen.push(`${name} ${event}`);
+      };
+      client.subscribe(makeFunctionReference<"query">(`users:${name}`), {}, (v: any) => record(`data ${v.userId}`), (err) => record(`error ${err.message}`));
+    }
+    const nextBoth = async () => [await seen.next(), await seen.next()].sort();
+    const both = [`me data ${user._id}`, `required data ${user._id}`];
+    expect(await nextBoth()).toEqual(both);
+
+    // A wrong current password changes nothing, and the live queries keep working.
+    await expect(client.auth.changePassword({ currentPassword: "wrong-password", newPassword: "password456" })).rejects.toThrow(
+      "Current password is wrong",
+    );
+    await client.mutation(makeFunctionReference<"mutation">("notes:add"), { text: "before" });
+    expect(await nextBoth()).toEqual(both);
+
+    await client.auth.changePassword({ currentPassword: "password123", newPassword: "password456" });
+    expect(await nextBoth()).toEqual(both);
+    await client.mutation(makeFunctionReference<"mutation">("notes:add"), { text: "after" });
+    expect(await nextBoth()).toEqual(both);
+    await Bun.sleep(100);
+    expect(events.filter((event) => !event.endsWith(`data ${user._id}`))).toEqual([]);
+
+    // Every old session still ended.
+    expect(await me(oldToken)).toBeNull();
+    expect((await me(client.getToken()!))._id).toBe(user._id);
   });
 });

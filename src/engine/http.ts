@@ -18,11 +18,26 @@ export interface ServeOptions {
   corsOrigins?: string[] | "*";
   /** Serve the admin dashboard at `/_/`. Default true. */
   dashboard?: boolean;
-  /** Largest JSON body (API routes, MCP) and WebSocket message accepted, in bytes. Default 1 MiB. Uploads use the storage limit. */
+  /**
+   * Largest JSON body (API routes, MCP) and WebSocket message accepted, in
+   * bytes; also what one socket's subscriptions may hold. Default
+   * `INCIBASE_MAX_JSON_BYTES` or 1 MiB. Uploads use the storage limit.
+   */
   maxJsonBytes?: number;
 }
 
 const DEFAULT_MAX_JSON_BYTES = 1024 * 1024;
+
+/** `INCIBASE_MAX_JSON_BYTES`, so a server started by the CLI can raise the limit. */
+function maxJsonBytesFromEnv(): number | undefined {
+  const value = process.env.INCIBASE_MAX_JSON_BYTES;
+  if (!value) return undefined;
+  const bytes = Number(value);
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) {
+    throw new Error(`INCIBASE_MAX_JSON_BYTES must be a positive whole number of bytes, got "${value}"`);
+  }
+  return bytes;
+}
 
 /** A body over its route's limit; answered with 413. */
 class BodyTooLargeError extends IncibaseError<{ code: string; message: string }> {}
@@ -57,7 +72,7 @@ type Handler = (req: Request & { params: Record<string, string> }, server: Serve
 export function startServer(engine: Engine, options: ServeOptions): Server<SocketData> {
   const dev = !!engine.options.dev;
   const origins = options.corsOrigins ?? "*";
-  const maxJsonBytes = options.maxJsonBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const maxJsonBytes = options.maxJsonBytes ?? maxJsonBytesFromEnv() ?? DEFAULT_MAX_JSON_BYTES;
 
   const cors = (req: Request): Record<string, string> => {
     const origin = req.headers.get("origin");
@@ -77,8 +92,10 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
     return res;
   };
 
-  const errorResponse = (err: unknown) => {
+  const errorResponse = (err: unknown, { admin = false } = {}) => {
     const { status, error } = toErrorPayload(err, dev);
+    // Admin callers get the message of an internal error (not the stack) in production too, as on MCP.
+    if (status === 500 && admin && !dev) error.message = String(err);
     return Response.json({ error }, { status: err instanceof BodyTooLargeError ? 413 : status });
   };
 
@@ -213,7 +230,11 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
           if (!tool) throw new IncibaseError({ code: "NOT_FOUND", message: `Unknown admin tool "${req.params.tool}"` });
           const parsed = tool.input.safeParse(await readJson(req));
           if (!parsed.success) throw new ValidationError(`Invalid arguments:\n${z.prettifyError(parsed.error)}`, parsed.error.issues);
-          return Response.json({ value: (await tool.run(parsed.data)) ?? null });
+          try {
+            return Response.json({ value: (await tool.run(parsed.data)) ?? null });
+          } catch (err) {
+            return errorResponse(err, { admin: true });
+          }
         },
       }),
 
@@ -240,7 +261,8 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
       "/api/ws": (req: Request, server: Server<SocketData>) => {
         try {
           const { identity, session } = engine.auth.authenticateRequest(req);
-          if (server.upgrade(req, { data: { identity, session, subs: new Map() } })) return undefined;
+          const data: SocketData = { identity, session, subs: new Map(), maxSubscriptionBytes: maxJsonBytes };
+          if (server.upgrade(req, { data })) return undefined;
           return new Response("Expected a WebSocket upgrade", { status: 426 });
         } catch (err) {
           return errorResponse(err);
