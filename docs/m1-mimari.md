@@ -145,7 +145,7 @@ Internet ─:443─▶ nginx (TLS, limit_req/limit_conn, JSON log)
 2. Deploy: `incibase bundle --out app.ib`, `scp app.ib vps:`, ardından `ssh -t vps sudo incibase release add shop/prod ~/app.ib`. Root manifest'i doğrular ve sha256 hesaplar. Release `releases/<seq>/app.ib` yoluna (root:ib-<id> 0640) `staged` olarak yazılır.
 3. Gerisi `systemd-run --unit=incibase-release-<id>-<seq> --collect` içinde koşar; CLI journal'ı izler.
    1. **Snapshot:** root, `mode=ro` ile `VACUUM INTO backups/<id>/pre-<seq>.db` çalıştırır (LOCK tutulurken çalıştığı doğrulandı [P]), ardından 0600. 2×DB + 100 MB boş alan yoksa iptal.
-   2. **Preflight:** kopya üzerinde `incibase-preflight@<id>` aynı sandbox ve MemoryMax ile `serve --migrate-only` çalıştırır. 64, 65, 78 veya OOM gelirse canlı branch'e dokunulmaz. Süre gate timeout'unu belirler.
+   2. **Preflight:** kopya üzerinde `incibase-preflight@<id>` aynı sandbox ve MemoryMax ile `serve --migrate-only` çalıştırır. 64, 65, 78 veya OOM gelirse canlı branch'e dokunulmaz. Süre gate timeout'unu belirler. Kopyada `data.db` yoksa 64 döner; henüz verisi olmayan yeni bir branch'in ilk release'i `--allow-empty` ile geçer.
    3. Drop-in'e `--bundle` ve `INCIBASE_GENERATION=<seq>.<nonce>` yazılır, restart edilir. Gate generation birebir eşleşene kadar bekler.
    4. Başarılıysa `live`, son 5 release tutulur.
    5. Başarısızsa ve `migration_committed` yoksa önceki release'e dönülür. Commit varsa release kalır, alarm gider ve `release rollback --restore pre-<seq>` önerilir; snapshot sonrası yazılanlar kaybolur.
@@ -261,6 +261,9 @@ Slice=incibase.slice
 Restart=on-failure
 RestartSec=2
 RestartPreventExitStatus=64 65 78
+# serve kendi SIGHUP handler'ını kurmadan önce (runtime ve import'lar, ~40 ms) gelen bir reload süreci sinyalle bitirir;
+# systemd bunu temiz çıkış sayıp restart etmezdi.
+RestartForceExitStatus=SIGHUP
 ExecReload=/bin/kill -HUP $MAINPID
 TemporaryFileSystem=/tmp:size=64M
 SocketBindDeny=any
@@ -272,7 +275,7 @@ IPAddressAllow=127.0.0.53/32
 - **Drop-in**
   - `ExecStart=/usr/local/lib/incibase/<runtime_version>/incibase serve --bundle …/releases/<seq>/app.ib …`
   - `MemoryMax=512M`, `MemoryHigh=460M`, `MemorySwapMax=0`, `CPUQuota`, `TasksMax`, `TimeoutStopSec=25`.
-- **`incibase-preflight@.service`**: aynı sandbox; yalnızca `…/%i/preflight` yazılabilir.
+- **`incibase-preflight@.service`**: aynı sandbox ve `RestartForceExitStatus=SIGHUP`; yalnızca `…/%i/preflight` yazılabilir.
 - **Env dosyası** (0600):
   - `INCIBASE_ADMIN_KEY`, `INCIBASE_STORAGE_SECRET`.
   - `INCIBASE_SERVICE_KEYS_FILE`: `branches/<id>/service-keys.json` dosyasını gösterir (root:ib-<id> 0640; yalnızca sha256 ve kapsamlar).

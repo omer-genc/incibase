@@ -198,7 +198,8 @@ export interface ReloadTarget {
  * Makes SIGHUP (`systemctl reload`) read the service keys again instead of
  * ending the process. Install it before anything else: a reload that comes
  * while serve is still starting would otherwise end it, and systemd would not
- * restart it. Before the keys are first read there is nothing to reload; the
+ * restart it. The runtime and the imports before serve still leave a short
+ * window, which only the unit closes (`RestartForceExitStatus=SIGHUP`). Before the keys are first read there is nothing to reload; the
  * first read sees the file as it is then. Open WebSockets signed in with a
  * key whose access narrowed (or with any key, when the file could not be
  * used) become anonymous.
