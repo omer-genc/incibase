@@ -13,6 +13,7 @@ import { ridFrom, withRid } from "./log.ts";
 import { handleMcp } from "./mcp.ts";
 import type { SocketData } from "./realtime.ts";
 import { allowsInternal, hasScope } from "./service-keys.ts";
+import { ServerStoppingError } from "./timeouts.ts";
 import { adminRequestRefusal, corsOriginsFromEnv, routesFor, type Surface } from "./surface.ts";
 import { VERSION } from "./version.ts";
 
@@ -136,7 +137,7 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
       "access-control-allow-origin": origins === "*" ? "*" : origin,
       "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
       "access-control-allow-headers": "authorization, content-type, x-incibase-as-user, x-request-id, mcp-protocol-version, mcp-session-id",
-      "access-control-expose-headers": "x-request-id",
+      "access-control-expose-headers": "x-request-id, x-incibase-unprocessed, retry-after",
       "access-control-max-age": "86400",
       ...(origins === "*" ? {} : { vary: "origin" }),
     };
@@ -152,6 +153,10 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
     // Admin callers get the message of an internal error (not the stack) in production too, as on MCP.
     if (status === 500 && admin && !dev) error.message = String(err);
     if (err instanceof LimitError) return limitResponse(err, error);
+    // Cut by a stopping server and rolled back: marked as the front proxy marks a call that never arrived, so clients resend it.
+    if (err instanceof ServerStoppingError && err.unprocessed) {
+      return Response.json({ error }, { status, headers: { "x-incibase-unprocessed": "1", "retry-after": "1" } });
+    }
     return Response.json({ error }, { status: err instanceof BodyTooLargeError ? 413 : status });
   };
 

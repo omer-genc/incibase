@@ -286,6 +286,9 @@ describe("drain on SIGTERM", () => {
     run.proc.kill("SIGTERM");
     const res = await hung;
     expect(res.status).toBe(503);
+    // Marked as the front proxy marks a call that never arrived: clients resend it.
+    expect(res.headers.get("x-incibase-unprocessed")).toBe("1");
+    expect(res.headers.get("retry-after")).toBe("1");
     expect((await res.json()).error.code).toBe("SERVER_STOPPING");
     const { code, events } = await run.exit();
     const took = performance.now() - sent;
