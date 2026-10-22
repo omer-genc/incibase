@@ -1,3 +1,4 @@
+import type { Database } from "bun:sqlite";
 import { join } from "node:path";
 import { z } from "zod";
 import { getFunctionPath, type FunctionType, type RegisteredFunction } from "../api.ts";
@@ -63,6 +64,27 @@ export interface LogEntry {
   userId?: string | null;
 }
 
+export interface WriteTxOptions {
+  /**
+   * How long to wait for another process's write lock, instead of the
+   * connection's busy_timeout. bun:sqlite waits synchronously, blocking the
+   * event loop, so background work that retries on its own waits briefly.
+   */
+  busyTimeoutMs?: number;
+}
+
+/** `BEGIN IMMEDIATE`, waiting at most `busyTimeoutMs` (when given) for the write lock. */
+function begin(db: Database, busyTimeoutMs?: number) {
+  if (busyTimeoutMs === undefined) return db.run("BEGIN IMMEDIATE");
+  const { timeout } = db.query("PRAGMA busy_timeout").get() as { timeout: number };
+  db.run(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(busyTimeoutMs))}`);
+  try {
+    db.run("BEGIN IMMEDIATE");
+  } finally {
+    db.run(`PRAGMA busy_timeout = ${timeout}`);
+  }
+}
+
 class Mutex {
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -102,31 +124,32 @@ export class Engine {
   ) {
     ensurePrivateDir(options.dataDir);
     this.store = new Store(join(options.dataDir, "data.db"));
+    // A constructor that throws returns no engine to stop(): close the store here, or the data dir stays locked.
     try {
       this.migration = migrate(this.store, app.schema);
+
+      let crons: CronJobs | null = null;
+      let http: HttpRouter | null = null;
+      for (const [modulePath, ns] of Object.entries(app.modules)) {
+        for (const [name, value] of Object.entries(ns)) {
+          const marker = (value as { __incibase?: string } | null)?.__incibase;
+          if (marker === "function") this.functions.set(functionPathOf(modulePath, name), value as RegisteredFunction);
+          else if (marker === "crons" && name === "default") crons = value as CronJobs;
+          else if (marker === "httpRouter" && name === "default") http = value as HttpRouter;
+        }
+      }
+      this.crons = crons;
+      this.http = http;
+
+      this.adminKey = options.adminKey ?? process.env.INCIBASE_ADMIN_KEY ?? this.loadOrCreateAdminKey();
+      this.auth = new AuthService(this);
+      this.storage = new StorageService(this, options.storage);
+      this.scheduler = new Scheduler(this);
+      this.realtime = new Realtime(this);
     } catch (err) {
       this.store.close();
       throw err;
     }
-
-    let crons: CronJobs | null = null;
-    let http: HttpRouter | null = null;
-    for (const [modulePath, ns] of Object.entries(app.modules)) {
-      for (const [name, value] of Object.entries(ns)) {
-        const marker = (value as { __incibase?: string } | null)?.__incibase;
-        if (marker === "function") this.functions.set(functionPathOf(modulePath, name), value as RegisteredFunction);
-        else if (marker === "crons" && name === "default") crons = value as CronJobs;
-        else if (marker === "httpRouter" && name === "default") http = value as HttpRouter;
-      }
-    }
-    this.crons = crons;
-    this.http = http;
-
-    this.adminKey = options.adminKey ?? process.env.INCIBASE_ADMIN_KEY ?? this.loadOrCreateAdminKey();
-    this.auth = new AuthService(this);
-    this.storage = new StorageService(this, options.storage);
-    this.scheduler = new Scheduler(this);
-    this.realtime = new Realtime(this);
     (globalThis as Record<symbol, unknown>)[ID_TABLE_RESOLVER] = (id: string) => this.store.tableOfId(id)?.name ?? null;
   }
 
@@ -166,11 +189,11 @@ export class Engine {
 
   /** Serialized write transaction on the write connection. Notifies subscribers after commit. */
   /** `identity` is who writes, for file ownership checks; omitted means trusted engine code. */
-  writeTx<T>(fn: (session: DbSession) => Promise<T> | T, identity?: Identity): Promise<T> {
+  writeTx<T>(fn: (session: DbSession) => Promise<T> | T, identity?: Identity, options: WriteTxOptions = {}): Promise<T> {
     return this.writeLock.run(async () => {
       const db = this.store.write;
       const session = new DbSession(this.store, db, true, identity);
-      db.run("BEGIN IMMEDIATE");
+      begin(db, options.busyTimeoutMs);
       let result: T;
       try {
         result = await fn(session);

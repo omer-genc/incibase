@@ -2,7 +2,7 @@ import { getFunctionPath } from "../api.ts";
 import { IncibaseError } from "../errors.ts";
 import type { CronJob } from "../server.ts";
 import type { DbSession } from "./database.ts";
-import type { Engine, Identity } from "./engine.ts";
+import type { Engine, Identity, WriteTxOptions } from "./engine.ts";
 import { quoteIdent, rowToDoc, type DocumentRow } from "./store.ts";
 
 const SYSTEM_IDENTITY: Identity = { userId: null, admin: false, system: true };
@@ -11,7 +11,13 @@ const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_CONCURRENT = 8;
 /** Waits between attempts after a background write fails (e.g. SQLITE_BUSY): doubles from MIN up to MAX. */
 const RETRY_MIN_MS = 100;
-const RETRY_MAX_MS = 30_000;
+const RETRY_MAX_MS = 5_000;
+/**
+ * Background writes wait this long for another process's write lock, not the
+ * 5s busy_timeout: bun:sqlite waits synchronously, so a long wait would freeze
+ * reads, HTTP and WebSockets. The retry backoff does the rest of the waiting.
+ */
+const BACKGROUND: WriteTxOptions = { busyTimeoutMs: 50 };
 
 function backoff(failures: number) {
   return Math.min(RETRY_MIN_MS * 2 ** failures, RETRY_MAX_MS);
@@ -52,7 +58,7 @@ export class Scheduler {
     // Jobs left "running" by a crash never finished; mark them failed rather than run twice.
     // A retry can land after this process claimed jobs of its own, so those are skipped.
     void this.persist("restart recovery", () =>
-      this.engine.writeTx((session) => {
+      this.backgroundTx((session) => {
         for (const job of this.jobsInState(session, "running", 10_000)) {
           if (this.active.has(job._id)) continue;
           this.update(session, job, { state: "failed", completedAt: Date.now(), error: "Interrupted by server restart" });
@@ -62,7 +68,7 @@ export class Scheduler {
     for (const job of this.engine.crons?.jobs ?? []) this.startCron(job);
     this.pruneTimer = setInterval(() => {
       void this.prune().catch((err) => this.report("prune", err));
-      void this.engine.storage.cleanup().catch((err) => console.error("[incibase] storage cleanup failed:", err));
+      void this.engine.storage.cleanup().catch((err) => this.report("storage cleanup", err));
     }, 60 * 60 * 1000);
     this.poke();
   }
@@ -94,6 +100,11 @@ export class Scheduler {
       const timer = setTimeout(wake, ms);
       this.wakers.add(wake);
     });
+  }
+
+  /** A write transaction for background work, which must not block the event loop on a busy database. */
+  private backgroundTx<T>(fn: (session: DbSession) => T) {
+    return this.engine.writeTx(fn, undefined, BACKGROUND);
   }
 
   /** Retries a background write with backoff until it succeeds or the scheduler stops. */
@@ -212,7 +223,7 @@ export class Scheduler {
     this.claiming = true;
     let claimed: ScheduledDoc[];
     try {
-      claimed = await this.engine.writeTx((session) => {
+      claimed = await this.backgroundTx((session) => {
         const jobs = this.jobsInState(session, "pending", MAX_CONCURRENT - this.active.size, Date.now());
         for (const job of jobs) this.update(session, job, { state: "running", startedAt: Date.now() });
         return jobs;
@@ -250,7 +261,7 @@ export class Scheduler {
     this.engine.log({ type: "scheduled", path: job.name, durationMs: performance.now() - started, ok: !error, error });
     // The job ran: keep its slot until the outcome is stored, or a restart would report it as interrupted.
     await this.persist(`saving status of ${job.name} (${job._id})`, () =>
-      this.engine.writeTx((session) => {
+      this.backgroundTx((session) => {
         const row = session.conn.query(`SELECT _id, _creationTime, data FROM _scheduled WHERE _id = ?`).get(job._id) as DocumentRow | null;
         if (row) {
           this.update(session, rowToDoc(row) as unknown as ScheduledDoc, {
@@ -320,7 +331,7 @@ export class Scheduler {
 
   private async prune() {
     const cutoff = Date.now() - RETENTION_MS;
-    await this.engine.writeTx((session) => {
+    await this.backgroundTx((session) => {
       const result = session.conn
         .query(
           `DELETE FROM ${quoteIdent("_scheduled")} WHERE json_extract(data, '$.state') IN ('success', 'failed', 'canceled')
