@@ -3,6 +3,8 @@
 // FUNCTION_TIMEOUT (HTTP 504), its transaction is rolled back and its lock
 // released, and whatever the handler tries afterwards through its ctx throws.
 // A handler that never yields (a busy loop) cannot be cut off this way.
+// A stopping server cuts the calls its drain did not wait out the same way
+// (see drain.ts).
 import { IncibaseError } from "../errors.ts";
 import { ConfigError } from "./exit-codes.ts";
 import { logEvent } from "./log.ts";
@@ -65,17 +67,33 @@ export class FunctionTimeoutError extends IncibaseError<{ code: "FUNCTION_TIMEOU
 }
 
 /**
+ * A call cut short because the server stopped: its drain deadline passed, or
+ * a second signal came. Its transaction was rolled back, so a client may send
+ * it again. Sent to clients as SERVER_STOPPING with status 503.
+ */
+export class ServerStoppingError extends IncibaseError<{ code: "SERVER_STOPPING"; message: string }> {
+  constructor() {
+    super({ code: "SERVER_STOPPING", message: "The server is stopping: the call was cut short and nothing it wrote was kept; try again" });
+    this.name = "ServerStoppingError";
+  }
+}
+
+/** What ends a deadline's races: its own timeout, or the server stopping. */
+export type DeadlineError = FunctionTimeoutError | ServerStoppingError;
+
+/**
  * One call's deadline, counted from `start` (the start of the call, so time
  * spent queued for a lock counts too) or else from its first `race`. One
  * timer serves every `race` on it: when it fires, all of them end in the
- * same callback.
+ * same callback. With `ms` Infinity it never passes by itself, but `abort`
+ * still ends it: a stopping server cuts every call that way.
  */
 export class Deadline {
-  private error: FunctionTimeoutError | null = null;
+  private error: DeadlineError | null = null;
   private startedAt: number | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
   /** How to end each race still waiting on its work. */
-  private readonly waiting = new Set<(err: FunctionTimeoutError) => void>();
+  private readonly waiting = new Set<(err: DeadlineError) => void>();
 
   constructor(
     readonly kind: TimeoutKind,
@@ -128,13 +146,13 @@ export class Deadline {
    * never undone. A deadline that already passed rejects without calling
    * `work`.
    */
-  race<T>(work: () => Promise<T> | T, onExpire?: (err: FunctionTimeoutError) => void): Promise<T> {
+  race<T>(work: () => Promise<T> | T, onExpire?: (err: DeadlineError) => void): Promise<T> {
     this.start();
     return new Promise<T>((resolve, reject) => {
       if (!this.error && this.remainingMs <= 0) this.expire();
       if (this.error) return reject(this.error);
       let settled = false;
-      const end = (err: FunctionTimeoutError) => {
+      const end = (err: DeadlineError) => {
         settled = true;
         try {
           onExpire?.(err);
@@ -144,7 +162,7 @@ export class Deadline {
         reject(err);
       };
       this.waiting.add(end);
-      this.timer ??= setTimeout(() => this.expire(), Math.max(0, Math.ceil(this.remainingMs)));
+      if (Number.isFinite(this.ms)) this.timer ??= setTimeout(() => this.expire(), Math.max(0, Math.ceil(this.remainingMs)));
       const finish = () => {
         settled = true;
         this.waiting.delete(end);
@@ -175,15 +193,29 @@ export class Deadline {
     });
   }
 
+  /**
+   * Ends it now with `err`, as if it had passed: every race on it ends in
+   * this call (rolling back what it guards) and later checks throw `err`.
+   * `onTimeout` is not called. Does nothing once it has ended.
+   */
+  abort(err: DeadlineError) {
+    this.end(err);
+  }
+
   private expire() {
-    if (this.error) return;
+    if (this.end(new FunctionTimeoutError(this.kind, this.path, this.ms))) this.onTimeout?.(this);
+  }
+
+  /** Ends every race with `err`; false when it had ended already. */
+  private end(err: DeadlineError): boolean {
+    if (this.error) return false;
     clearTimeout(this.timer);
     this.timer = undefined;
-    const err = (this.error = new FunctionTimeoutError(this.kind, this.path, this.ms));
+    this.error = err;
     const ending = [...this.waiting];
     this.waiting.clear();
     for (const end of ending) end(err);
-    this.onTimeout?.(this);
+    return true;
   }
 }
 
@@ -191,7 +223,7 @@ export class Deadline {
 export function raceDeadline<T>(
   deadline: Deadline | undefined,
   work: () => Promise<T> | T,
-  onExpire?: (err: FunctionTimeoutError) => void,
+  onExpire?: (err: DeadlineError) => void,
 ): Promise<T> | T {
   return deadline ? deadline.race(work, onExpire) : work();
 }

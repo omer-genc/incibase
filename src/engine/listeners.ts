@@ -42,6 +42,11 @@ export interface Listeners {
   readonly url: URL;
   /** Where the public listener is, for the log: its socket path or its origin. */
   readonly listen: string;
+  /**
+   * Stops accepting connections at once and removes the socket files; the
+   * promise resolves once every open connection (WebSockets included) closed.
+   * `closeActiveConnections` closes them now instead.
+   */
   stop(closeActiveConnections?: boolean): Promise<void>;
 }
 
@@ -165,8 +170,25 @@ function socketListenError(err: unknown, path: string): unknown {
   return err;
 }
 
+/** The socket this process bound at a path, to remove it on stop and nothing that took its place. */
+interface BoundSocket {
+  path: string;
+  dev: number;
+  ino: number;
+}
+
+/** Removes the socket file at `bound.path` when it is still the one bound there (Bun usually removes it itself). */
+function removeSocket(bound: BoundSocket) {
+  try {
+    const stat = lstatSync(bound.path);
+    if (stat.isSocket() && stat.dev === bound.dev && stat.ino === bound.ino) unlinkSync(bound.path);
+  } catch {
+    // Gone already, or not ours to remove.
+  }
+}
+
 /** Binds a unix socket for `start` and gives it mode 0770 (Bun creates it from the umask, e.g. 0755). */
-async function onSocket(path: string, start: () => Server<SocketData>): Promise<Server<SocketData>> {
+async function onSocket(path: string, start: () => Server<SocketData>, bound: BoundSocket[]): Promise<Server<SocketData>> {
   await clearStaleSocket(path);
   let server: Server<SocketData>;
   try {
@@ -176,8 +198,10 @@ async function onSocket(path: string, start: () => Server<SocketData>): Promise<
   }
   try {
     // chmod follows a symlink: make sure the path is still the socket just bound.
-    if (!lstatSync(path).isSocket()) throw new Error("it is no longer a socket");
+    const stat = lstatSync(path);
+    if (!stat.isSocket()) throw new Error("it is no longer a socket");
     chmodSync(path, SOCKET_MODE);
+    bound.push({ path, dev: stat.dev, ino: stat.ino });
   } catch (err) {
     server.stop(true);
     throw new ConfigError(`Cannot set the mode of ${path} to ${SOCKET_MODE.toString(8)}: ${(err as Error).message}`);
@@ -197,11 +221,12 @@ export async function startListeners(engine: Engine, options: ListenOptions): Pr
   const serve = (surface: "combined" | "public" | "admin", unix?: string) => () =>
     startServer(engine, { port: options.port, hostname: options.hostname, dashboard: options.dashboard, surface, unix });
   const publicServe = serve(split ? "public" : "combined", options.socket);
-  const pub = options.socket ? await onSocket(options.socket, publicServe) : publicServe();
+  const bound: BoundSocket[] = [];
+  const pub = options.socket ? await onSocket(options.socket, publicServe, bound) : publicServe();
   let admin: Server<SocketData> | null = null;
   if (options.adminSocket) {
     try {
-      admin = await onSocket(options.adminSocket, serve("admin", options.adminSocket));
+      admin = await onSocket(options.adminSocket, serve("admin", options.adminSocket), bound);
     } catch (err) {
       pub.stop(true);
       throw err;
@@ -213,7 +238,10 @@ export async function startListeners(engine: Engine, options: ListenOptions): Pr
     url: pub.url,
     listen: options.socket ?? pub.url.origin,
     async stop(closeActiveConnections?: boolean) {
-      await Promise.all([pub.stop(closeActiveConnections), admin?.stop(closeActiveConnections)]);
+      const stopped = Promise.all([pub.stop(closeActiveConnections), admin?.stop(closeActiveConnections)]);
+      // Once nothing listens, the socket files go (a graceful stop no longer accepts connections right away).
+      for (const socket of bound) removeSocket(socket);
+      await stopped;
     },
   };
 }

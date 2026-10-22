@@ -19,7 +19,16 @@ import { Scheduler, validateCrons } from "./scheduler.ts";
 import type { ServiceKeys } from "./service-keys.ts";
 import { StorageService, type StorageOptions } from "./storage.ts";
 import { ensurePrivateDir, Store } from "./store.ts";
-import { Deadline, formatMs, FunctionTimeoutError, guardCtx, raceDeadline, type TimeoutKind, type Timeouts } from "./timeouts.ts";
+import {
+  Deadline,
+  formatMs,
+  FunctionTimeoutError,
+  guardCtx,
+  raceDeadline,
+  ServerStoppingError,
+  type TimeoutKind,
+  type Timeouts,
+} from "./timeouts.ts";
 
 export interface AppDefinition {
   schema?: SchemaDefinition;
@@ -184,6 +193,12 @@ export class Engine {
 
   private readonly readLock = new Mutex();
   private readonly writeLock = new Mutex();
+  /** The deadline of each function call running now, which `cutCalls` ends. */
+  private readonly running = new Set<Deadline>();
+  /** Wakes `idle` when the last running call ends. */
+  private readonly idleWaiters = new Set<() => void>();
+  /** Set once `cutCalls` ran: a call that starts afterwards is cut at once. */
+  private cutError: ServerStoppingError | null = null;
 
   constructor(
     readonly app: AppDefinition,
@@ -231,6 +246,65 @@ export class Engine {
     await this.writeLock.run(() => {});
     await this.readLock.run(() => {});
     this.store.close();
+  }
+
+  /**
+   * Resolves once no function call or scheduled job runs and no transaction
+   * holds or waits for a lock: what a graceful stop waits for. Stop the
+   * scheduler first, or new jobs keep it from resolving.
+   */
+  async idle(): Promise<void> {
+    for (;;) {
+      if (this.running.size) {
+        await new Promise<void>((resolve) => {
+          const wake = () => {
+            this.idleWaiters.delete(wake);
+            resolve();
+          };
+          this.idleWaiters.add(wake);
+        });
+      }
+      await this.scheduler.idle();
+      await this.writeLock.run(() => {});
+      await this.readLock.run(() => {});
+      // A call or job may have started another one meanwhile (an action's runMutation).
+      if (!this.running.size && this.scheduler.isIdle) return;
+    }
+  }
+
+  /** Paths of the function calls running now. */
+  runningCalls(): string[] {
+    return [...this.running].map((d) => d.path);
+  }
+
+  /**
+   * Ends every running function call now, as its deadline would: each gets
+   * SERVER_STOPPING, its transaction is rolled back and its lock released.
+   * Calls that start later are cut as they start. For a drain that ran out.
+   */
+  cutCalls() {
+    this.cutError ??= new ServerStoppingError();
+    for (const deadline of [...this.running]) deadline.abort(this.cutError);
+  }
+
+  /** Runs one function call under `deadline`, counted as running until it settles, so `idle` and `cutCalls` see it. */
+  private async tracked<T>(deadline: Deadline, work: () => Promise<T>): Promise<T> {
+    this.running.add(deadline);
+    if (this.cutError) deadline.abort(this.cutError);
+    try {
+      return await work();
+    } finally {
+      this.running.delete(deadline);
+      if (!this.running.size) for (const wake of [...this.idleWaiters]) wake();
+    }
+  }
+
+  /**
+   * The deadline of one call: `--timeouts`' for its kind, or else one that
+   * never passes but that `cutCalls` can still end.
+   */
+  private callDeadline(kind: TimeoutKind, path: string, startNow: boolean): Deadline {
+    return this.deadlineFor(kind, path, startNow) ?? (startNow ? new Deadline(kind, path, Infinity).start() : new Deadline(kind, path, Infinity));
   }
 
   private loadOrCreateAdminKey(): string {
@@ -378,43 +452,45 @@ export class Engine {
   ): Promise<{ value: unknown; reads: ReadSet[] }> {
     const fn = this.resolve(path, options);
     const started = performance.now();
-    const deadline = this.deadlineFor(fn.type, path, !options.deadlineAtLock);
-    try {
-      const parsed = this.parseArgs(fn, args);
-      let value: unknown;
-      let reads: ReadSet[] = [];
-      if (fn.type === "query") {
-        const { result, session } = await this.readTx(
-          async (session) => this.finish(fn, await fn.handler(this.queryCtx(session, identity), parsed)),
-          { deadline },
+    const deadline = this.callDeadline(fn.type, path, !options.deadlineAtLock);
+    return this.tracked(deadline, async () => {
+      try {
+        const parsed = this.parseArgs(fn, args);
+        let value: unknown;
+        let reads: ReadSet[] = [];
+        if (fn.type === "query") {
+          const { result, session } = await this.readTx(
+            async (session) => this.finish(fn, await fn.handler(this.queryCtx(session, identity), parsed)),
+            { deadline },
+          );
+          value = result;
+          reads = session.reads;
+        } else if (fn.type === "mutation") {
+          value = await this.writeTx(
+            async (session) => this.finish(fn, await fn.handler(this.mutationCtx(session, identity), parsed)),
+            identity,
+            { deadline },
+          );
+        } else {
+          value = this.finish(fn, await deadline.race(() => fn.handler(this.actionCtx(identity, deadline), parsed)));
+        }
+        this.log({ type: fn.type, path, durationMs: performance.now() - started, ok: true, userId: identity.userId });
+        return { value, reads };
+      } catch (err) {
+        this.log(
+          {
+            type: fn.type,
+            path,
+            durationMs: performance.now() - started,
+            ok: false,
+            error: (err as Error)?.message?.split("\n")[0] ?? String(err),
+            userId: identity.userId,
+          },
+          { err },
         );
-        value = result;
-        reads = session.reads;
-      } else if (fn.type === "mutation") {
-        value = await this.writeTx(
-          async (session) => this.finish(fn, await fn.handler(this.mutationCtx(session, identity), parsed)),
-          identity,
-          { deadline },
-        );
-      } else {
-        value = this.finish(fn, await raceDeadline(deadline, () => fn.handler(this.actionCtx(identity, deadline), parsed)));
+        throw err;
       }
-      this.log({ type: fn.type, path, durationMs: performance.now() - started, ok: true, userId: identity.userId });
-      return { value, reads };
-    } catch (err) {
-      this.log(
-        {
-          type: fn.type,
-          path,
-          durationMs: performance.now() - started,
-          ok: false,
-          error: (err as Error)?.message?.split("\n")[0] ?? String(err),
-          userId: identity.userId,
-        },
-        { err },
-      );
-      throw err;
-    }
+    });
   }
 
   /**
@@ -440,9 +516,9 @@ export class Engine {
     identity: Identity,
     req: Request,
     path: string,
-  ): Promise<Response> | Response {
-    const deadline = this.deadlineFor("http", path);
-    return raceDeadline(deadline, () => handler(this.actionCtx(identity, deadline), req));
+  ): Promise<Response> {
+    const deadline = this.callDeadline("http", path, true);
+    return this.tracked(deadline, () => deadline.race(() => handler(this.actionCtx(identity, deadline), req)));
   }
 
   // -------------------------------------------------------------------------
@@ -513,7 +589,7 @@ export function toErrorPayload(err: unknown, dev: boolean): { status: number; er
   if (isIncibaseError(err)) {
     const data = err.data as { code?: unknown; message?: unknown } | string;
     const code = typeof data === "object" && data && typeof data.code === "string" ? data.code : "APPLICATION_ERROR";
-    const status = err instanceof FunctionTimeoutError ? 504 : code === "UNAUTHENTICATED" ? 401 : code === "FORBIDDEN" ? 403 : code === "NOT_FOUND" ? 404 : 400;
+    const status = err instanceof FunctionTimeoutError ? 504 : err instanceof ServerStoppingError ? 503 : code === "UNAUTHENTICATED" ? 401 : code === "FORBIDDEN" ? 403 : code === "NOT_FOUND" ? 404 : 400;
     const message = typeof data === "string" ? data : typeof data?.message === "string" ? data.message : err.message;
     return { status, error: { code, message, data: err.data, application: true } };
   }

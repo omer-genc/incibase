@@ -74,6 +74,8 @@ export class Realtime {
   private readonly sweep: Timer;
   private flushScheduled = false;
   private stopped = false;
+  /** Set by `closeAll`: how sockets that open afterwards are closed. */
+  private closing: { code: number; reason: string } | null = null;
 
   constructor(private readonly engine: Engine) {
     this.sweep = setInterval(() => this.sweepSessions(), SESSION_SWEEP_MS);
@@ -85,6 +87,18 @@ export class Realtime {
     clearInterval(this.sweep);
   }
 
+  /**
+   * Closes every socket with `code` and stops rerunning subscriptions; a
+   * socket that opens later is closed the same way. A stopping server sends
+   * 1012 (service restart): clients reconnect, to it or another, and
+   * resubscribe. Until they close, a server's graceful stop would wait.
+   */
+  closeAll(code: number, reason: string) {
+    this.closing = { code, reason };
+    this.stop();
+    for (const ws of [...this.sockets]) ws.close(code, reason);
+  }
+
   get subscriptionCount() {
     return this.subs.size;
   }
@@ -93,6 +107,7 @@ export class Realtime {
     ws.data.subs ??= new Map();
     ws.data.identity ??= ANONYMOUS;
     this.sockets.add(ws);
+    if (this.closing) ws.close(this.closing.code, this.closing.reason);
   }
 
   close(ws: ServerWebSocket<SocketData>) {

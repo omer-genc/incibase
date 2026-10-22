@@ -7,6 +7,7 @@ import { bundleApp, loadAppFromBundle } from "./engine/bundle.ts";
 import { codegen, writeIfChanged } from "./engine/codegen.ts";
 import { setEmbeddedDashboard } from "./engine/dashboard.ts";
 import { describeApp } from "./engine/describe.ts";
+import { devStopWaitMs, drain, exitsWithin, parseDrainTimeout } from "./engine/drain.ts";
 import { embeddedRuntime } from "./engine/embedded.ts";
 import { Engine, type AppDefinition } from "./engine/engine.ts";
 import { ConfigError, DefinitionError, describeExit, exitCodeOf, ExitCode } from "./engine/exit-codes.ts";
@@ -65,6 +66,11 @@ Options:
                     s, m). A call past its deadline is rolled back and gets
                     504 FUNCTION_TIMEOUT (serve, dev; default:
                     $INCIBASE_TIMEOUTS, otherwise none)
+  --drain-timeout <s>
+                    On SIGTERM or SIGINT, how long to wait for running calls
+                    and jobs before cutting them (rolled back); seconds or a
+                    duration such as 500ms. A second signal cuts at once
+                    (serve, dev; default: 10, dev 1)
 `;
 
 /** The app a built binary carries. */
@@ -102,6 +108,7 @@ function parse(argv: string[]) {
       "log-format": { type: "string" },
       "allow-field-removal": { type: "boolean", default: false },
       timeouts: { type: "string" },
+      "drain-timeout": { type: "string" },
       dev: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -262,9 +269,11 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
   let publicUrl: string;
   let engine: Engine;
   let timeouts: Timeouts;
+  let drainMs: number;
   try {
     port = portOf(values.port ?? process.env.PORT ?? "3210");
     timeouts = parseTimeouts(values.timeouts);
+    drainMs = parseDrainTimeout(values["drain-timeout"], dev);
     publicUrl = (values.url ?? process.env.INCIBASE_URL ?? `http://localhost:${port}`).replace(/\/+$/, "");
     checkListenFlags({
       socket: values.socket,
@@ -380,14 +389,17 @@ ${color.bold(`incibase ${VERSION}`)}${dev ? " (dev)" : ""}  ${engine.functions.s
   }
 
   let stopping = false;
+  let forceDrain = () => {};
+  const forced = new Promise<void>((resolve) => (forceDrain = resolve));
   const shutdown = async (signal: string) => {
-    if (stopping) return;
+    // A second signal: stop waiting for the drain.
+    if (stopping) return forceDrain();
     stopping = true;
-    logEvent("info", { ev: "stopping", signal });
     // A failure here must still exit: the crash handlers would otherwise keep the process up.
     let code = 0;
     try {
-      server.stop(true);
+      await drain(engine, server, { signal, timeoutMs: drainMs, force: forced });
+      logEvent("info", { ev: "stopping", signal });
       await engine.stop();
       logEvent("info", { ev: "stopped" });
     } catch (err) {
@@ -479,11 +491,16 @@ async function dev(argv: string[], values: Values) {
     }, 120);
   });
 
-  const stop = async () => {
-    const current = child;
+  let stopping: ReturnType<typeof Bun.spawn> | null | undefined;
+  const stop = async (signal: NodeJS.Signals) => {
+    // A second signal is passed on: it cuts the server's drain short.
+    if (stopping !== undefined) return void stopping?.kill("SIGTERM");
+    const current = (stopping = child);
     child = null;
     if (current) {
-      current.kill("SIGTERM");
+      // Ctrl-C reaches the server too (one process group), and another signal from here would cut its drain short.
+      const exited = signal === "SIGINT" && (await exitsWithin(current.exited, devStopWaitMs(values["drain-timeout"])));
+      if (!exited) current.kill("SIGTERM");
       await current.exited;
     }
     process.exit(0);

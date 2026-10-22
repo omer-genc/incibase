@@ -44,6 +44,8 @@ export interface RegisteredFunction<
   readonly returns?: z.ZodType;
   readonly description?: string;
   readonly mcp?: boolean | McpToolOptions;
+  /** Queue a scheduled job of it again once after an interruption (see the function definition). */
+  readonly retryOnInterrupt?: boolean;
   readonly handler: (ctx: any, args: any) => unknown;
   /** Type-level only. */
   readonly _args: Args;
