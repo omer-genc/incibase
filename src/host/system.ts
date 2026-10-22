@@ -1,0 +1,345 @@
+// What the host layer asks of the operating system: users and groups, and
+// files with exact owners and modes. Provisioning goes through this
+// interface, so tests on macOS run it against FakeSystem and the Linux
+// tests against LinuxSystem. Commands run from argument arrays, never a
+// shell; every name is checked before it reaches one.
+import {
+  closeSync,
+  fchmodSync,
+  fchownSync,
+  fsyncSync,
+  lchownSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeSync,
+  chmodSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
+
+export interface PasswdEntry {
+  name: string;
+  uid: number;
+  gid: number;
+  gecos: string;
+  home: string;
+  shell: string;
+}
+
+export interface GroupEntry {
+  name: string;
+  gid: number;
+  members: string[];
+}
+
+export interface FileInfo {
+  type: "dir" | "file" | "symlink" | "other";
+  uid: number;
+  gid: number;
+  /** Permission bits with setuid, setgid and sticky (`& 0o7777`). */
+  mode: number;
+}
+
+export interface NewUser {
+  name: string;
+  uid: number;
+  gid: number;
+  home: string;
+  shell: string;
+  comment: string;
+}
+
+export interface HostSystem {
+  getpwnam(name: string): PasswdEntry | null;
+  getpwuid(uid: number): PasswdEntry | null;
+  getgrnam(name: string): GroupEntry | null;
+  getgrgid(gid: number): GroupEntry | null;
+  /** A system group; `gid` picks its id, otherwise the system chooses. */
+  groupadd(name: string, gid?: number): void;
+  groupdel(name: string): void;
+  /** A system user without a home directory or login shell. */
+  useradd(user: NewUser): void;
+  /** Removes the user; its group goes too if it was the user's private group. */
+  userdel(name: string): void;
+
+  /** The path itself, never what a symlink points at; null when missing. */
+  lstat(path: string): FileInfo | null;
+  /** One directory level; an existing directory is fine. */
+  mkdir(path: string, mode: number): void;
+  /** Owner of the path itself (lchown). */
+  chown(path: string, uid: number, gid: number): void;
+  /** Refuses a symlink, so it never changes what one points at. */
+  chmod(path: string, mode: number): void;
+  /** Points `path` at `target`, replacing what is there atomically. */
+  symlink(target: string, path: string): void;
+  readlink(path: string): string | null;
+  /** Writes `content` to a temp file next to `path` with the owner and mode, syncs it and renames it over `path`. */
+  writeFile(path: string, content: string, owner: { uid: number; gid: number; mode: number }): void;
+  readFile(path: string): string | null;
+  rename(from: string, to: string): void;
+  /** Removes a file, link or whole tree without following links; missing is fine. */
+  remove(path: string): void;
+  /** The first path under `root` whose owner or group is `id`, skipping (pruning) `exclude`; null when none. */
+  findOwned(root: string, id: number, exclude: string[]): string | null;
+  /** Ids of the processes running as `uid`. */
+  processesOf(uid: number): number[];
+}
+
+export class SystemCommandError extends Error {
+  constructor(
+    readonly command: string[],
+    readonly exitCode: number | null,
+    readonly stderr: string,
+  ) {
+    super(`${command.join(" ")} failed (exit ${exitCode ?? "signal"}): ${stderr.trim() || "no output"}`);
+    this.name = "SystemCommandError";
+  }
+}
+
+/** User and group names this layer passes to commands: never one that could read as an option. */
+const ACCOUNT_NAME = /^[a-z_][a-z0-9_-]{0,31}$/;
+
+export function checkAccountName(name: string): string {
+  if (!ACCOUNT_NAME.test(name)) throw new Error(`Invalid user or group name ${JSON.stringify(name)}`);
+  return name;
+}
+
+function checkId(id: number): number {
+  if (!Number.isInteger(id) || id < 0 || id >= 2 ** 32 - 1) throw new Error(`Invalid uid or gid ${id}`);
+  return id;
+}
+
+function checkPath(path: string): string {
+  if (!isAbsolute(path) || path.includes("\0")) throw new Error(`Expected an absolute path, got ${JSON.stringify(path)}`);
+  return path;
+}
+
+/** `/etc/passwd` and `/etc/group` lines as getent prints them. */
+export function parsePasswd(line: string): PasswdEntry | null {
+  const f = line.trim().split(":");
+  if (f.length < 7) return null;
+  return { name: f[0]!, uid: Number(f[2]), gid: Number(f[3]), gecos: f[4]!, home: f[5]!, shell: f[6]! };
+}
+
+export function parseGroup(line: string): GroupEntry | null {
+  const f = line.trim().split(":");
+  if (f.length < 4) return null;
+  return { name: f[0]!, gid: Number(f[2]), members: f[3] ? f[3].split(",") : [] };
+}
+
+function fileInfo(path: string): FileInfo | null {
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch (err) {
+    if ((err as { code?: string }).code === "ENOENT") return null;
+    throw err;
+  }
+  const type = st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : st.isFile() ? "file" : "other";
+  return { type, uid: st.uid, gid: st.gid, mode: st.mode & 0o7777 };
+}
+
+function tempPath(path: string): string {
+  return join(dirname(path), `.${basename(path)}.tmp`);
+}
+
+function removeQuietly(path: string) {
+  try {
+    unlinkSync(path);
+  } catch (err) {
+    if ((err as { code?: string }).code !== "ENOENT") throw err;
+  }
+}
+
+function fsyncDir(dir: string) {
+  const fd = openSync(dir, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** The real thing: shadow-utils, getent and find on Linux; run as root. */
+export class LinuxSystem implements HostSystem {
+  private run(command: string[], okCodes: number[] = [0]): { exitCode: number; stdout: string } {
+    const result = Bun.spawnSync(command, { stdin: "ignore", stdout: "pipe", stderr: "pipe", env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LC_ALL: "C" } });
+    const exitCode = result.exitCode ?? -1;
+    if (!okCodes.includes(exitCode)) throw new SystemCommandError(command, result.exitCode, result.stderr.toString());
+    return { exitCode, stdout: result.stdout.toString() };
+  }
+
+  /** getent exits 2 when the key is not found. */
+  private getent(db: "passwd" | "group", key: string): string | null {
+    const { exitCode, stdout } = this.run(["getent", db, key], [0, 2]);
+    return exitCode === 0 ? stdout.split("\n")[0]! : null;
+  }
+
+  getpwnam(name: string) {
+    const line = this.getent("passwd", checkAccountName(name));
+    return line === null ? null : parsePasswd(line);
+  }
+
+  getpwuid(uid: number) {
+    const line = this.getent("passwd", String(checkId(uid)));
+    return line === null ? null : parsePasswd(line);
+  }
+
+  getgrnam(name: string) {
+    const line = this.getent("group", checkAccountName(name));
+    return line === null ? null : parseGroup(line);
+  }
+
+  getgrgid(gid: number) {
+    const line = this.getent("group", String(checkId(gid)));
+    return line === null ? null : parseGroup(line);
+  }
+
+  groupadd(name: string, gid?: number) {
+    const args = ["groupadd", "--system"];
+    if (gid !== undefined) args.push("--gid", String(checkId(gid)));
+    this.run([...args, "--", checkAccountName(name)]);
+  }
+
+  groupdel(name: string) {
+    this.run(["groupdel", "--", checkAccountName(name)]);
+  }
+
+  useradd(user: NewUser) {
+    if (/[:\n,]/.test(user.comment)) throw new Error(`Invalid user comment ${JSON.stringify(user.comment)}`);
+    this.run([
+      "useradd",
+      "--system",
+      "--uid",
+      String(checkId(user.uid)),
+      "--gid",
+      String(checkId(user.gid)),
+      "--no-create-home",
+      "--home-dir",
+      checkPath(user.home),
+      "--shell",
+      checkPath(user.shell),
+      "--comment",
+      user.comment,
+      "--",
+      checkAccountName(user.name),
+    ]);
+  }
+
+  userdel(name: string) {
+    this.run(["userdel", "--", checkAccountName(name)]);
+  }
+
+  lstat(path: string) {
+    return fileInfo(checkPath(path));
+  }
+
+  mkdir(path: string, mode: number) {
+    try {
+      mkdirSync(checkPath(path), { mode });
+    } catch (err) {
+      if ((err as { code?: string }).code !== "EEXIST") throw err;
+      if (fileInfo(path)?.type !== "dir") throw new Error(`${path} exists and is not a directory`);
+    }
+  }
+
+  chown(path: string, uid: number, gid: number) {
+    lchownSync(checkPath(path), checkId(uid), checkId(gid));
+  }
+
+  chmod(path: string, mode: number) {
+    const info = fileInfo(checkPath(path));
+    if (!info) throw new Error(`${path} does not exist`);
+    if (info.type === "symlink") throw new Error(`${path} is a symlink; refusing to chmod what it points at`);
+    chmodSync(path, mode);
+  }
+
+  symlink(target: string, path: string) {
+    const temp = tempPath(checkPath(path));
+    removeQuietly(temp);
+    symlinkSync(target, temp);
+    renameSync(temp, path);
+    fsyncDir(dirname(path));
+  }
+
+  readlink(path: string) {
+    try {
+      return readlinkSync(checkPath(path));
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === "ENOENT" || code === "EINVAL") return null;
+      throw err;
+    }
+  }
+
+  writeFile(path: string, content: string, owner: { uid: number; gid: number; mode: number }) {
+    const temp = tempPath(checkPath(path));
+    removeQuietly(temp);
+    const fd = openSync(temp, "wx", 0o600);
+    try {
+      fchownSync(fd, checkId(owner.uid), checkId(owner.gid));
+      fchmodSync(fd, owner.mode);
+      const bytes = Buffer.from(content);
+      let written = 0;
+      while (written < bytes.length) written += writeSync(fd, bytes, written);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temp, path);
+    fsyncDir(dirname(path));
+  }
+
+  readFile(path: string) {
+    try {
+      return readFileSync(checkPath(path), "utf8");
+    } catch (err) {
+      if ((err as { code?: string }).code === "ENOENT") return null;
+      throw err;
+    }
+  }
+
+  rename(from: string, to: string) {
+    renameSync(checkPath(from), checkPath(to));
+    fsyncDir(dirname(to));
+  }
+
+  remove(path: string) {
+    // rmSync never follows symlinks; it removes the link.
+    rmSync(checkPath(path), { recursive: true, force: true });
+  }
+
+  findOwned(root: string, id: number, exclude: string[]) {
+    const prune = exclude.flatMap((p, i) => (i === 0 ? ["-path", checkPath(p)] : ["-o", "-path", checkPath(p)]));
+    const args = ["find", checkPath(root)];
+    if (prune.length) args.push("(", ...prune, ")", "-prune", "-o");
+    args.push("(", "-uid", String(checkId(id)), "-o", "-gid", String(id), ")", "-print", "-quit");
+    const { stdout } = this.run(args);
+    const first = stdout.split("\n")[0];
+    return first ? first : null;
+  }
+
+  processesOf(uid: number) {
+    checkId(uid);
+    const pids: number[] = [];
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      let status: string;
+      try {
+        status = readFileSync(`/proc/${entry}/status`, "utf8");
+      } catch {
+        continue; // exited meanwhile
+      }
+      const ids = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(status);
+      if (ids && ids.slice(1).some((v) => Number(v) === uid)) pids.push(Number(entry));
+    }
+    return pids;
+  }
+}

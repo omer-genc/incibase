@@ -137,7 +137,7 @@ Internet ─:443─▶ nginx (TLS, limit_req/limit_conn, JSON log)
    - Faz 1: kısa bir transaction'da `uid_next++`, `phase='provisioning'`, sistem env satırları ve audit **commit** edilir.
    - Faz 2 (idempotent):
      1. `getpwuid` boş olmalı.
-     2. `useradd --system --uid …`.
+     2. `groupadd --system --gid <uid> ib-<id>`, ardından `useradd --system --uid <uid> --gid <uid> --home-dir /nonexistent --shell /usr/sbin/nologin ib-<id>`. gid verilmezse useradd sistem aralığından (989 gibi) yeniden kullanılabilecek bir gid ve `/home/ib-<id>` seçiyor [P]; `userdel` grubu da siler [P].
      3. `getpwnam` eşleşmeli.
      4. `find /var/lib/incibase -uid` boş dönmeli.
      5. Ağaç, env dosyası, drop-in, `daemon-reload`, symlink'ler ve `phase='ready'`.
@@ -198,6 +198,8 @@ Internet ─:443─▶ nginx (TLS, limit_req/limit_conn, JSON log)
 
 ```sql
 -- control/registry.db  root 0600, WAL, user_version=1. Yalnız istenen durum; gerçeği `systemctl show` verir.
+-- Uygulamada (adım 9): kind IN ('prod','dev','preview'); os_uid < 100000 (Ubuntu SUB_UID_MIN); branches'ta
+-- created_at/updated_at, releases ve service_keys'te created_at; settings'te uid_base.
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   -- domain, timezone, trust_proxy, alert_webhook, cli_version, uid_next (70000+), tunnel_port_next
 CREATE TABLE projects (slug TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL);
