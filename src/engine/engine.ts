@@ -11,6 +11,7 @@ import { DbSession, ValidationError } from "./database.ts";
 import { DefinitionError } from "./exit-codes.ts";
 import { argsSchemaOf } from "./jsonschema.ts";
 import { checkLimitsEnv, databaseFullError, isDatabaseFull, limitDatabaseSize } from "./limits.ts";
+import { EXPORT_NAME_REGEX, MODULE_PATH_REGEX } from "./manifest.ts";
 import { color, isJson, logEvent, markLogged, SLOW_CALL_MS, wasLogged } from "./log.ts";
 import { migrate, type MigrationReport } from "./migrate.ts";
 import type { ReadSet } from "./readset.ts";
@@ -129,10 +130,6 @@ class Mutex {
   }
 }
 
-/** Module paths as the loader discovers them (`"chat/messages"`); other characters would break function paths. */
-const MODULE_PATH_REGEX = /^[A-Za-z0-9_]+(\/[A-Za-z0-9_]+)*$/;
-/** Export names a function reference (`api.chat.messages.list`) can spell. */
-const EXPORT_NAME_REGEX = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
 /** Splits the module path and the export name: `"chat/messages:list"`. */
 export function functionPathOf(modulePath: string, exportName: string) {

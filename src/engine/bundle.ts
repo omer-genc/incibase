@@ -11,8 +11,10 @@ import { ConfigError, DefinitionError } from "./exit-codes.ts";
 import { discoverModules, installModuleAliases, schemaOf } from "./loader.ts";
 import { logEvent } from "./log.ts";
 import {
+  appSummarySchema,
   envNamesOf,
   manifestLine,
+  manifestSchema,
   MAX_MANIFEST_BYTES,
   sha256Hex,
   verifyBundle,
@@ -179,6 +181,12 @@ export async function bundleApp(options: BundleOptions): Promise<BundleManifest>
       app,
       envNames: envNamesOf(body),
     };
+    // What serve and root would refuse to read is refused here, not written.
+    const valid = manifestSchema.safeParse(manifest);
+    if (!valid.success) {
+      const issue = valid.error.issues[0]!;
+      throw new DefinitionError(`The bundle's manifest would be refused at ${issue.path.join(".")}: ${issue.message}`);
+    }
     const line = manifestLine(manifest);
     if (Buffer.byteLength(line) > MAX_MANIFEST_BYTES) {
       throw new DefinitionError(`The bundle's manifest would be longer than ${MAX_MANIFEST_BYTES} bytes, which serve refuses`);
@@ -299,5 +307,28 @@ export async function loadAppFromBundle(file: string): Promise<{ app: AppDefinit
   const ns = await import(path);
   // Still there: Bun did not ask the hook, so what it imported was not the verified text.
   if (verifiedSources.delete(path)) throw new ConfigError(`${file} was not loaded through the verified-bundle hook`);
-  return { app: appOf(ns, file), manifest };
+  const app = appOf(ns, file);
+  checkManifestDescribes(manifest, app, source.slice(source.indexOf("\n") + 1), file);
+  return { app, manifest };
+}
+
+/**
+ * Refuses (ConfigError, exit 64) a manifest that does not describe the app
+ * the bundle defines, so the manifest a host keeps after a passing preflight
+ * is true to the release: its functions, tables, crons, routes and env names.
+ */
+function checkManifestDescribes(manifest: BundleManifest, app: AppDefinition, body: string, file: string) {
+  // Through the schema, so both sides have the same key order and no undefined keys.
+  const parsed = appSummarySchema.safeParse(JSON.parse(JSON.stringify(summarizeApp(app))));
+  const actual: Record<string, unknown> = parsed.success ? parsed.data : {};
+  const differ = (["functions", "tables", "crons", "http"] as const).filter(
+    (part) => JSON.stringify(actual[part]) !== JSON.stringify(manifest.app[part]),
+  );
+  if (JSON.stringify(envNamesOf(body)) !== JSON.stringify(manifest.envNames)) differ.push("envNames" as never);
+  if (differ.length) {
+    throw new ConfigError(
+      `${file}: its manifest does not describe the app it defines (${differ.join(", ")} differ). ` +
+        `The bundle was edited, or the app's definitions depend on the environment; bundle it again.`,
+    );
+  }
 }
