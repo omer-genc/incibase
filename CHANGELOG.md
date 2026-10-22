@@ -1,6 +1,8 @@
 # Değişiklikler
 
-## 0.3.0
+## 0.3.1
+
+`v0.3.0` tag'i Linux CI'daki iki test hatası yüzünden yayınlanmadı; 0.3.1 aynı içeriği ve bu düzeltmeleri taşır (Linux'ta dinleme hatalarının sınıflandırılması, migration bellek testinin ölçümü).
 
 M1 Faz A: tek sunucuda proje ve branch barındıracak host katmanının (Faz B) üzerine kurulacağı `serve` özellikleri. Tasarım: [docs/m1-mimari.md](docs/m1-mimari.md). Yeni davranışların çoğu bayrak ya da env ile açılır; bayraksız `serve`/`dev` aşağıda listelenenler dışında aynı çalışır.
 
