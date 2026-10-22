@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { IncibaseError } from "incibase";
 import {
   action,
   defineSchema,
@@ -105,7 +106,25 @@ const app: AppDefinition = {
           return ctx.db.insert("notes", { body: "slow" });
         },
       }),
+      busyInserts: mutation({
+        args: { ms: z.number() },
+        handler: async (ctx, { ms }) => {
+          // Only awaits ctx.db, which settles in microtasks: the deadline's timer never gets a turn.
+          const started = performance.now();
+          let n = 0;
+          while (performance.now() - started < ms) {
+            await ctx.db.insert("notes", { body: "busy" });
+            n++;
+          }
+          return n;
+        },
+      }),
       hangQuery: query({ handler: async () => never() }),
+      throws: query({
+        handler: async () => {
+          throw new IncibaseError("always fails");
+        },
+      }),
       lateRead: query({
         handler: async (ctx) => {
           await afterDeadline("query", 120, () => ctx.db.query("notes").collect());
@@ -268,15 +287,47 @@ describe("mutations", () => {
     expect(t.engine.store.read.query(`SELECT COUNT(*) AS n FROM _scheduled`).get()).toEqual({ n: 0 });
   });
 
-  test("a mutation queued behind a hung one waits for the deadline, then runs", async () => {
+  test("a mutation queued behind a hung one runs once that one times out", async () => {
     const t = await start({ mutation: 150 });
     const hung = t.call("mutation", "app:hangMutation");
-    await Bun.sleep(20);
+    // Its own deadline, counted from here, ends well after the hung one's.
+    await Bun.sleep(75);
     const queued = await timed(() => t.call("mutation", "app:add", { body: "queued" }));
     expect(queued.value.status).toBe(200);
     expect(queued.ms).toBeLessThan(1000);
     expect((await hung).status).toBe(504);
     expect(t.notes()).toEqual([{ body: "queued" }]);
+  });
+
+  test("time spent queued counts: behind several hung mutations a call gets 504 at its own deadline and never runs", async () => {
+    const t = await start({ mutation: 200 });
+    const hung = [1, 2, 3, 4].map(() => t.call("mutation", "app:hangMutation"));
+    const queued = await timed(() => t.call("mutation", "app:add", { body: "queued too long" }));
+    expect(queued.value.status).toBe(504);
+    expect(queued.value.body.error.code).toBe("FUNCTION_TIMEOUT");
+    // One deadline, not one per hung mutation ahead of it (that was about 4 x 200ms).
+    expect(queued.ms).toBeLessThan(600);
+    for (const res of await Promise.all(hung)) expect(res.status).toBe(504);
+    // Once it got the lock it was already late, so it did not start and nothing committed after its 504.
+    await Bun.sleep(50);
+    expect(t.notes()).toEqual([]);
+    const next = await timed(() => t.call("mutation", "app:add", { body: "next" }));
+    expect(next.value.status).toBe(200);
+    expect(next.ms).toBeLessThan(200);
+    expect(t.notes()).toEqual([{ body: "next" }]);
+  });
+
+  test("a mutation that only awaits ctx.db past its deadline is rolled back at commit", async () => {
+    const t = await start({ mutation: 50 });
+    const res = await t.call("mutation", "app:busyInserts", { ms: 150 });
+    expect(res.status).toBe(504);
+    expect(res.body.error.code).toBe("FUNCTION_TIMEOUT");
+    expect(t.notes()).toEqual([]);
+    expect(t.engine.store.write.inTransaction).toBe(false);
+    // Within its deadline the same mutation commits.
+    const ok = await t.call("mutation", "app:busyInserts", { ms: 5 });
+    expect(ok.status).toBe(200);
+    expect(t.notes().length).toBe(ok.body.value);
   });
 
   test("stop() does not wait past the deadline for a hung mutation", async () => {
@@ -299,6 +350,16 @@ describe("queries", () => {
     expect(next.value).toEqual({ status: 200, body: { value: 0 } });
     expect(next.ms).toBeLessThan(200);
     expect(t.engine.store.read.inTransaction).toBe(false);
+  });
+
+  test("a query queued behind hung ones gets 504 at its own deadline", async () => {
+    const t = await start({ query: 150 });
+    const hung = [1, 2, 3].map(() => t.call("query", "app:hangQuery"));
+    const queued = await timed(() => t.call("query", "app:count"));
+    expect(queued.value.status).toBe(504);
+    expect(queued.ms).toBeLessThan(400);
+    for (const res of await Promise.all(hung)) expect(res.status).toBe(504);
+    expect(await t.call("query", "app:count")).toEqual({ status: 200, body: { value: 0 } });
   });
 
   test("an abandoned query's late ctx.db call throws", async () => {
@@ -325,6 +386,62 @@ describe("queries", () => {
     expect(await t.call("query", "app:count")).toMatchObject({ status: 200 });
     await t.engine.call("app:setFlag", { hang: false }, { userId: null, admin: false });
     expect(await inbox.next()).toMatchObject({ id: "s", type: "data", value: 1 });
+  });
+});
+
+describe("subscriptions", () => {
+  async function subscribe(t: Awaited<ReturnType<typeof start>>) {
+    const ws = new WebSocket(`${t.url.replace(/^http/, "ws")}/api/ws`);
+    cleanups.push(() => ws.close());
+    const frames: any[] = [];
+    ws.onmessage = (m) => frames.push(JSON.parse(String(m.data)));
+    await new Promise((resolve) => (ws.onopen = resolve));
+    ws.send(JSON.stringify({ type: "sub", id: "s", path: "app:flagged" }));
+    return frames;
+  }
+  const setFlag = (t: Awaited<ReturnType<typeof start>>, hang: boolean) =>
+    t.engine.call("app:setFlag", { hang }, { userId: null, admin: false });
+
+  test("a change committed while a rerun hangs reruns it after the timeout", async () => {
+    const t = await start({ query: 300 });
+    await setFlag(t, false);
+    const frames = await subscribe(t);
+    await until(() => frames.length === 1);
+    await setFlag(t, true);
+    await Bun.sleep(100);
+    // The rerun is hanging now; this change lands while it runs.
+    await setFlag(t, false);
+    await until(() => frames.length === 3);
+    expect(frames.map((f) => f.type)).toEqual(["data", "error", "data"]);
+    expect(frames[1].error.code).toBe("FUNCTION_TIMEOUT");
+    expect(frames[2].value).toBe(1);
+  });
+
+  test("a subscription whose first run timed out reruns on the next change", async () => {
+    const t = await start({ query: 100 });
+    await setFlag(t, true);
+    const frames = await subscribe(t);
+    await until(() => frames.length === 1);
+    expect(frames[0]).toMatchObject({ type: "error", error: { code: "FUNCTION_TIMEOUT" } });
+    await setFlag(t, false);
+    await until(() => frames.length === 2);
+    expect(frames[1]).toMatchObject({ type: "data", value: 1 });
+  });
+
+  test("without a timeout, a query that throws on its first run is not rerun by changes (as before)", async () => {
+    const t = await start();
+    await t.engine.call("app:add", { body: "x" }, { userId: null, admin: false });
+    const ws = new WebSocket(`${t.url.replace(/^http/, "ws")}/api/ws`);
+    cleanups.push(() => ws.close());
+    const frames: any[] = [];
+    ws.onmessage = (m) => frames.push(JSON.parse(String(m.data)));
+    await new Promise((resolve) => (ws.onopen = resolve));
+    ws.send(JSON.stringify({ type: "sub", id: "s", path: "app:throws" }));
+    await until(() => frames.length === 1);
+    expect(frames[0].type).toBe("error");
+    await t.engine.call("app:add", { body: "y" }, { userId: null, admin: false });
+    await Bun.sleep(100);
+    expect(t.engine.realtime.stats()).toMatchObject([{ path: "app:throws", runs: 1 }]);
   });
 });
 
@@ -362,6 +479,7 @@ describe("actions", () => {
 describe("scheduled jobs", () => {
   test("a job past the mutation deadline is marked failed and the scheduler carries on", async () => {
     const t = await start({ mutation: 100 });
+    // Both are claimed together, so okJob waits for the write lock behind hangJob: a job's deadline starts only once it holds the lock.
     const ids = await t.engine.writeTx(async (s) => [
       await t.engine.scheduler.forSession(s).runAfter(0, "app:hangJob"),
       await t.engine.scheduler.forSession(s).runAfter(0, "app:okJob"),

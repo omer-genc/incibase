@@ -64,20 +64,44 @@ export class FunctionTimeoutError extends IncibaseError<{ code: "FUNCTION_TIMEOU
   }
 }
 
-/** One call's deadline. It starts when `race` is called, not when it is created. */
+/**
+ * One call's deadline, counted from `start` (the start of the call, so time
+ * spent queued for a lock counts too) or else from its first `race`. One
+ * timer serves every `race` on it: when it fires, all of them end in the
+ * same callback.
+ */
 export class Deadline {
   private error: FunctionTimeoutError | null = null;
+  private startedAt: number | undefined;
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  /** How to end each race still waiting on its work. */
+  private readonly waiting = new Set<(err: FunctionTimeoutError) => void>();
 
   constructor(
     readonly kind: TimeoutKind,
     readonly path: string,
     readonly ms: number,
-    /** Called once when the deadline passes, after `onExpire` (e.g. to log it). */
+    /** Called once when the deadline passes, after the races on it ended (e.g. to log it). */
     private readonly onTimeout?: (deadline: Deadline) => void,
   ) {}
 
   get expired() {
     return this.error !== null;
+  }
+
+  get started() {
+    return this.startedAt !== undefined;
+  }
+
+  /** Starts the clock, unless it already runs. */
+  start() {
+    this.startedAt ??= performance.now();
+    return this;
+  }
+
+  /** Milliseconds left; zero or less once the deadline passed, whether or not its timer has fired. */
+  get remainingMs() {
+    return this.ms - (performance.now() - (this.startedAt ?? performance.now()));
   }
 
   /** Throws once the deadline passed; guards what an abandoned handler calls later. */
@@ -86,28 +110,49 @@ export class Deadline {
   }
 
   /**
-   * Settles as `work` does, or rejects with FunctionTimeoutError `ms` from
-   * now. `onExpire` runs inside the timer callback, before any other code
-   * (the abandoned handler included) runs again, so it can close a session
-   * and roll back before the handler gets another chance to write. Once
-   * `work` has settled the timer is cleared, so a result that came first is
-   * never undone.
+   * Like `check`, but also by the clock: work that never yielded to the event
+   * loop can be past its deadline before the timer had a chance to fire.
+   * Expires the deadline then, ending every race still on it.
+   */
+  checkTime() {
+    if (!this.error && this.remainingMs <= 0) this.expire();
+    this.check();
+  }
+
+  /**
+   * Settles as `work` does, or rejects with FunctionTimeoutError when the
+   * deadline passes. `onExpire` runs inside the timer callback, before any
+   * other code (the abandoned handler included) runs again, so it can close a
+   * session and roll back before the handler gets another chance to write.
+   * Once `work` has settled the race is over, so a result that came first is
+   * never undone. A deadline that already passed rejects without calling
+   * `work`.
    */
   race<T>(work: () => Promise<T> | T, onExpire?: (err: FunctionTimeoutError) => void): Promise<T> {
+    this.start();
     return new Promise<T>((resolve, reject) => {
+      if (!this.error && this.remainingMs <= 0) this.expire();
+      if (this.error) return reject(this.error);
       let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
+      const end = (err: FunctionTimeoutError) => {
         settled = true;
-        const err = (this.error = new FunctionTimeoutError(this.kind, this.path, this.ms));
         try {
           onExpire?.(err);
         } catch (cleanupErr) {
           logEvent("error", { ev: "timeout_cleanup_error", path: this.path, err: cleanupErr }, ["[incibase] cleanup after a timeout failed:", cleanupErr]);
         }
-        this.onTimeout?.(this);
         reject(err);
-      }, this.ms);
+      };
+      this.waiting.add(end);
+      this.timer ??= setTimeout(() => this.expire(), Math.max(0, Math.ceil(this.remainingMs)));
+      const finish = () => {
+        settled = true;
+        this.waiting.delete(end);
+        if (this.waiting.size === 0) {
+          clearTimeout(this.timer);
+          this.timer = undefined;
+        }
+      };
       let pending: Promise<T>;
       try {
         pending = Promise.resolve(work());
@@ -118,18 +163,27 @@ export class Deadline {
       pending.then(
         (value) => {
           if (settled) return;
-          settled = true;
-          clearTimeout(timer);
+          finish();
           resolve(value);
         },
         (err) => {
           if (settled) return;
-          settled = true;
-          clearTimeout(timer);
+          finish();
           reject(err);
         },
       );
     });
+  }
+
+  private expire() {
+    if (this.error) return;
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    const err = (this.error = new FunctionTimeoutError(this.kind, this.path, this.ms));
+    const ending = [...this.waiting];
+    this.waiting.clear();
+    for (const end of ending) end(err);
+    this.onTimeout?.(this);
   }
 }
 

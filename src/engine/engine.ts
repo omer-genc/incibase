@@ -52,6 +52,12 @@ export interface CallOptions {
   /** Internal functions are callable from server code, the scheduler and admins only. */
   allowInternal?: boolean;
   expectType?: FunctionType;
+  /**
+   * Start a query's or mutation's deadline once it holds its lock, not at the
+   * call: for scheduled jobs and crons, which nobody waits on, so one queued
+   * behind a hung job still gets its full deadline.
+   */
+  deadlineAtLock?: boolean;
 }
 
 export class FunctionNotFoundError extends Error {
@@ -250,17 +256,22 @@ export class Engine {
   /** Serialized write transaction on the write connection. Notifies subscribers after commit. */
   /** `identity` is who writes, for file ownership checks; omitted means trusted engine code. */
   writeTx<T>(fn: (session: DbSession) => Promise<T> | T, identity?: Identity, options: WriteTxOptions = {}): Promise<T> {
-    return this.writeLock.run(async () => {
+    const { deadline } = options;
+    const locked = () => this.writeLock.run(async () => {
+      // Its deadline passed while it waited for the lock: it does not start, so it cannot commit after its caller got the timeout.
+      deadline?.checkTime();
       const db = this.store.write;
       const session = new DbSession(this.store, db, true, identity);
       begin(db, options.busyTimeoutMs);
       let result: T;
       try {
-        result = await raceDeadline(options.deadline, () => fn(session), (err) => {
+        result = await raceDeadline(deadline, () => fn(session), (err) => {
           // Runs in the timer callback, before the abandoned handler can run again: its next ctx.db call throws and nothing commits.
           session.close(err);
           if (db.inTransaction) db.run("ROLLBACK");
         });
+        // A handler that only awaited ctx.db never let the timer fire; past its deadline it rolls back instead of committing late.
+        deadline?.checkTime();
         db.run("COMMIT");
       } catch (err) {
         if (db.inTransaction) db.run("ROLLBACK");
@@ -270,16 +281,20 @@ export class Engine {
       if (session.changes.length) this.realtime.invalidate(session.changes);
       return result;
     });
+    // A deadline that counts from the start of the call also covers the wait for the lock, so a caller queued behind hung mutations gets its answer in time.
+    return deadline?.started ? deadline.race(locked) : locked();
   }
 
   /** Snapshot read transaction on the read connection. */
   readTx<T>(fn: (session: DbSession) => Promise<T> | T, options: { deadline?: Deadline } = {}): Promise<{ result: T; session: DbSession }> {
-    return this.readLock.run(async () => {
+    const { deadline } = options;
+    const locked = () => this.readLock.run(async () => {
+      deadline?.checkTime();
       const db = this.store.read;
       const session = new DbSession(this.store, db, false);
       db.run("BEGIN");
       try {
-        const result = await raceDeadline(options.deadline, () => fn(session), (err) => {
+        const result = await raceDeadline(deadline, () => fn(session), (err) => {
           session.close(err);
           if (db.inTransaction) db.run("COMMIT");
         });
@@ -288,6 +303,7 @@ export class Engine {
         if (db.inTransaction) db.run("COMMIT");
       }
     });
+    return deadline?.started ? deadline.race(locked) : locked();
   }
 
   // -------------------------------------------------------------------------
@@ -332,7 +348,7 @@ export class Engine {
   ): Promise<{ value: unknown; reads: ReadSet[] }> {
     const fn = this.resolve(path, options);
     const started = performance.now();
-    const deadline = this.deadlineFor(fn.type, path);
+    const deadline = this.deadlineFor(fn.type, path, !options.deadlineAtLock);
     try {
       const parsed = this.parseArgs(fn, args);
       let value: unknown;
@@ -373,16 +389,19 @@ export class Engine {
 
   /**
    * A deadline for one call of `kind`, or none when `--timeouts` sets none.
-   * Queries and mutations start it once they hold their lock, so time spent
-   * waiting behind another call does not count.
+   * With `startNow` it counts from now, the start of the call: time a query
+   * or mutation spends waiting for its lock counts too, so the caller is
+   * answered within the deadline and a call that ran out while queued never
+   * starts. Otherwise it starts once the call holds its lock.
    */
-  deadlineFor(kind: TimeoutKind, path: string): Deadline | undefined {
+  deadlineFor(kind: TimeoutKind, path: string, startNow = true): Deadline | undefined {
     const ms = this.options.timeouts?.[kind];
     if (!ms) return undefined;
-    return new Deadline(kind, path, ms, () => {
+    const deadline = new Deadline(kind, path, ms, () => {
       const text = this.options.quiet || this.options.dev ? undefined : [`[incibase] ${kind} ${path} timed out after ${formatMs(ms)}`];
       logEvent("warn", { ev: "timeout", type: kind, path, ms }, text);
     });
+    return startNow ? deadline.start() : deadline;
   }
 
   /** Runs an httpAction under the http deadline. */
