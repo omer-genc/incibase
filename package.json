@@ -89,7 +89,7 @@
   },
   "peerDependencies": {
     "react": ">=18",
-    "typescript": "^7"
+    "typescript": "7.0.2"
   },
   "peerDependenciesMeta": {
     "react": {
