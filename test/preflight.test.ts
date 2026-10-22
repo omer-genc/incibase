@@ -293,7 +293,9 @@ import { defineSchema, defineTable, z } from "incibase/server";
 const store = new Store(${JSON.stringify(path)});
 const report = migrate(store, defineSchema({ notes: defineTable({ body: z.string(), n: z.number(), tag: z.string().default("new") }) }));
 store.close();
-console.log(JSON.stringify({ rewritten: report.rewrittenDocuments, maxRssKiB: process.resourceUsage().maxRSS }));
+// On Linux ru_maxrss survives exec, so it would report the test runner's own peak; VmHWM starts fresh.
+const hwm = (() => { try { return Number(require("node:fs").readFileSync("/proc/self/status", "utf8").match(/VmHWM:\\s+(\\d+)/)?.[1]); } catch { return NaN; } })();
+console.log(JSON.stringify({ rewritten: report.rewrittenDocuments, maxRssKiB: Number.isFinite(hwm) ? hwm : process.resourceUsage().maxRSS }));
 `,
     );
     const proc = Bun.spawn([process.execPath, script], { cwd: join(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe", timeout: 60_000 });

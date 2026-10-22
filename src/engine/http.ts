@@ -93,9 +93,9 @@ const PERMANENT_BIND_ERRORS: Record<string, (port: number) => string> = {
 };
 
 /**
- * Why `startServer` could not listen on `hostname:port`. Bun reports every
- * listen failure as EADDRINUSE with errno 0, including a hostname that does
- * not resolve, an address that is not on this machine and a port this user
+ * Why `startServer` could not listen on `hostname:port`. On macOS Bun reports
+ * every listen failure as EADDRINUSE with errno 0, including a hostname that does
+ * not resolve (Linux reports that one as EINVAL or EEXIST), an address that is not on this machine and a port this user
  * may not bind. Those fail the same way on every start, so this resolves the
  * host and binds the address with node:net to find the real cause: a
  * ConfigError (exit 64) for those, and `err` itself (exit 75) for an address
@@ -105,7 +105,15 @@ export async function listenError(err: unknown, hostname: string, port: number):
   const code = (err as { code?: unknown } | null)?.code;
   const fail = (reason: string) => new ConfigError(`Cannot listen on ${hostname}:${port}: ${reason}`);
   if (typeof code === "string" && PERMANENT_BIND_ERRORS[code]) return fail(PERMANENT_BIND_ERRORS[code](port));
-  if (code !== "EADDRINUSE") return err;
+  if (code !== "EADDRINUSE") {
+    // On Linux a hostname that does not resolve fails as EINVAL or EEXIST (it depends on the port), not as EADDRINUSE.
+    try {
+      await lookup(hostname);
+    } catch {
+      return fail("the hostname does not resolve");
+    }
+    return code === "EINVAL" ? fail("invalid address") : err;
+  }
   let address: string;
   try {
     ({ address } = await lookup(hostname));
