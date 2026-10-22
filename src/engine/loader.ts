@@ -7,6 +7,7 @@ import type { SchemaDefinition } from "../schema.ts";
 import * as serverNs from "../server.ts";
 import type { AppDefinition } from "./engine.ts";
 import { DefinitionError } from "./exit-codes.ts";
+import { logEvent } from "./log.ts";
 
 const MODULE_SEGMENT = /^[A-Za-z0-9_]+$/;
 const SCHEMA_FILES = ["schema.ts", "schema.js", "schema.mts", "schema.mjs"];
@@ -71,7 +72,9 @@ export async function loadAppFromDir(dir: string): Promise<AppDefinition> {
   installModuleAliases();
   const { modules, schemaFile, skipped } = discoverModules(dir);
   for (const file of skipped) {
-    console.warn(`[incibase] skipping ${relative(process.cwd(), join(dir, file))}: module paths may only use letters, digits and "_"`);
+    const path = relative(process.cwd(), join(dir, file));
+    const reason = `module paths may only use letters, digits and "_"`;
+    logEvent("warn", { ev: "module_skipped", path, msg: reason }, [`[incibase] skipping ${path}: ${reason}`]);
   }
   const schema = schemaFile ? schemaOf(await import(schemaFile), schemaFile) : undefined;
   const loaded: AppDefinition["modules"] = {};

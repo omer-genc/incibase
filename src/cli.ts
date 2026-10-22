@@ -11,6 +11,7 @@ import { Engine, type AppDefinition } from "./engine/engine.ts";
 import { ConfigError, DefinitionError, describeExit, exitCodeOf, ExitCode } from "./engine/exit-codes.ts";
 import { startServer } from "./engine/http.ts";
 import { loadAppFromDir, schemaOf } from "./engine/loader.ts";
+import { color, isJson, logEvent, parseLogFormat, setLogFormat, stripQuery } from "./engine/log.ts";
 import { MigrationError } from "./engine/migrate.ts";
 import { DataDirLockedError, readMeta } from "./engine/store.ts";
 import { VERSION } from "./engine/version.ts";
@@ -36,6 +37,8 @@ Options:
   --outfile <path>  Output for build (default: ./app)
   --target <t>      Build target, e.g. bun-linux-x64 (default: this machine)
   --no-dashboard    Do not serve the admin dashboard at /_/
+  --log-format <f>  text (default) or json: one JSON object per line on
+                    stdout (serve, dev; default: $INCIBASE_LOG_FORMAT)
   --allow-field-removal
                     Let a migration delete the stored data of fields removed
                     from the schema (serve, dev); otherwise it is refused.
@@ -69,6 +72,7 @@ function parse(argv: string[]) {
       outfile: { type: "string", default: "./app" },
       target: { type: "string" },
       "no-dashboard": { type: "boolean", default: false },
+      "log-format": { type: "string" },
       "allow-field-removal": { type: "boolean", default: false },
       dev: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -83,8 +87,13 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
   try {
     parsed = parse(argv);
   } catch (err) {
-    console.error(`${(err as Error).message}\n`);
-    console.log(HELP);
+    if (process.env.INCIBASE_LOG_FORMAT === "json") {
+      setLogFormat("json");
+      logEvent("error", { ev: "fatal", msg: (err as Error).message, exitCode: ExitCode.CONFIG, reason: describeExit(ExitCode.CONFIG) });
+    } else {
+      console.error(`${(err as Error).message}\n`);
+      console.log(HELP);
+    }
     process.exit(ExitCode.CONFIG);
   }
   const { values, command: given } = parsed;
@@ -97,6 +106,14 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
   if (options.embedded && !["serve", "start", "admin-key"].includes(command)) {
     console.error(`"${command}" is not available in a built app. Use: serve, admin-key`);
     process.exit(1);
+  }
+
+  if (["serve", "start", "dev"].includes(command)) {
+    try {
+      setLogFormat(parseLogFormat(values["log-format"]));
+    } catch (err) {
+      exitOnStartError(err);
+    }
   }
 
   switch (command) {
@@ -146,21 +163,29 @@ type Values = ReturnType<typeof parse>["values"];
  * a restart can fix.
  */
 function exitOnStartError(err: unknown): never {
+  const code = exitCodeOf(err);
+  const message = (err as Error)?.message ?? String(err);
   if (err instanceof MigrationError) {
-    console.error(`\x1b[31m${err.message}\x1b[0m\nFix the schema (or the data) and save again.`);
+    fatal(err, code, [`${color.red(message)}\nFix the schema (or the data) and save again.`]);
   } else if (err instanceof DataDirLockedError || err instanceof ConfigError || (err as { code?: string })?.code === "EADDRINUSE") {
-    console.error(`\x1b[31m${(err as Error).message}\x1b[0m`);
+    fatal(err, code, [color.red(message)]);
   } else if (err instanceof DefinitionError) {
     // The stack is incibase's own, except for the frame in the app that made the definition.
     const frame = err.stack
       ?.split("\n")
       .map((line) => line.trim())
       .find((line) => line.startsWith("at ") && line.includes("/") && !line.includes(import.meta.dir));
-    console.error(`\x1b[31m${err.message}\x1b[0m${frame ? `\n  ${frame}` : ""}`);
+    fatal(err, code, [`${color.red(message)}${frame ? `\n  ${frame}` : ""}`], { at: frame?.slice(3) });
   } else {
-    console.error(err);
+    fatal(err, code, [err], { stack: (err as Error)?.stack });
   }
-  process.exit(exitCodeOf(err));
+  process.exit(code);
+}
+
+/** A start failure: `text` in text mode, one `fatal` line naming the exit code in json mode. */
+function fatal(err: unknown, exitCode: number, text: unknown[], fields: Record<string, unknown> = {}) {
+  const message = (err as Error)?.message ?? String(err);
+  logEvent("error", { ev: "fatal", msg: message, exitCode, reason: describeExit(exitCode), ...fields }, text);
 }
 
 function portOf(value: string): number {
@@ -192,12 +217,27 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
     writeIfChanged(join(values.dir, "_generated", "schema.json"), JSON.stringify(describeApp(engine), null, 2) + "\n");
   }
   const m = engine.migration;
-  for (const t of m.createdTables) console.log(`+ table ${t}`);
-  for (const i of m.addedIndexes) console.log(`+ index ${i}`);
-  for (const i of m.droppedIndexes) console.log(`- index ${i}`);
-  for (const t of m.deactivatedTables) console.log(`- table ${t} (removed from schema; data kept)`);
-  for (const f of m.removedFields) console.log(`- field ${f.table}.${f.field} (data deleted from ${f.documents} document(s))`);
-  if (m.rewrittenDocuments) console.log(`~ ${m.rewrittenDocuments} document(s) updated to the new schema`);
+  if (isJson()) {
+    const changed = [m.createdTables, m.addedIndexes, m.droppedIndexes, m.deactivatedTables, m.removedFields].some((l) => l.length);
+    if (changed || m.rewrittenDocuments) {
+      logEvent("info", {
+        ev: "migration",
+        createdTables: m.createdTables,
+        addedIndexes: m.addedIndexes,
+        droppedIndexes: m.droppedIndexes,
+        deactivatedTables: m.deactivatedTables,
+        removedFields: m.removedFields,
+        rewrittenDocuments: m.rewrittenDocuments,
+      });
+    }
+  } else {
+    for (const t of m.createdTables) console.log(`+ table ${t}`);
+    for (const i of m.addedIndexes) console.log(`+ index ${i}`);
+    for (const i of m.droppedIndexes) console.log(`- index ${i}`);
+    for (const t of m.deactivatedTables) console.log(`- table ${t} (removed from schema; data kept)`);
+    for (const f of m.removedFields) console.log(`- field ${f.table}.${f.field} (data deleted from ${f.documents} document(s))`);
+    if (m.rewrittenDocuments) console.log(`~ ${m.rewrittenDocuments} document(s) updated to the new schema`);
+  }
 
   engine.start();
   const dashboard = !values["no-dashboard"];
@@ -214,12 +254,26 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
 
   const mcpUrl = `${publicUrl}/mcp`;
   const tableCount = [...engine.store.tables.values()].filter((t) => !t.system).length;
-  if (process.env.INCIBASE_RESTART) {
+  if (isJson()) {
+    // Never the admin key: json lines end up in a journal other people can read.
+    logEvent("info", {
+      ev: "ready",
+      url: stripQuery(publicUrl),
+      listen: server.url.origin,
+      version: VERSION,
+      dev,
+      functions: engine.functions.size,
+      tables: tableCount,
+      dashboard,
+      data: resolve(values.data),
+      ...(process.env.INCIBASE_RESTART ? { restart: true } : {}),
+    });
+  } else if (process.env.INCIBASE_RESTART) {
     // Dev restarts after a file change: one line instead of the full banner.
-    console.log(`\x1b[32mready\x1b[0m ${engine.functions.size} function(s), ${tableCount} table(s)`);
+    console.log(`${color.green("ready")} ${engine.functions.size} function(s), ${tableCount} table(s)`);
   } else {
     console.log(`
-\x1b[1mincibase ${VERSION}\x1b[0m${dev ? " (dev)" : ""}  ${engine.functions.size} function(s), ${tableCount} table(s)
+${color.bold(`incibase ${VERSION}`)}${dev ? " (dev)" : ""}  ${engine.functions.size} function(s), ${tableCount} table(s)
   API       ${publicUrl}/api${dashboard ? `\n  Dashboard ${publicUrl}/_/` : ""}
   Realtime  ${publicUrl.replace(/^http/, "ws")}/api/ws
   MCP       ${mcpUrl}
@@ -236,22 +290,24 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
   }
 
   let stopping = false;
-  const shutdown = async () => {
+  const shutdown = async (signal: string) => {
     if (stopping) return;
     stopping = true;
+    logEvent("info", { ev: "stopping", signal });
     // A failure here must still exit: the crash handlers would otherwise keep the process up.
     let code = 0;
     try {
       server.stop(true);
       await engine.stop();
+      logEvent("info", { ev: "stopped" });
     } catch (err) {
-      console.error("[incibase] shutdown failed:", err);
+      logEvent("error", { ev: "shutdown_failed", err }, ["[incibase] shutdown failed:", err]);
       code = 1;
     }
     process.exit(code);
   };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
 /**
@@ -263,10 +319,11 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
  */
 export function installCrashHandlers() {
   process.on("unhandledRejection", (reason) => {
-    console.error("[incibase] unhandled promise rejection (a missing await?); still serving:", reason);
+    const text = ["[incibase] unhandled promise rejection (a missing await?); still serving:", reason];
+    logEvent("error", { ev: "unhandled_rejection", msg: "a missing await?", err: reason }, text);
   });
   process.on("uncaughtException", (err, origin) => {
-    console.error(`[incibase] uncaught exception (${origin}); still serving:`, err);
+    logEvent("error", { ev: "uncaught", origin, err }, [`[incibase] uncaught exception (${origin}); still serving:`, err]);
   });
 }
 
@@ -290,7 +347,7 @@ async function dev(argv: string[], values: Values) {
   let restarts = 0;
   const start = () => {
     const { changed } = codegen(dir);
-    if (changed.length) console.log(`\x1b[2mgenerated ${changed.join(", ")}\x1b[0m`);
+    if (changed.length) logEvent("info", { ev: "codegen", files: changed }, [color.dim(`generated ${changed.join(", ")}`)]);
     child = Bun.spawn([...selfCommand(), ...childArgs, ...(allowFieldRemoval ? ["--allow-field-removal"] : [])], {
       stdio: ["inherit", "inherit", "inherit"],
       env: { ...process.env, ...(restarts++ ? { INCIBASE_RESTART: "1" } : {}) },
@@ -298,7 +355,8 @@ async function dev(argv: string[], values: Values) {
     const current = child;
     void current.exited.then((code) => {
       if (child === current && code !== 0 && code !== null) {
-        console.log(`\x1b[33mServer stopped (${describeExit(code)}); waiting for changes...\x1b[0m`);
+        const msg = `Server stopped (${describeExit(code)}); waiting for changes...`;
+        logEvent("info", { ev: "server_stopped", exitCode: code, reason: describeExit(code), msg }, [color.yellow(msg)]);
       }
     });
   };
@@ -310,7 +368,8 @@ async function dev(argv: string[], values: Values) {
       // Still running means it migrated (or stops before committing); a refused one has exited.
       if (old.exitCode === null && allowFieldRemoval) {
         allowFieldRemoval = false;
-        console.log(`\x1b[2m--allow-field-removal applied to the first start only\x1b[0m`);
+        const msg = "--allow-field-removal applied to the first start only";
+        logEvent("info", { ev: "notice", msg }, [color.dim(msg)]);
       }
       old.kill("SIGTERM");
       await old.exited;
@@ -324,7 +383,8 @@ async function dev(argv: string[], values: Values) {
     if (name.startsWith("_generated") || name.split(/[\\/]/).some((s) => s.startsWith("."))) return;
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
-      console.log(`\x1b[2m${relative(process.cwd(), join(dir, name))} changed, restarting\x1b[0m`);
+      const file = relative(process.cwd(), join(dir, name));
+      logEvent("info", { ev: "restarting", file }, [color.dim(`${file} changed, restarting`)]);
       restarting = (restarting ?? Promise.resolve()).then(restart);
     }, 120);
   });

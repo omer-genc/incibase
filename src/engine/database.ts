@@ -4,6 +4,7 @@ import { IncibaseError } from "../errors.ts";
 import { FIELD_PATH_REGEX, type IndexDefinition } from "../schema.ts";
 import type { Identity } from "./engine.ts";
 import { syncFiles } from "./files.ts";
+import { logEvent } from "./log.ts";
 import type { Change, RangeRead, ReadSet } from "./readset.ts";
 import { fieldExpr, quoteIdent, rowToDoc, type Document, type DocumentRow, type Store, type TableInfo } from "./store.ts";
 
@@ -285,7 +286,7 @@ export class DbSession {
       try {
         hook();
       } catch (err) {
-        console.error("[incibase] commit hook failed:", err);
+        logEvent("error", { ev: "commit_hook_error", err }, ["[incibase] commit hook failed:", err]);
       }
     }
   }

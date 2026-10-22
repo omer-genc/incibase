@@ -2,7 +2,9 @@
 // `/api/admin/:tool` endpoint. Callers must already have checked the admin key.
 import { z } from "zod";
 import { runAdminSql, SQL_MAX_ROWS, SQL_TIMEOUT_MS } from "./adminsql.ts";
+import { ValidationError } from "./database.ts";
 import { describeApp } from "./describe.ts";
+import { logEvent } from "./log.ts";
 import { visibilityOf } from "./storage.ts";
 import type { Engine } from "./engine.ts";
 import { VERSION } from "./version.ts";
@@ -12,6 +14,26 @@ export interface AdminTool {
   input: z.ZodObject<any>;
   readOnly: boolean;
   run: (args: any) => Promise<unknown>;
+}
+
+/**
+ * Checks `args` against the tool's input and runs it, logging the call in
+ * json mode (the tool's name and outcome, never its arguments: they can hold
+ * SQL, documents or keys).
+ */
+export async function invokeAdminTool(name: string, tool: AdminTool, args: unknown, via: "http" | "mcp"): Promise<unknown> {
+  const started = performance.now();
+  try {
+    const parsed = tool.input.safeParse(args);
+    if (!parsed.success) throw new ValidationError(`Invalid arguments:\n${z.prettifyError(parsed.error)}`, parsed.error.issues);
+    const value = await tool.run(parsed.data);
+    logEvent("info", { ev: "admin", tool: name, via, ok: true, ms: Math.round(performance.now() - started) });
+    return value;
+  } catch (err) {
+    const error = (err as Error)?.message?.split("\n")[0] ?? String(err);
+    logEvent("warn", { ev: "admin", tool: name, via, ok: false, ms: Math.round(performance.now() - started), error });
+    throw err;
+  }
 }
 
 const rangeOp = z.object({

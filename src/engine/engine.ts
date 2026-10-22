@@ -10,6 +10,7 @@ import { AuthService } from "./auth.ts";
 import { DbSession, ValidationError } from "./database.ts";
 import { DefinitionError } from "./exit-codes.ts";
 import { argsSchemaOf } from "./jsonschema.ts";
+import { color, isJson, logEvent, markLogged, SLOW_CALL_MS, wasLogged } from "./log.ts";
 import { migrate, type MigrationReport } from "./migrate.ts";
 import type { ReadSet } from "./readset.ts";
 import { Realtime } from "./realtime.ts";
@@ -203,13 +204,37 @@ export class Engine {
     return key;
   }
 
-  log(entry: Omit<LogEntry, "time">) {
+  /**
+   * Records a call in the in-memory log the dashboard reads. In json mode it
+   * is also printed when it failed or was slow (`INCIBASE_LOG_CALLS`: errors,
+   * slow or all); `err` adds the stack of an unexpected error. `emit: false`
+   * records only, for callers that log the failure themselves.
+   */
+  log(entry: Omit<LogEntry, "time">, { err, emit = true }: { err?: unknown; emit?: boolean } = {}) {
     const full = { time: Date.now(), ...entry };
     this.logs.push(full);
     if (this.logs.length > 1000) this.logs.splice(0, this.logs.length - 1000);
-    if (this.options.dev && !this.options.quiet) {
-      const status = entry.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
-      const suffix = entry.error ? ` \x1b[31m${entry.error}\x1b[0m` : "";
+    if (!emit) return;
+    if (isJson()) {
+      const calls = process.env.INCIBASE_LOG_CALLS ?? "slow";
+      const slow = entry.durationMs > SLOW_CALL_MS;
+      if (entry.ok && !(calls === "all" || (calls === "slow" && slow))) return;
+      const unexpected = !entry.ok && err instanceof Error && !isExpectedError(err) && !wasLogged(err);
+      if (unexpected) markLogged(err);
+      logEvent(entry.ok ? (slow ? "warn" : "info") : "error", {
+        ev: entry.type === "cron" || entry.type === "scheduled" ? "job" : "call",
+        type: entry.type,
+        path: entry.path,
+        ms: Math.round(entry.durationMs),
+        ok: entry.ok,
+        ...(slow ? { slow } : {}),
+        ...(entry.error !== undefined ? { error: entry.error } : {}),
+        ...(entry.userId ? { userId: entry.userId } : {}),
+        ...(unexpected ? { stack: (err as Error).stack } : {}),
+      });
+    } else if (this.options.dev && !this.options.quiet) {
+      const status = entry.ok ? color.green("✓") : color.red("✗");
+      const suffix = entry.error ? ` ${color.red(entry.error)}` : "";
       console.log(`${status} [${entry.type}] ${entry.path} ${entry.durationMs.toFixed(1)}ms${suffix}`);
     }
   }
@@ -315,14 +340,17 @@ export class Engine {
       this.log({ type: fn.type, path, durationMs: performance.now() - started, ok: true, userId: identity.userId });
       return { value, reads };
     } catch (err) {
-      this.log({
-        type: fn.type,
-        path,
-        durationMs: performance.now() - started,
-        ok: false,
-        error: (err as Error)?.message?.split("\n")[0] ?? String(err),
-        userId: identity.userId,
-      });
+      this.log(
+        {
+          type: fn.type,
+          path,
+          durationMs: performance.now() - started,
+          ok: false,
+          error: (err as Error)?.message?.split("\n")[0] ?? String(err),
+          userId: identity.userId,
+        },
+        { err },
+      );
       throw err;
     }
   }
@@ -374,6 +402,11 @@ export class Engine {
   }
 }
 
+/** Errors clients are told about (4xx); anything else is a bug worth its stack in the log. */
+function isExpectedError(err: unknown): boolean {
+  return isIncibaseError(err) || err instanceof ValidationError || err instanceof FunctionNotFoundError;
+}
+
 /** Shape of errors sent to clients. */
 export interface ErrorPayload {
   code: string;
@@ -398,6 +431,9 @@ export function toErrorPayload(err: unknown, dev: boolean): { status: number; er
     return { status: 404, error: { code: "FUNCTION_NOT_FOUND", message: err.message } };
   }
   const message = dev ? ((err as Error)?.stack ?? String(err)) : "Internal server error";
-  if (!dev) console.error("[incibase]", err);
+  if (isJson()) {
+    if (!wasLogged(err)) logEvent("error", { ev: "error", err });
+    markLogged(err);
+  } else if (!dev) console.error("[incibase]", err);
   return { status: 500, error: { code: "INTERNAL_ERROR", message } };
 }

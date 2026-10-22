@@ -5,6 +5,7 @@ import type { z } from "zod";
 import { FIELD_PATH_REGEX, type IndexDefinition } from "../schema.ts";
 import { ConfigError, EXIT_CODE, ExitCode } from "./exit-codes.ts";
 import type { StorageField } from "./files.ts";
+import { logEvent } from "./log.ts";
 import { ID_REGEX } from "../values.ts";
 import { VERSION } from "./version.ts";
 
@@ -97,7 +98,8 @@ function restrictMode(path: string, mode: number) {
   try {
     chmodSync(path, current & mode);
   } catch (err) {
-    console.warn(`[incibase] could not restrict ${path} to mode ${mode.toString(8)}: ${(err as Error).message}`);
+    const message = `could not restrict ${path} to mode ${mode.toString(8)}: ${(err as Error).message}`;
+    logEvent("warn", { ev: "chmod_failed", msg: message }, [`[incibase] ${message}`]);
   }
 }
 

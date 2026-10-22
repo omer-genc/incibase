@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { SessionRef } from "./auth.ts";
 import type { Engine, Identity } from "./engine.ts";
 import { ANONYMOUS, toErrorPayload } from "./engine.ts";
+import { logEvent, newRid, withRid } from "./log.ts";
 import { affects, type Change, type ReadSet } from "./readset.ts";
 
 /** Commits within this window are coalesced into one rerun per affected subscription. */
@@ -96,7 +97,7 @@ export class Realtime {
   /** Handles one client message. Never throws: a bad message gets an error reply, not a crash. */
   message(ws: ServerWebSocket<SocketData>, raw: string | Buffer) {
     try {
-      this.handle(ws, raw);
+      withRid(newRid(), () => this.handle(ws, raw));
     } catch (err) {
       const { error } = toErrorPayload(err, !!this.engine.options.dev);
       ws.send(JSON.stringify({ type: "error", error }));
@@ -171,7 +172,7 @@ export class Realtime {
         if (session && !this.engine.auth.activeSession(session.tokenHash, now)) this.setIdentity(ws, ANONYMOUS, null);
       }
     } catch (err) {
-      console.error("[incibase] session sweep failed:", err);
+      logEvent("error", { ev: "realtime_error", what: "session sweep", err }, ["[incibase] session sweep failed:", err]);
     }
   }
 
@@ -246,10 +247,10 @@ export class Realtime {
         let body: string;
         try {
           sub.runs++;
-          const { value, reads } = await this.engine.callTracked(sub.path, sub.args, sub.identity, {
-            expectType: "query",
-            allowInternal: sub.identity.admin,
-          });
+          // Each run is a request of its own in the log; one serves every client of the subscription.
+          const { value, reads } = await withRid(newRid(), () =>
+            this.engine.callTracked(sub.path, sub.args, sub.identity, { expectType: "query", allowInternal: sub.identity.admin }),
+          );
           sub.reads = reads;
           sub.tables = new Set(reads.map((r) => r.table));
           // A write that landed mid-run may or may not be in this result; rerun if it could matter.

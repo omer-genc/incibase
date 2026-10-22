@@ -4,6 +4,7 @@ import type { CronJob, CronJobs } from "../server.ts";
 import type { DbSession } from "./database.ts";
 import type { Engine, Identity, WriteTxOptions } from "./engine.ts";
 import { DefinitionError } from "./exit-codes.ts";
+import { isJson, logEvent, newRid, withRid } from "./log.ts";
 import { quoteIdent, rowToDoc, type DocumentRow } from "./store.ts";
 
 const SYSTEM_IDENTITY: Identity = { userId: null, admin: false, system: true };
@@ -103,11 +104,14 @@ export class Scheduler {
     for (const wake of this.wakers) wake();
   }
 
-  /** Logs a background failure to the engine log (and stderr outside dev); never throws. */
+  /** Logs a background failure to the engine log (and stderr outside dev, or as json); never throws. */
   private report(what: string, err: unknown) {
     const error = (err as Error)?.message ?? String(err);
-    this.engine.log({ type: "scheduled", path: `scheduler: ${what}`, durationMs: 0, ok: false, error });
-    if (!this.engine.options.dev && !this.engine.options.quiet) console.error(`[incibase] scheduler ${what} failed:`, err);
+    // In json mode the scheduler_error line below says it, with the stack.
+    this.engine.log({ type: "scheduled", path: `scheduler: ${what}`, durationMs: 0, ok: false, error }, { emit: !isJson() });
+    if (this.engine.options.quiet) return;
+    const text = this.engine.options.dev ? undefined : [`[incibase] scheduler ${what} failed:`, err];
+    logEvent("error", { ev: "scheduler_error", what, err }, text);
   }
 
   /** A timer wait that stop() cuts short. */
@@ -256,7 +260,8 @@ export class Scheduler {
     } finally {
       this.claiming = false;
     }
-    for (const job of claimed) void this.run(job);
+    // Each job is a request of its own in the log.
+    for (const job of claimed) void withRid(newRid(), () => this.run(job));
     this.poke();
   }
 
@@ -321,7 +326,8 @@ export class Scheduler {
     const arm = () => {
       if (this.stopped) return;
       const timer = setTimeout(
-        async () => {
+        // Each run is a request of its own in the log.
+        () => withRid(newRid(), async () => {
           this.cronTimers = this.cronTimers.filter((t) => t !== timer);
           rearm();
           if (busy) return; // previous run still going; skip this tick
@@ -341,7 +347,7 @@ export class Scheduler {
           } finally {
             busy = false;
           }
-        },
+        }),
         Math.max(0, Math.min(next() - Date.now(), MAX_TIMEOUT)),
       );
       this.cronTimers.push(timer);

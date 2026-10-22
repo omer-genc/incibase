@@ -7,11 +7,17 @@ import type { DbSession } from "./database.ts";
 import { collectHeldIds, contentTypeMatches } from "./files.ts";
 import { ensurePrivateDir, quoteIdent } from "./store.ts";
 import type { Engine, Identity } from "./engine.ts";
+import { logEvent } from "./log.ts";
 
 const UPLOAD_URL_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_SIGNED_URL_SECONDS = 60 * 60;
 
 export type Visibility = "public" | "private";
+
+/** The row is gone; only the stored bytes are left behind, for the next cleanup to find. */
+function blobDeleteFailed(storageId: string, err: unknown) {
+  logEvent("error", { ev: "storage_error", what: "blob delete", storageId, err }, ["[incibase] blob delete failed:", err]);
+}
 
 interface OwnerOptions {
   /** Skip the owner check because the calling code verified access itself (e.g. an HR role). */
@@ -293,7 +299,7 @@ export class StorageService {
       for (const row of due) {
         if (referenced.has(row._id)) continue;
         session.deleteRaw(table, row._id);
-        session.onCommit(() => void this.backend.delete(row._id).catch((err) => console.error("[incibase] blob delete failed:", err)));
+        session.onCommit(() => void this.backend.delete(row._id).catch((err) => blobDeleteFailed(row._id, err)));
         deleted++;
       }
       return deleted;
@@ -390,7 +396,7 @@ export class StorageService {
   private async deleteIn(session: DbSession, id: string, identity: Identity, bypass?: boolean) {
     await this.loadOwned(session, id, identity, bypass, "delete");
     session.deleteRaw(this.storageTable(session, id), id);
-    session.onCommit(() => void this.backend.delete(id).catch((err) => console.error("[incibase] blob delete failed:", err)));
+    session.onCommit(() => void this.backend.delete(id).catch((err) => blobDeleteFailed(id, err)));
   }
 
   /** Unchecked; callers decide who may change visibility (see `setVisibility` in contexts). */

@@ -1,13 +1,12 @@
 import type { Server } from "bun";
-import { z } from "zod";
 import { getFunctionPath, type FunctionType } from "../api.ts";
 import { IncibaseError } from "../errors.ts";
-import { adminTools } from "./admin.ts";
+import { adminTools, invokeAdminTool } from "./admin.ts";
 import { dashboardHtml } from "./dashboard.ts";
 import { describeApp } from "./describe.ts";
-import { ValidationError } from "./database.ts";
 import { toErrorPayload, type Engine, type Identity } from "./engine.ts";
 import { ConfigError } from "./exit-codes.ts";
+import { ridFrom, withRid } from "./log.ts";
 import { handleMcp } from "./mcp.ts";
 import type { SocketData } from "./realtime.ts";
 import { VERSION } from "./version.ts";
@@ -82,7 +81,8 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
     return {
       "access-control-allow-origin": origins === "*" ? "*" : origin,
       "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-      "access-control-allow-headers": "authorization, content-type, x-incibase-as-user, mcp-protocol-version, mcp-session-id",
+      "access-control-allow-headers": "authorization, content-type, x-incibase-as-user, x-request-id, mcp-protocol-version, mcp-session-id",
+      "access-control-expose-headers": "x-request-id",
       "access-control-max-age": "86400",
       ...(origins === "*" ? {} : { vary: "origin" }),
     };
@@ -112,19 +112,34 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
     }
   };
 
-  /** Wraps a handler with CORS, preflight and error handling. */
+  /** Sets the request id header, unless the response already has one or cannot take headers. */
+  const withRequestId = (res: Response, rid: string) => {
+    try {
+      if (!res.headers.has("x-request-id")) res.headers.set("x-request-id", rid);
+    } catch {}
+    return res;
+  };
+
+  /**
+   * Wraps a handler with CORS, preflight and error handling. The request runs
+   * with its id (the client's `x-request-id` or a new one) for the log, and the
+   * response carries it back.
+   */
   const route = (methods: Partial<Record<"GET" | "POST" | "DELETE", Handler>>) => {
     const wrapped: Record<string, Handler> = {
       OPTIONS: (req) => withCors(req, new Response(null, { status: 204 })),
     };
     for (const [method, handler] of Object.entries(methods)) {
-      wrapped[method] = async (req, server) => {
-        try {
-          const res = await handler(req, server);
-          return res ? withCors(req, res) : res;
-        } catch (err) {
-          return withCors(req, errorResponse(err));
-        }
+      wrapped[method] = (req, server) => {
+        const rid = ridFrom(req.headers.get("x-request-id"));
+        return withRid(rid, async () => {
+          try {
+            const res = await handler(req, server);
+            return res ? withRequestId(withCors(req, res), rid) : res;
+          } catch (err) {
+            return withRequestId(withCors(req, errorResponse(err)), rid);
+          }
+        });
       };
     }
     return wrapped;
@@ -160,6 +175,32 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
     POST: (req) => handleMcp(engine, req, () => readText(req)),
     DELETE: (req) => handleMcp(engine, req),
   });
+
+  /** Runs the app's httpAction for `req`, if one matches. */
+  const httpAction = async (req: Request): Promise<Response> => {
+    const url = new URL(req.url);
+    if (req.method === "OPTIONS") return withCors(req, new Response(null, { status: 204 }));
+    const action = engine.http?.match(req.method, url.pathname);
+    if (!action) return withCors(req, Response.json({ error: { code: "NOT_FOUND", message: "Not found" } }, { status: 404 }));
+    const started = performance.now();
+    try {
+      const res = await action.handler(engine.actionCtx(engine.auth.identifyRequest(req)), req);
+      engine.log({ type: "http", path: `${req.method} ${url.pathname}`, durationMs: performance.now() - started, ok: true });
+      return res;
+    } catch (err) {
+      engine.log(
+        {
+          type: "http",
+          path: `${req.method} ${url.pathname}`,
+          durationMs: performance.now() - started,
+          ok: false,
+          error: (err as Error)?.message,
+        },
+        { err },
+      );
+      return withCors(req, errorResponse(err));
+    }
+  };
 
   return Bun.serve<SocketData>({
     port: options.port,
@@ -229,11 +270,11 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
           requireAdmin(req);
           const tool = adminTools(engine)[req.params.tool!];
           if (!tool) throw new IncibaseError({ code: "NOT_FOUND", message: `Unknown admin tool "${req.params.tool}"` });
-          const parsed = tool.input.safeParse(await readJson(req));
-          if (!parsed.success) throw new ValidationError(`Invalid arguments:\n${z.prettifyError(parsed.error)}`, parsed.error.issues);
+          const args = await readJson(req);
           try {
-            return Response.json({ value: (await tool.run(parsed.data)) ?? null });
+            return Response.json({ value: (await invokeAdminTool(req.params.tool!, tool, args, "http")) ?? null });
           } catch (err) {
+            // Admins get the message of an internal error too, as on MCP.
             return errorResponse(err, { admin: true });
           }
         },
@@ -273,27 +314,8 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
       "/mcp": mcp,
     },
 
-    async fetch(req) {
-      const url = new URL(req.url);
-      if (req.method === "OPTIONS") return withCors(req, new Response(null, { status: 204 }));
-      const action = engine.http?.match(req.method, url.pathname);
-      if (!action) return withCors(req, Response.json({ error: { code: "NOT_FOUND", message: "Not found" } }, { status: 404 }));
-      const started = performance.now();
-      try {
-        const res = await action.handler(engine.actionCtx(engine.auth.identifyRequest(req)), req);
-        engine.log({ type: "http", path: `${req.method} ${url.pathname}`, durationMs: performance.now() - started, ok: true });
-        return res;
-      } catch (err) {
-        engine.log({
-          type: "http",
-          path: `${req.method} ${url.pathname}`,
-          durationMs: performance.now() - started,
-          ok: false,
-          error: (err as Error)?.message,
-        });
-        return withCors(req, errorResponse(err));
-      }
-    },
+    // The app's own responses are left as they are: the id is only for the log.
+    fetch: (req) => withRid(ridFrom(req.headers.get("x-request-id")), () => httpAction(req)),
 
     websocket: {
       idleTimeout: 120,

@@ -1,9 +1,7 @@
 // Model Context Protocol over Streamable HTTP (stateless, JSON responses).
 // Public functions marked `mcp: true` become tools for any caller; admin-key
 // callers also get tools to inspect and edit data.
-import { z } from "zod";
-import { adminTools } from "./admin.ts";
-import { ValidationError } from "./database.ts";
+import { adminTools, invokeAdminTool } from "./admin.ts";
 import { mcpToolName } from "./describe.ts";
 import { toErrorPayload, type Engine, type Identity } from "./engine.ts";
 import { argsSchemaOf, toJsonSchema, type JsonSchema } from "./jsonschema.ts";
@@ -47,11 +45,7 @@ function toolsFor(engine: Engine, identity: Identity): Map<string, Tool> {
         description: def.description,
         inputSchema: objectSchema(toJsonSchema(def.input, "input")),
         annotations: { readOnlyHint: def.readOnly, destructiveHint: !def.readOnly },
-        run: async (args) => {
-          const parsed = def.input.safeParse(args);
-          if (!parsed.success) throw new ValidationError(`Invalid arguments:\n${z.prettifyError(parsed.error)}`, parsed.error.issues);
-          return def.run(parsed.data);
-        },
+        run: (args) => invokeAdminTool(name, def, args, "mcp"),
       });
     }
   }
