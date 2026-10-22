@@ -198,7 +198,7 @@ export class Engine {
   /** Wakes `idle` when the last running call ends. */
   private readonly idleWaiters = new Set<() => void>();
   /** Set once `cutCalls` ran: a call that starts afterwards is cut at once. */
-  private cutError: ServerStoppingError | null = null;
+  private cut = false;
 
   constructor(
     readonly app: AppDefinition,
@@ -278,19 +278,25 @@ export class Engine {
   }
 
   /**
-   * Ends every running function call now, as its deadline would: each gets
-   * SERVER_STOPPING, its transaction is rolled back and its lock released.
-   * Calls that start later are cut as they start. For a drain that ran out.
+   * Ends every running function call now, as its deadline would: its
+   * transaction is rolled back and its lock released. A query or mutation
+   * gets SERVER_STOPPING (unprocessed), an action or httpAction
+   * ACTION_INTERRUPTED, since what it already ran stays committed. Calls
+   * that start later are cut as they start, unprocessed. For a drain that
+   * ran out.
    */
   cutCalls() {
-    this.cutError ??= new ServerStoppingError();
-    for (const deadline of [...this.running]) deadline.abort(this.cutError);
+    this.cut = true;
+    for (const deadline of [...this.running]) {
+      deadline.abort(new ServerStoppingError(deadline.kind === "query" || deadline.kind === "mutation"));
+    }
   }
 
   /** Runs one function call under `deadline`, counted as running until it settles, so `idle` and `cutCalls` see it. */
   private async tracked<T>(deadline: Deadline, work: () => Promise<T>): Promise<T> {
     this.running.add(deadline);
-    if (this.cutError) deadline.abort(this.cutError);
+    // Aborted before `work` starts: whatever kind it is, it does nothing.
+    if (this.cut) deadline.abort(new ServerStoppingError(true));
     try {
       return await work();
     } finally {

@@ -3,7 +3,8 @@
 // calls, jobs and transactions still running, up to `--drain-timeout`. What
 // is left at the deadline is cut through the call deadlines (timeouts.ts), so
 // a hung mutation rolls back and releases the write lock before the process
-// goes. A second signal cuts at once.
+// goes. A second signal cuts at once, unless it is the first one delivered
+// twice (see REPEAT_SIGNAL_MS).
 import type { Engine } from "./engine.ts";
 import { ConfigError } from "./exit-codes.ts";
 import type { Listeners } from "./listeners.ts";
@@ -37,23 +38,27 @@ export function parseDrainTimeout(value: string | undefined, dev = false): numbe
 }
 
 /**
- * How long dev waits after Ctrl-C for its server, which got the SIGINT too,
- * to drain and exit on its own before signalling it: the drain and a margin.
+ * A stop signal that comes again sooner than this is the same one delivered
+ * twice, not a second request: Ctrl-C signals the terminal's whole process
+ * group, and wrappers such as `bun run`, `npm run` and `bunx` pass the signal
+ * on to their child as well.
  */
-export function devStopWaitMs(drainTimeout: string | undefined): number {
-  try {
-    return parseDrainTimeout(drainTimeout, true) + 2000;
-  } catch {
-    // The server exits 64 for it.
-    return DEV_DRAIN_TIMEOUT_MS + 2000;
-  }
-}
+export const REPEAT_SIGNAL_MS = 500;
 
-/** Whether `exited` settles within `ms`. */
-export function exitsWithin(exited: Promise<unknown>, ms: number): Promise<boolean> {
-  let timer: Timer | undefined;
-  const late = new Promise<false>((resolve) => (timer = setTimeout(() => resolve(false), ms)));
-  return Promise.race([exited.then(() => true), late]).finally(() => clearTimeout(timer));
+/**
+ * Sorts the stop signals of one process: "stop" for the first, "repeat" for
+ * one within `windowMs` of it (ignored), "force" for any later one.
+ */
+export function stopSignals(windowMs = REPEAT_SIGNAL_MS): () => "stop" | "repeat" | "force" {
+  let first: number | undefined;
+  return () => {
+    const now = performance.now();
+    if (first === undefined) {
+      first = now;
+      return "stop";
+    }
+    return now - first < windowMs ? "repeat" : "force";
+  };
 }
 
 export interface DrainOptions {

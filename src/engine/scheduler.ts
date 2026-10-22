@@ -256,6 +256,16 @@ export class Scheduler {
     session.updateRaw(this.table(), job._id, JSON.stringify({ ...data, ...patch }));
   }
 
+  /** Puts a claimed job back to pending, taking back the attempt its claim counted. */
+  private unclaim(session: DbSession, id: string) {
+    const row = session.conn.query(`SELECT _id, _creationTime, data FROM _scheduled WHERE _id = ?`).get(id) as DocumentRow | null;
+    if (!row) return;
+    const job = rowToDoc(row) as unknown as ScheduledDoc;
+    if (job.state !== "running") return;
+    const attempts = (job.attempts ?? 1) - 1;
+    this.update(session, job, { state: "pending", startedAt: undefined, attempts: attempts > 0 ? attempts : undefined });
+  }
+
   private schedule(session: DbSession, runAt: number | Date, ref: unknown, args: unknown): string {
     const path = getFunctionPath(ref as any);
     const fn = this.engine.functions.get(path);
@@ -378,15 +388,21 @@ export class Scheduler {
   private async execute(job: ScheduledDoc) {
     const started = performance.now();
     let error: string | undefined;
-    let cut = false;
+    let cut: ServerStoppingError | undefined;
     try {
       await this.engine.call(job.name, job.args, SYSTEM_IDENTITY, { allowInternal: true, deadlineAtLock: true });
     } catch (err) {
       error = (err as Error)?.message ?? String(err);
-      cut = err instanceof ServerStoppingError;
+      if (err instanceof ServerStoppingError) cut = err;
     }
     this.engine.log({ type: "scheduled", path: job.name, durationMs: performance.now() - started, ok: !error, error });
-    // Cut short by a stopping server, it did not finish: left "running", the next start marks it interrupted (or runs it again).
+    if (cut?.unprocessed) {
+      // Cut by a stopping server before it did anything (a mutation rolled back, or a job that never started):
+      // pending again, as if never claimed, so the next start runs it. A background write is not cut.
+      await this.persist(`requeueing ${job.name} (${job._id})`, () => this.backgroundTx((session) => this.unclaim(session, job._id)));
+      return;
+    }
+    // An action cut part way may have done some of its work: left "running", the next start marks it interrupted (or runs it again).
     if (cut) return;
     // The job ran: keep its slot until the outcome is stored, or a restart would report it as interrupted.
     await this.persist(`saving status of ${job.name} (${job._id})`, () =>

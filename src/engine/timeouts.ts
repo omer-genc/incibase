@@ -68,12 +68,32 @@ export class FunctionTimeoutError extends IncibaseError<{ code: "FUNCTION_TIMEOU
 
 /**
  * A call cut short because the server stopped: its drain deadline passed, or
- * a second signal came. Its transaction was rolled back, so a client may send
- * it again. Sent to clients as SERVER_STOPPING with status 503.
+ * a second signal came. Sent to clients with status 503, as one of:
+ *
+ * - SERVER_STOPPING, `unprocessed: true`: nothing it did was kept. A query or
+ *   mutation (its transaction was rolled back), or a call cut before it
+ *   started. A client may send it again.
+ * - ACTION_INTERRUPTED, `unprocessed: false`: an action or httpAction that was
+ *   running. What it already did stays done (the mutations it ran through
+ *   ctx.runMutation are committed), so sending it again may do that twice.
+ *
+ * Anything that retries on its own keys on `unprocessed`.
  */
-export class ServerStoppingError extends IncibaseError<{ code: "SERVER_STOPPING"; message: string }> {
-  constructor() {
-    super({ code: "SERVER_STOPPING", message: "The server is stopping: the call was cut short and nothing it wrote was kept; try again" });
+export class ServerStoppingError extends IncibaseError<{
+  code: "SERVER_STOPPING" | "ACTION_INTERRUPTED";
+  message: string;
+  unprocessed: boolean;
+}> {
+  constructor(readonly unprocessed = true) {
+    super(
+      unprocessed
+        ? { code: "SERVER_STOPPING", message: "The server is stopping: the call was cut short and nothing it wrote was kept; try again", unprocessed }
+        : {
+            code: "ACTION_INTERRUPTED",
+            message: "The server is stopping: the action was cut short and may have partly run; what it already did (its mutations) is kept",
+            unprocessed,
+          },
+    );
     this.name = "ServerStoppingError";
   }
 }

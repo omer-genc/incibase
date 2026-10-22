@@ -3,9 +3,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cronJobs, defineSchema, defineTable, internalAction, internalMutation, query, z } from "incibase/server";
-import { DEV_DRAIN_TIMEOUT_MS, DRAIN_TIMEOUT_MS, parseDrainTimeout } from "../src/engine/drain.ts";
-import { Engine, type AppDefinition } from "../src/engine/engine.ts";
+import { action, cronJobs, defineSchema, defineTable, internalAction, internalMutation, mutation, query, z } from "incibase/server";
+import { DEV_DRAIN_TIMEOUT_MS, DRAIN_TIMEOUT_MS, parseDrainTimeout, REPEAT_SIGNAL_MS, stopSignals } from "../src/engine/drain.ts";
+import { Engine, toErrorPayload, type AppDefinition } from "../src/engine/engine.ts";
 import { ConfigError, DefinitionError, ExitCode } from "../src/engine/exit-codes.ts";
 import { INTERRUPT_RETRIES } from "../src/engine/scheduler.ts";
 import { Deadline, FunctionTimeoutError, ServerStoppingError } from "../src/engine/timeouts.ts";
@@ -89,6 +89,31 @@ export const crash = internalAction({
 });
 
 export const tick = internalMutation({ handler: async (ctx) => { await ctx.db.insert("notes", { body: "tick" }); } });
+
+export const writeThenHang = action({
+  handler: async (ctx) => {
+    await ctx.runMutation("app:add" as any, { body: "from action" });
+    console.log("action wrote");
+    await new Promise(() => {});
+  },
+});
+
+export const slowJobAdd = internalMutation({
+  args: { body: z.string() },
+  handler: async (ctx, { body }) => {
+    console.log("job " + body + " started");
+    await Bun.sleep(800);
+    await ctx.db.insert("notes", { body });
+  },
+});
+
+export const queueThree = mutation({
+  handler: async (ctx) => {
+    for (const body of ["j1", "j2", "j3"]) await ctx.scheduler.runAfter(0, "app:slowJobAdd" as any, { body });
+  },
+});
+
+export const queueHangingAction = mutation({ handler: async (ctx) => ctx.scheduler.runAfter(0, "app:writeThenHang" as any) });
 `;
 
 const CRONS = `import { cronJobs } from "incibase/server";
@@ -114,7 +139,12 @@ function childEnv(extra: Record<string, string> = {}) {
 
 /** Starts the CLI with json logs and collects its output. */
 function spawn(args: string[], env: Record<string, string> = {}, prefix: string[] = []) {
-  const proc = Bun.spawn([...prefix, process.execPath, CLI, ...args, "--log-format", "json"], { stdout: "pipe", stderr: "pipe", env: childEnv(env) });
+  return spawnCommand([...prefix, process.execPath, CLI, ...args, "--log-format", "json"], env);
+}
+
+/** Starts `cmd` (which runs the CLI with json logs) and collects its output. */
+function spawnCommand(cmd: string[], env: Record<string, string> = {}, cwd?: string) {
+  const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe", env: childEnv(env), cwd });
   procs.push(proc);
   const out = { stdout: "", stderr: "" };
   const done = Promise.all(
@@ -282,7 +312,8 @@ describe("drain on SIGTERM", () => {
     await run.waitFor((e) => e.msg === "hang started", "the mutation to hang");
     run.proc.kill("SIGTERM");
     await run.waitFor((e) => e.ev === "draining", "the draining line");
-    await Bun.sleep(200);
+    // Past REPEAT_SIGNAL_MS: a second request, not the first one delivered twice.
+    await Bun.sleep(REPEAT_SIGNAL_MS + 100);
     const second = performance.now();
     run.proc.kill("SIGTERM");
     expect((await hung).status).toBe(503);
@@ -333,7 +364,7 @@ describe("drain on SIGTERM", () => {
   }, 30_000);
 
   // perl starts dev in a process group of its own, so the test can signal the group as a terminal's Ctrl-C does.
-  test.skipIf(!Bun.which("perl"))("Ctrl-C on dev reaches the server once, so its drain is not cut short", async () => {
+  test.skipIf(!Bun.which("perl"))("Ctrl-C on dev is one stop for its server, so its drain is not cut short", async () => {
     const p = project();
     const run = spawn(["dev", "--dir", p.source, "--data", p.data, "--port", "0", "--host", "127.0.0.1"], {}, [
       "perl",
@@ -351,6 +382,141 @@ describe("drain on SIGTERM", () => {
     expect(events.find((e) => e.ev === "drained")!.forced).toBe(false);
     expect(notesIn(p.data)).toEqual(["slow"]);
   }, 30_000);
+
+  test("the same signal delivered twice within REPEAT_SIGNAL_MS is one stop, not a forced one", async () => {
+    const p = project();
+    const run = serve(p, "--drain-timeout", "5");
+    const url = await run.ready();
+    const slow = call(url, "mutation", "app:slowAdd", { ms: 800 });
+    await run.waitFor((e) => e.msg === "slowAdd started", "the mutation to start");
+    run.proc.kill("SIGINT");
+    await Bun.sleep(30);
+    run.proc.kill("SIGINT");
+    expect((await slow).status).toBe(200);
+    const { code, events } = await run.exit();
+    expect(code).toBe(0);
+    expect(events.filter((e) => e.ev === "draining")).toHaveLength(1);
+    expect(events.find((e) => e.ev === "drained")!.forced).toBe(false);
+    expect(notesIn(p.data)).toEqual(["slow"]);
+  }, 30_000);
+
+  /**
+   * Runs the CLI as `bun run start` does, the usual way to start it, in a
+   * process group of its own (perl), so the test can signal the group as a
+   * terminal's Ctrl-C does. The wrapper passes the signal on as well, so the
+   * CLI gets it twice.
+   */
+  function viaBunRun(p: ReturnType<typeof project>, args: string[]) {
+    const script = [process.execPath, CLI, ...args, "--log-format", "json"].map((a) => `'${a}'`).join(" ");
+    writeFileSync(join(p.root, "package.json"), JSON.stringify({ name: "drain-app", private: true, scripts: { start: script } }));
+    return spawnCommand(["perl", "-e", "setpgrp(0, 0); exec @ARGV", process.execPath, "run", "start"], {}, p.root);
+  }
+
+  for (const command of ["serve", "dev"] as const) {
+    test.skipIf(!Bun.which("perl"))(`Ctrl-C on ${command} under bun run drains instead of cutting at once`, async () => {
+      const p = project();
+      const run = viaBunRun(p, [command, "--dir", p.source, "--data", p.data, "--port", "0", "--host", "127.0.0.1"]);
+      const url = await run.ready();
+      const slow = call(url, "mutation", "app:slowAdd", { ms: 600 });
+      await run.waitFor((e) => e.msg === "slowAdd started", "the mutation to start");
+      process.kill(-run.proc.pid, "SIGINT");
+      const res = await slow;
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ value: "committed" });
+      const { code, events } = await run.exit();
+      expect(code).toBe(0);
+      expect(events.filter((e) => e.ev === "draining")).toHaveLength(1);
+      expect(events.find((e) => e.ev === "drained")).toMatchObject({ forced: false });
+      expect(notesIn(p.data)).toEqual(["slow"]);
+    }, 30_000);
+  }
+
+  test("dev passes a signal sent to it alone on at once, and ignores file changes while it stops", async () => {
+    const p = project();
+    const run = spawn(["dev", "--dir", p.source, "--data", p.data, "--port", "0", "--host", "127.0.0.1"]);
+    const url = await run.ready();
+    const slow = call(url, "mutation", "app:slowAdd", { ms: 800 });
+    await run.waitFor((e) => e.msg === "slowAdd started", "the mutation to start");
+    const sent = performance.now();
+    // Only the dev process, as `kill -INT <pid>` or a supervisor would: its server did not get it.
+    run.proc.kill("SIGINT");
+    await run.waitFor((e) => e.ev === "draining", "the server to drain");
+    writeFileSync(join(p.source, "app.ts"), `${APP}\n// changed while stopping\n`);
+    expect((await slow).status).toBe(200);
+    const { code, events } = await run.exit();
+    expect(code).toBe(0);
+    // Not drain + 2s of waiting for a signal the server never got.
+    expect(performance.now() - sent).toBeLessThan(2000);
+    expect(events.find((e) => e.ev === "draining")!.signal).toBe("SIGINT");
+    expect(events.find((e) => e.ev === "drained")!.forced).toBe(false);
+    // No restart, so no second server racing the first for the data dir.
+    expect(events.some((e) => e.ev === "restarting")).toBe(false);
+    expect(events.filter((e) => e.ev === "ready")).toHaveLength(1);
+    expect(notesIn(p.data)).toEqual(["slow"]);
+  }, 30_000);
+
+  test("an action cut at the drain deadline is ACTION_INTERRUPTED, not unprocessed: what it ran is kept", async () => {
+    const p = project();
+    const run = serve(p, "--drain-timeout", "500ms");
+    const url = await run.ready();
+    const pending = call(url, "action", "app:writeThenHang");
+    await run.waitFor((e) => e.msg === "action wrote", "the action to write");
+    run.proc.kill("SIGTERM");
+    const res = await pending;
+    expect(res.status).toBe(503);
+    const { error } = await res.json();
+    expect(error.code).toBe("ACTION_INTERRUPTED");
+    expect(error.data.unprocessed).toBe(false);
+    expect(error.message).toContain("may have partly run");
+    expect((await run.exit()).code).toBe(0);
+    expect(notesIn(p.data)).toEqual(["from action"]);
+  }, 30_000);
+
+  test("scheduled mutations cut at the drain deadline go back to pending and run on the next start; a cut action is interrupted", async () => {
+    const p = project();
+    const args = ["--drain-timeout", "1.2"];
+    const first = serve(p, ...args);
+    const url = await first.ready();
+    expect((await call(url, "mutation", "app:queueHangingAction")).status).toBe(200);
+    await first.waitFor((e) => e.msg === "action wrote", "the scheduled action to write");
+    // Each job sleeps 800ms holding the write lock: at the deadline j2 runs and j3 waits for the lock.
+    expect((await call(url, "mutation", "app:queueThree")).status).toBe(200);
+    await first.waitFor((e) => e.msg === "job j1 started", "the first job");
+    first.proc.kill("SIGTERM");
+    const stopped = await first.exit();
+    expect(stopped.code).toBe(0);
+    const drained = stopped.events.find((e) => e.ev === "drained")!;
+    expect(drained.forced).toBe(true);
+    expect([...drained.cut].sort()).toEqual(["app:slowJobAdd", "app:slowJobAdd", "app:writeThenHang"]);
+    const byBody = (jobs: Record<string, any>[]) => Object.fromEntries(jobs.map((j) => [j.args.body ?? j.name, j]));
+    let jobs = byBody(jobsIn(p.data));
+    expect(jobs.j1).toMatchObject({ state: "success", attempts: 1 });
+    // Rolled back (j2) or never started (j3): pending again, the claim's attempt taken back.
+    for (const body of ["j2", "j3"]) {
+      expect(jobs[body].state).toBe("pending");
+      expect(jobs[body].attempts).toBeUndefined();
+      expect(jobs[body].startedAt).toBeUndefined();
+    }
+    // The action may have done part of its work: left running for the next start to judge.
+    expect(jobs["app:writeThenHang"]).toMatchObject({ state: "running", attempts: 1 });
+    expect(notesIn(p.data)).toEqual(["from action", "j1"]);
+
+    const second = serve(p, ...args);
+    const url2 = await second.ready();
+    await until(
+      async () => ((await (await call(url2, "query", "app:notes")).json()).value as string[]).length === 4,
+      "the requeued jobs to run",
+      10_000,
+    );
+    second.proc.kill("SIGTERM");
+    const { code, events } = await second.exit();
+    expect(code).toBe(0);
+    expect(events.filter((e) => e.ev === "job_interrupted").map((e) => e.name)).toEqual(["app:writeThenHang"]);
+    expect(notesIn(p.data)).toEqual(["from action", "j1", "j2", "j3"]);
+    jobs = byBody(jobsIn(p.data));
+    for (const body of ["j1", "j2", "j3"]) expect(jobs[body]).toMatchObject({ state: "success", attempts: 1 });
+    expect(jobs["app:writeThenHang"]).toMatchObject({ state: "interrupted" });
+  }, 60_000);
 
   test("an invalid --drain-timeout exits 64", async () => {
     const p = project();
@@ -372,6 +538,18 @@ describe("--drain-timeout", () => {
     expect(parseDrainTimeout("250ms")).toBe(250);
     expect(parseDrainTimeout("2m")).toBe(120_000);
     for (const bad of ["", "soon", "-1", "10 seconds", "1h", "9999999999"]) expect(() => parseDrainTimeout(bad)).toThrow(ConfigError);
+  });
+});
+
+describe("stopSignals", () => {
+  test("a signal within the window of the first is a repeat; a later one forces", async () => {
+    expect(REPEAT_SIGNAL_MS).toBe(500);
+    const next = stopSignals(100);
+    expect(next()).toBe("stop");
+    expect(next()).toBe("repeat");
+    await Bun.sleep(130);
+    expect(next()).toBe("force");
+    expect(next()).toBe("force");
   });
 });
 
@@ -445,12 +623,69 @@ describe("engine cut", () => {
     engine.cutCalls();
     expect(await hung).toBeInstanceOf(ServerStoppingError);
     expect(await queued).toBeInstanceOf(ServerStoppingError);
+    // Rolled back or never run: unprocessed, so a client may send them again.
+    for (const err of [await hung, await queued]) {
+      expect((err as ServerStoppingError).data).toMatchObject({ code: "SERVER_STOPPING", unprocessed: true });
+      expect(toErrorPayload(err, false).status).toBe(503);
+    }
     await until(() => idle, "idle");
     expect(engine.store.write.inTransaction).toBe(false);
     expect(engine.store.read.query(`SELECT count(*) AS n FROM notes`).get()).toEqual({ n: 0 });
     // Calls after the cut are cut as they start; engine-internal writes still run.
     expect(await engine.call("app:ok", {}, system, { allowInternal: true }).catch((e) => e)).toBeInstanceOf(ServerStoppingError);
     expect(await engine.writeTx(() => "written")).toBe("written");
+  });
+});
+
+describe("engine cut of actions", () => {
+  test("a cut action or httpAction gets ACTION_INTERRUPTED; the mutation it ran stays committed", async () => {
+    let wrote = 0;
+    const app: AppDefinition = {
+      schema: defineSchema({ notes: defineTable({ body: z.string() }) }),
+      modules: {
+        app: {
+          add: internalMutation({ handler: async (ctx) => void (await ctx.db.insert("notes", { body: "from action" })) }),
+          writeThenHang: internalAction({
+            handler: async (ctx) => {
+              await ctx.runMutation("app:add" as never, {} as never);
+              wrote++;
+              await new Promise(() => {});
+            },
+          }),
+          ok: internalAction({ handler: async () => "ok" }),
+        },
+      },
+    };
+    const engine = new Engine(app, { dataDir: dir(), quiet: true, publicUrl: "http://localhost" });
+    engines.push(engine);
+    const system = { userId: null, admin: false, system: true };
+    const cutAction = engine.call("app:writeThenHang", {}, system, { allowInternal: true }).catch((e) => e);
+    const cutHttp = engine
+      .runHttpAction(
+        async (ctx) => {
+          await ctx.runMutation("app:add" as never, {} as never);
+          wrote++;
+          return new Promise<Response>(() => {});
+        },
+        system,
+        new Request("http://localhost/hook"),
+        "POST /hook",
+      )
+      .catch((e) => e);
+    await until(() => wrote === 2, "both to write");
+    engine.cutCalls();
+    for (const err of [await cutAction, await cutHttp]) {
+      expect(err).toBeInstanceOf(ServerStoppingError);
+      expect((err as ServerStoppingError).unprocessed).toBe(false);
+      expect(toErrorPayload(err, false)).toMatchObject({
+        status: 503,
+        error: { code: "ACTION_INTERRUPTED", data: { code: "ACTION_INTERRUPTED", unprocessed: false } },
+      });
+    }
+    expect(engine.store.read.query(`SELECT count(*) AS n FROM notes`).get()).toEqual({ n: 2 });
+    // An action that starts after the cut never runs: that one is unprocessed.
+    const late = await engine.call("app:ok", {}, system, { allowInternal: true }).catch((e) => e);
+    expect((late as ServerStoppingError).data).toMatchObject({ code: "SERVER_STOPPING", unprocessed: true });
   });
 });
 

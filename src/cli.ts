@@ -7,7 +7,7 @@ import { bundleApp, loadAppFromBundle } from "./engine/bundle.ts";
 import { codegen, writeIfChanged } from "./engine/codegen.ts";
 import { setEmbeddedDashboard } from "./engine/dashboard.ts";
 import { describeApp } from "./engine/describe.ts";
-import { devStopWaitMs, drain, exitsWithin, parseDrainTimeout } from "./engine/drain.ts";
+import { drain, parseDrainTimeout, stopSignals } from "./engine/drain.ts";
 import { embeddedRuntime } from "./engine/embedded.ts";
 import { Engine, type AppDefinition } from "./engine/engine.ts";
 import { ConfigError, DefinitionError, describeExit, exitCodeOf, ExitCode } from "./engine/exit-codes.ts";
@@ -388,13 +388,15 @@ ${color.bold(`incibase ${VERSION}`)}${dev ? " (dev)" : ""}  ${engine.functions.s
     }
   }
 
-  let stopping = false;
+  const nextSignal = stopSignals();
   let forceDrain = () => {};
   const forced = new Promise<void>((resolve) => (forceDrain = resolve));
   const shutdown = async (signal: string) => {
+    const next = nextSignal();
+    // The same Ctrl-C twice (from the terminal and from a wrapper such as `bun run`): one stop.
+    if (next === "repeat") return;
     // A second signal: stop waiting for the drain.
-    if (stopping) return forceDrain();
-    stopping = true;
+    if (next === "force") return forceDrain();
     // A failure here must still exit: the crash handlers would otherwise keep the process up.
     let code = 0;
     try {
@@ -445,6 +447,8 @@ async function dev(argv: string[], values: Values) {
   let allowFieldRemoval = values["allow-field-removal"];
   let child: ReturnType<typeof Bun.spawn> | null = null;
   let restarting: Promise<void> | null = null;
+  /** Set once dev stops: the server it was running then, if any. */
+  let stopping: ReturnType<typeof Bun.spawn> | null | undefined;
 
   let restarts = 0;
   const start = () => {
@@ -464,6 +468,7 @@ async function dev(argv: string[], values: Values) {
   };
 
   const restart = async () => {
+    if (stopping !== undefined) return;
     const old = child;
     child = null;
     if (old) {
@@ -476,12 +481,14 @@ async function dev(argv: string[], values: Values) {
       old.kill("SIGTERM");
       await old.exited;
     }
-    start();
+    // Stopped meanwhile: no new server.
+    if (stopping === undefined) start();
   };
 
   let timer: Timer | null = null;
   watch(dir, { recursive: true }, (_event, filename) => {
     const name = String(filename ?? "");
+    if (stopping !== undefined) return;
     if (name.startsWith("_generated") || name.split(/[\\/]/).some((s) => s.startsWith("."))) return;
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
@@ -491,18 +498,23 @@ async function dev(argv: string[], values: Values) {
     }, 120);
   });
 
-  let stopping: ReturnType<typeof Bun.spawn> | null | undefined;
+  const nextSignal = stopSignals();
   const stop = async (signal: NodeJS.Signals) => {
+    const next = nextSignal();
+    // The same Ctrl-C twice (from the terminal and from a wrapper such as `bun run`): one stop.
+    if (next === "repeat") return;
     // A second signal is passed on: it cuts the server's drain short.
-    if (stopping !== undefined) return void stopping?.kill("SIGTERM");
+    if (next === "force") return void stopping?.kill("SIGTERM");
+    if (timer) clearTimeout(timer);
     const current = (stopping = child);
     child = null;
     if (current) {
-      // Ctrl-C reaches the server too (one process group), and another signal from here would cut its drain short.
-      const exited = signal === "SIGINT" && (await exitsWithin(current.exited, devStopWaitMs(values["drain-timeout"])));
-      if (!exited) current.kill("SIGTERM");
+      // Passed on at once. When Ctrl-C reached the server too (one process group), it takes this one as a repeat.
+      current.kill(signal);
       await current.exited;
     }
+    // A restart under way stops its old server and starts none.
+    await restarting;
     process.exit(0);
   };
   process.on("SIGINT", stop);
