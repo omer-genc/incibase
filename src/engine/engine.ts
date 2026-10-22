@@ -6,7 +6,7 @@ import { IncibaseError, isIncibaseError } from "../errors.ts";
 import type { SchemaDefinition } from "../schema.ts";
 import { ID_TABLE_RESOLVER } from "../values.ts";
 import type { ActionCtx, CronJobs, HttpRouter, ServiceIdentity } from "../server.ts";
-import { AuthService } from "./auth.ts";
+import { AuthService, type AuthOptions } from "./auth.ts";
 import { DbSession, ValidationError } from "./database.ts";
 import { DefinitionError } from "./exit-codes.ts";
 import { argsSchemaOf } from "./jsonschema.ts";
@@ -43,6 +43,8 @@ export interface EngineOptions {
   maxDbBytes?: number;
   /** Service keys (`ik_svc_…`) accepted besides sessions and the admin key. */
   serviceKeys?: ServiceKeys | null;
+  /** How many password hashes run at once, and how long the rest wait. */
+  auth?: AuthOptions;
 }
 
 export interface Identity {
@@ -203,7 +205,7 @@ export class Engine {
       // After migrating, so a database at its cap still starts.
       limitDatabaseSize(this.store.write, options.maxDbBytes);
       this.adminKey = options.adminKey ?? process.env.INCIBASE_ADMIN_KEY ?? this.loadOrCreateAdminKey();
-      this.auth = new AuthService(this);
+      this.auth = new AuthService(this, options.auth);
       this.storage = new StorageService(this, options.storage);
       this.scheduler = new Scheduler(this);
       this.realtime = new Realtime(this);

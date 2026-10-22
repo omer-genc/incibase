@@ -1,4 +1,5 @@
 // Calls `/api/admin/:tool` with the admin key kept in localStorage.
+import type { BranchInfo } from "./branch";
 
 export const ID_PATTERN = /^[0-9a-hjkmnp-tv-z]{28}$/;
 const KEY_STORAGE = "incibase:admin-key";
@@ -56,7 +57,7 @@ export async function admin<T = any>(tool: string, args: Record<string, unknown>
   return body?.value as T;
 }
 
-export async function health(): Promise<{ ok: boolean; version: string; startedAt: number }> {
+export async function health(): Promise<{ ok: boolean; version: string; startedAt: number; generation?: string | null }> {
   const res = await fetch("/api/health", { cache: "no-store" });
   if (!res.ok) throw new ApiError(`HTTP ${res.status}`, res.status);
   return res.json();
@@ -112,6 +113,10 @@ export interface AppInfo {
 export interface Overview {
   version: string;
   dev: boolean;
+  /** Missing on servers before 0.3.0. */
+  branch?: BranchInfo;
+  /** The listener the dashboard talks to: "combined" for a single app, "admin" behind a host's tunnel. */
+  surface?: "combined" | "public" | "admin";
   startedAt: number;
   uptimeMs: number;
   publicUrl: string;

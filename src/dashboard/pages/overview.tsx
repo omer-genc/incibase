@@ -5,6 +5,7 @@ import { TimeText } from "@/components/value";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { admin, getAdminKey, type LogEntry, type Overview as OverviewData } from "@/lib/api";
+import { mcpCommand } from "@/lib/branch";
 import { formatSpan, plural } from "@/lib/format";
 import { useAsync, useNow } from "@/lib/hooks";
 
@@ -34,7 +35,7 @@ export function Overview({ navigate }: { navigate: (path: string) => void }) {
   const userTables = Object.entries(data.tables).filter(([, t]) => !t.system);
   const systemTables = Object.entries(data.tables).filter(([, t]) => t.system);
   const totalFunctions = data.functions.query + data.functions.mutation + data.functions.action;
-  const mcpCommand = `claude mcp add --transport http incibase ${data.publicUrl}/mcp --header "Authorization: Bearer ${getAdminKey() ?? "<admin key>"}"`;
+  const mcp = mcpCommand(location.origin, getAdminKey());
 
   return (
     <>
@@ -46,6 +47,7 @@ export function Overview({ navigate }: { navigate: (path: string) => void }) {
           </>
         }
       >
+        {data.branch?.label && <Badge variant={data.branch.kind === "prod" ? "destructive" : "outline"}>{data.branch.label}</Badge>}
         {data.dev && <Badge variant="secondary">dev</Badge>}
       </PageHeader>
 
@@ -124,14 +126,18 @@ export function Overview({ navigate }: { navigate: (path: string) => void }) {
           <div className="space-y-0.5 px-4 py-3">
             <Endpoint label="HTTP API" value={`${data.publicUrl}/api`} />
             <Endpoint label="Realtime" value={`${data.publicUrl.replace(/^http/, "ws")}/api/ws`} />
-            <Endpoint label="MCP" value={`${data.publicUrl}/mcp`} hint={`${plural(data.functions.mcpTools, "app tool")} + admin tools`} />
+            <Endpoint
+              label="MCP"
+              value={`${data.publicUrl}/mcp`}
+              hint={`${plural(data.functions.mcpTools, "app tool")}${data.surface === "admin" ? "; admin tools through this tunnel (below)" : " + admin tools"}`}
+            />
             <div className="pt-3">
               <div className="mb-1.5 flex items-center justify-between">
                 <span className="text-xs font-medium text-muted-foreground">Add to Claude Code</span>
-                <CopyButton value={mcpCommand} label="Copy command (includes admin key)" />
+                <CopyButton value={mcp} label="Copy command (includes admin key)" />
               </div>
               <pre className="overflow-x-auto rounded-md bg-muted/60 p-2.5 font-mono text-[11px] leading-relaxed text-muted-foreground">
-                {mcpCommand.replace(/Bearer [^"]+/, "Bearer ik_admin_••••••")}
+                {mcp.replace(/Bearer [^"]+/, "Bearer ik_admin_••••••")}
               </pre>
             </div>
           </div>

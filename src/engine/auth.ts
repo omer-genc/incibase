@@ -4,6 +4,7 @@ import { IncibaseError } from "../errors.ts";
 import { ValidationError, type DbSession } from "./database.ts";
 import type { Engine, Identity } from "./engine.ts";
 import { ANONYMOUS } from "./engine.ts";
+import { checkPositiveInt, ConcurrencyGate, LimitError, positiveIntFromEnv } from "./limits.ts";
 import { SERVICE_KEY_PREFIX } from "./service-keys.ts";
 import type { Surface } from "./surface.ts";
 
@@ -37,9 +38,39 @@ export interface SessionRef {
   expiresAt: number;
 }
 
+export interface AuthOptions {
+  /**
+   * Password hashes and checks run at once (default 4); `INCIBASE_AUTH_CONCURRENCY`
+   * wins when set. Each takes about 64 MiB (argon2id), so this bounds what a
+   * burst of sign-ins can allocate.
+   */
+  concurrency?: number;
+  /** How long a sign-in, sign-up or password change waits for a slot before AUTH_BUSY (default 10 s). */
+  queueTimeoutMs?: number;
+  /** How many may wait at once (default 256); the next one gets AUTH_BUSY without waiting. */
+  maxQueued?: number;
+}
+
 /** Email/password accounts in `_users`, opaque bearer session tokens stored hashed in `_sessions`. */
 export class AuthService {
-  constructor(private readonly engine: Engine) {}
+  /** Every password hash and check runs in a slot of this gate (see AuthOptions). */
+  readonly hashing: ConcurrencyGate;
+
+  constructor(
+    private readonly engine: Engine,
+    options: AuthOptions = {},
+  ) {
+    const limit = positiveIntFromEnv("INCIBASE_AUTH_CONCURRENCY") ?? checkPositiveInt(options.concurrency, "auth.concurrency") ?? 4;
+    this.hashing = new ConcurrencyGate(limit, checkPositiveInt(options.queueTimeoutMs, "auth.queueTimeoutMs") ?? 10_000, {
+      busy: () =>
+        new LimitError(
+          { code: "AUTH_BUSY", message: `Too many sign-ins in progress (at most ${limit} at a time); try again shortly` },
+          503,
+          1,
+        ),
+      maxQueued: checkPositiveInt(options.maxQueued, "auth.maxQueued") ?? 256,
+    });
+  }
 
   private parse<T>(schema: z.ZodType<T>, input: unknown): T {
     const result = schema.safeParse(input);
@@ -49,7 +80,7 @@ export class AuthService {
 
   async signUp(input: unknown): Promise<AuthResult> {
     const { email, password, name } = this.parse(signUpInput, input);
-    const hash = await Bun.password.hash(password);
+    const hash = await this.hashing.run(() => Bun.password.hash(password));
     const userId = await this.engine.writeTx((session) => {
       const users = session.systemTable("_users");
       if (this.findUserId(email)) throw new IncibaseError({ code: "EMAIL_TAKEN", message: "Email is already registered" });
@@ -67,7 +98,9 @@ export class AuthService {
       ? (this.engine.store.write.query(`SELECT hash FROM _passwords WHERE user_id = ?`).get(userId) as { hash: string } | null)
       : null;
     // Verify against a dummy hash when the user is unknown so timing does not reveal it.
-    const ok = await Bun.password.verify(password, row?.hash ?? (await (dummyHash ??= Bun.password.hash("incibase-dummy-password"))));
+    const ok = await this.hashing.run(async () =>
+      Bun.password.verify(password, row?.hash ?? (await (dummyHash ??= Bun.password.hash("incibase-dummy-password")))),
+    );
     // A disabled account answers like a wrong password, whatever the password: an account is often
     // disabled because it is under attack, and a distinct answer would confirm the right guess.
     if (!userId || !row || !ok || this.isDisabled(userId)) {
@@ -148,10 +181,13 @@ export class AuthService {
     const row = this.engine.store.write.query(`SELECT hash FROM _passwords WHERE user_id = ?`).get(userId) as {
       hash: string;
     } | null;
-    if (!row || !(await Bun.password.verify(currentPassword, row.hash))) {
-      throw new IncibaseError({ code: "INVALID_CREDENTIALS", message: "Current password is wrong" });
-    }
-    const hash = await Bun.password.hash(newPassword);
+    // One slot for the check and the new hash: they run one after the other, so they never need two.
+    const hash = await this.hashing.run(async () => {
+      if (!row || !(await Bun.password.verify(currentPassword, row.hash))) {
+        throw new IncibaseError({ code: "INVALID_CREDENTIALS", message: "Current password is wrong" });
+      }
+      return Bun.password.hash(newPassword);
+    });
     await this.engine.writeTx((session) => {
       session.conn.query(`UPDATE _passwords SET hash = ? WHERE user_id = ?`).run(hash, userId);
       this.revokeIn(session, userId);

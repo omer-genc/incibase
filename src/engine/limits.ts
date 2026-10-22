@@ -1,5 +1,6 @@
 // Resource limits a host sets per process through the environment: upload
-// size, total stored bytes, database size and concurrent uploads.
+// size, total stored bytes, database size, concurrent uploads and password
+// hashing.
 import type { Database } from "bun:sqlite";
 import { IncibaseError } from "../errors.ts";
 import { ConfigError } from "./exit-codes.ts";
@@ -18,6 +19,100 @@ export class LimitError extends IncibaseError<{ code: string; message: string }>
     readonly retryAfter?: number,
   ) {
     super(data);
+  }
+}
+
+/**
+ * At most `limit` operations at a time. The rest wait in order for up to
+ * `maxWaitMs`, then fail with `busy()`; with `maxQueued`, one that finds that
+ * many already waiting fails at once.
+ */
+export class ConcurrencyGate {
+  private running = 0;
+  private readonly waiting: { start: () => void; fail: (err: unknown) => void }[] = [];
+  private readonly busy: () => Error;
+  private readonly aborted: string;
+  private readonly maxQueued: number;
+
+  constructor(
+    readonly limit: number,
+    private readonly maxWaitMs: number,
+    options: { busy: () => Error; aborted?: string; maxQueued?: number },
+  ) {
+    this.busy = options.busy;
+    this.aborted = options.aborted ?? "The request was aborted";
+    this.maxQueued = options.maxQueued ?? Infinity;
+  }
+
+  get active() {
+    return this.running;
+  }
+
+  get queued() {
+    return this.waiting.length;
+  }
+
+  /** Waits for a free slot; the returned function frees it. A request that is aborted while waiting leaves the queue. */
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    if (this.running < this.limit && this.waiting.length === 0) {
+      this.running++;
+      return this.releaser();
+    }
+    if (this.waiting.length >= this.maxQueued) throw this.busy();
+    await new Promise<void>((resolve, reject) => {
+      const entry = {
+        start: () => {
+          done();
+          resolve();
+        },
+        fail: (err: unknown) => {
+          done();
+          reject(err);
+        },
+      };
+      const leave = () => {
+        const i = this.waiting.indexOf(entry);
+        if (i >= 0) this.waiting.splice(i, 1);
+      };
+      const timer = setTimeout(() => {
+        leave();
+        entry.fail(this.busy());
+      }, this.maxWaitMs);
+      const onAbort = () => {
+        leave();
+        entry.fail(signal!.reason ?? new Error(this.aborted));
+      };
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      if (signal?.aborted) return onAbort();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.waiting.push(entry);
+    });
+    return this.releaser();
+  }
+
+  /** Runs `fn` in a slot, freeing it when `fn` settles. */
+  async run<T>(fn: () => Promise<T> | T): Promise<T> {
+    const release = await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private releaser() {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.waiting.shift();
+      // The slot passes straight to the next waiter, so a new arrival cannot take it first.
+      if (next) next.start();
+      else this.running--;
+    };
   }
 }
 
@@ -44,6 +139,7 @@ export const bytesFromEnv = (name: string) => positiveIntFromEnv(name, "number o
 export function checkLimitsEnv() {
   for (const name of ["INCIBASE_MAX_DB_BYTES", "INCIBASE_MAX_STORAGE_BYTES", "INCIBASE_MAX_UPLOAD_BYTES"]) bytesFromEnv(name);
   positiveIntFromEnv("INCIBASE_UPLOAD_CONCURRENCY");
+  positiveIntFromEnv("INCIBASE_AUTH_CONCURRENCY");
   if (process.env.INCIBASE_S3_PREFIX !== undefined) s3PrefixFrom(undefined);
 }
 

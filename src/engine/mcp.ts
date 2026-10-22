@@ -5,6 +5,7 @@ import { adminTools, invokeAdminTool } from "./admin.ts";
 import { mcpToolName } from "./describe.ts";
 import { toErrorPayload, type Engine, type Identity } from "./engine.ts";
 import { argsSchemaOf, toJsonSchema, type JsonSchema } from "./jsonschema.ts";
+import type { Surface } from "./surface.ts";
 import { VERSION } from "./version.ts";
 
 const SUPPORTED_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -24,7 +25,7 @@ interface Tool {
   run: (args: Record<string, unknown>) => Promise<unknown>;
 }
 
-function toolsFor(engine: Engine, identity: Identity): Map<string, Tool> {
+function toolsFor(engine: Engine, identity: Identity, surface: Surface): Map<string, Tool> {
   const tools = new Map<string, Tool>();
   for (const [path, fn] of engine.functions) {
     if (!fn.mcp || fn.visibility !== "public") continue;
@@ -39,7 +40,7 @@ function toolsFor(engine: Engine, identity: Identity): Map<string, Tool> {
     });
   }
   if (identity.admin) {
-    for (const [name, def] of Object.entries(adminTools(engine))) {
+    for (const [name, def] of Object.entries(adminTools(engine, { surface }))) {
       tools.set(name, {
         name,
         description: def.description,
@@ -64,7 +65,7 @@ function rpcError(id: JsonRpcRequest["id"], code: number, message: string) {
   return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
 }
 
-async function handleMessage(engine: Engine, identity: Identity, msg: JsonRpcRequest) {
+async function handleMessage(engine: Engine, identity: Identity, msg: JsonRpcRequest, surface: Surface) {
   const isRequest = msg?.id !== undefined && msg?.id !== null;
   if (msg?.jsonrpc !== "2.0" || typeof msg.method !== "string") {
     return rpcError(msg?.id, -32600, "Invalid request");
@@ -87,10 +88,10 @@ async function handleMessage(engine: Engine, identity: Identity, msg: JsonRpcReq
       return rpcResult(msg.id, {});
     case "tools/list":
       return rpcResult(msg.id, {
-        tools: [...toolsFor(engine, identity).values()].map(({ run, ...tool }) => tool),
+        tools: [...toolsFor(engine, identity, surface).values()].map(({ run, ...tool }) => tool),
       });
     case "tools/call": {
-      const tool = toolsFor(engine, identity).get(msg.params?.name);
+      const tool = toolsFor(engine, identity, surface).get(msg.params?.name);
       if (!tool) return rpcError(msg.id, -32602, `Unknown tool "${msg.params?.name}"`);
       try {
         const value = (await tool.run(msg.params?.arguments ?? {})) ?? null;
@@ -114,8 +115,11 @@ async function handleMessage(engine: Engine, identity: Identity, msg: JsonRpcReq
   }
 }
 
-/** `readBody` reads the POST body; the HTTP server passes one that enforces its size limit. */
-export async function handleMcp(engine: Engine, req: Request, readBody = () => req.text()): Promise<Response> {
+/**
+ * `readBody` reads the POST body; the HTTP server passes one that enforces its
+ * size limit. `surface` is the listener's, which admin_overview reports.
+ */
+export async function handleMcp(engine: Engine, req: Request, readBody = () => req.text(), surface: Surface = "combined"): Promise<Response> {
   if (req.method === "GET") return new Response("SSE stream not supported; POST JSON-RPC messages", { status: 405, headers: { allow: "POST" } });
   if (req.method === "DELETE") return new Response(null, { status: 204 });
 
@@ -134,7 +138,7 @@ export async function handleMcp(engine: Engine, req: Request, readBody = () => r
   }
 
   const messages = Array.isArray(body) ? body : [body];
-  const responses = (await Promise.all(messages.map((m) => handleMessage(engine, identity, m as JsonRpcRequest)))).filter(
+  const responses = (await Promise.all(messages.map((m) => handleMessage(engine, identity, m as JsonRpcRequest, surface)))).filter(
     (r) => r !== null,
   );
   if (responses.length === 0) return new Response(null, { status: 202 });

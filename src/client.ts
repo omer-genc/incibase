@@ -50,19 +50,86 @@ export interface ClientOptions {
    * it immediately.
    */
   keepAliveMs?: number;
+  /**
+   * How long to keep retrying a call the server never received: a 503 with
+   * `x-incibase-unprocessed: 1`, which a host's front proxy answers while the
+   * server restarts. Retried with jittered backoff, mutations too, since none
+   * of them ran. Default 15000 ms; 0 turns it off. Other errors are never retried.
+   */
+  unprocessedRetryMs?: number;
 }
 
-function defaultStorage(): TokenStorage {
+/** The key 0.2.0 kept the token under, for every server alike. */
+const LEGACY_TOKEN_KEY = "incibase:token";
+const DEFAULT_UNPROCESSED_RETRY_MS = 15_000;
+/** Backoff caps: reconnects double from MIN to MAX; a restart (close code 1012) reconnects within RESTART. */
+const RECONNECT_MIN_MS = 250;
+const RECONNECT_MAX_MS = 10_000;
+const RECONNECT_RESTART_MS = 1_000;
+/** Retries of unprocessed calls double from MIN to MAX. */
+const RETRY_MIN_MS = 100;
+const RETRY_MAX_MS = 2_000;
+/** "Service restart": the server is restarting (it closes every socket with it before it stops). */
+const CLOSE_SERVICE_RESTART = 1012;
+
+/**
+ * Full jitter: a delay picked uniformly from [0, cap), so clients that lost
+ * the server at the same moment do not all come back at the same moment.
+ */
+export function fullJitter(capMs: number, random = Math.random): number {
+  return Math.floor(random() * capMs);
+}
+
+/** The base URL a token belongs to: origin and path, without a trailing slash (relative URLs resolve against the page). */
+export function normalizeBaseUrl(url: string): string {
+  try {
+    const base = (globalThis as { location?: { href?: string } }).location?.href;
+    const parsed = new URL(url, base);
+    return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return url.replace(/\/+$/, "");
+  }
+}
+
+/** The localStorage key of the session token for the server at `url`. */
+export function tokenKeyFor(url: string): string {
+  return `${LEGACY_TOKEN_KEY}:${normalizeBaseUrl(url)}`;
+}
+
+/**
+ * localStorage when available, else memory. Each server gets its own key, so
+ * a frontend that talks to dev and prod keeps one session for each. A token
+ * under the legacy key is taken over once, by the first client that finds no
+ * token of its own, and the legacy key is removed (as it is when a token is
+ * stored).
+ */
+function defaultStorage(url: string): TokenStorage {
   const ls = (globalThis as { localStorage?: Storage }).localStorage;
   if (ls) {
+    const key = tokenKeyFor(url);
     return {
-      get: () => ls.getItem("incibase:token"),
-      set: (t) => (t ? ls.setItem("incibase:token", t) : ls.removeItem("incibase:token")),
+      get: () => {
+        const token = ls.getItem(key);
+        if (token !== null) return token;
+        const legacy = ls.getItem(LEGACY_TOKEN_KEY);
+        if (legacy === null) return null;
+        ls.setItem(key, legacy);
+        ls.removeItem(LEGACY_TOKEN_KEY);
+        return legacy;
+      },
+      set: (t) => {
+        if (t) ls.setItem(key, t);
+        else ls.removeItem(key);
+        // Signing in or out here replaces the shared legacy token, as it did before keys were per server.
+        ls.removeItem(LEGACY_TOKEN_KEY);
+      },
     };
   }
   let token: string | null = null;
   return { get: () => token, set: (t) => void (token = t) };
 }
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 function toError(status: number, error: ErrorPayload | undefined): Error {
   if (error?.application) return new IncibaseError(error.data);
@@ -104,11 +171,13 @@ export class IncibaseClient {
   private readonly fetchImpl: typeof fetch;
   private readonly WS: typeof WebSocket;
   private readonly keepAliveMs: number;
+  private readonly unprocessedRetryMs: number;
   private readonly authListeners = new Set<(token: string | null) => void>();
 
   private ws: WebSocket | null = null;
   private wsOpen = false;
-  private reconnectDelay = 250;
+  /** The cap of the next reconnect's jittered delay. */
+  private reconnectDelay = RECONNECT_MIN_MS;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private nextSubId = 1;
   private readonly subscriptions = new Map<string, Subscription>();
@@ -119,22 +188,44 @@ export class IncibaseClient {
 
   constructor(url: string, options: ClientOptions = {}) {
     this.url = url.replace(/\/+$/, "");
-    this.tokenStorage = options.tokenStorage ?? defaultStorage();
+    this.tokenStorage = options.tokenStorage ?? defaultStorage(this.url);
     if (options.token) this.tokenStorage.set(options.token);
     this.fetchImpl = options.fetch ?? fetch.bind(globalThis);
     this.WS = options.WebSocket ?? WebSocket;
     this.keepAliveMs = Math.max(0, options.keepAliveMs ?? DEFAULT_KEEP_ALIVE_MS);
+    this.unprocessedRetryMs = Math.max(0, options.unprocessedRetryMs ?? DEFAULT_UNPROCESSED_RETRY_MS);
   }
 
   // -------------------------------------------------------------------------
   // Calls
+
+  /**
+   * fetch, retried while the answer is a 503 with `x-incibase-unprocessed: 1`
+   * (the request never reached the server) for up to `unprocessedRetryMs`,
+   * with full-jitter backoff. The last such answer is returned once that time
+   * is up. Any other answer, 5xx included, and network errors (the request
+   * may have run) are returned or thrown as they are.
+   */
+  private async fetchRetryingUnprocessed(url: string, init: RequestInit): Promise<Response> {
+    const deadline = Date.now() + this.unprocessedRetryMs;
+    let cap = RETRY_MIN_MS;
+    while (true) {
+      const res = await this.fetchImpl(url, init);
+      if (res.status !== 503 || res.headers.get("x-incibase-unprocessed") !== "1") return res;
+      const left = deadline - Date.now();
+      if (left <= 0) return res;
+      await res.body?.cancel().catch(() => {});
+      await sleep(Math.min(fullJitter(cap), left));
+      cap = Math.min(cap * 2, RETRY_MAX_MS);
+    }
+  }
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const headers = new Headers(init.headers);
     const token = this.tokenStorage.get();
     if (token) headers.set("authorization", `Bearer ${token}`);
     if (init.body && typeof init.body === "string") headers.set("content-type", "application/json");
-    const res = await this.fetchImpl(`${this.url}${path}`, { ...init, headers });
+    const res = await this.fetchRetryingUnprocessed(`${this.url}${path}`, { ...init, headers });
     const body = (await res.json().catch(() => null)) as { error?: ErrorPayload } | null;
     if (!res.ok) throw toError(res.status, body?.error);
     return body as T;
@@ -242,7 +333,7 @@ export class IncibaseClient {
     ws.onopen = () => {
       if (this.ws !== ws) return;
       this.wsOpen = true;
-      this.reconnectDelay = 250;
+      this.reconnectDelay = RECONNECT_MIN_MS;
       const token = this.tokenStorage.get();
       if (token) this.send({ type: "auth", token });
       for (const [id, sub] of this.subscriptions) this.send({ type: "sub", id, path: sub.path, args: sub.args });
@@ -258,13 +349,17 @@ export class IncibaseClient {
       if (this.held) this.held.push(msg);
       else this.deliver(msg);
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (this.ws !== ws) return;
       this.ws = null;
       this.wsOpen = false;
       if (this.closed || this.subscriptions.size === 0) return;
-      this.reconnectTimer = setTimeout(() => this.connect(), this.reconnectDelay);
-      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10_000);
+      // Full jitter, so the clients of a server that went away do not all come back at once.
+      // A restarting server (1012) is back shortly: reconnect soon, and back off from the start if it is not.
+      const restart = event?.code === CLOSE_SERVICE_RESTART;
+      if (restart) this.reconnectDelay = RECONNECT_MIN_MS;
+      this.reconnectTimer = setTimeout(() => this.connect(), fullJitter(restart ? RECONNECT_RESTART_MS : this.reconnectDelay));
+      if (!restart) this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
     };
     ws.onerror = () => ws.close();
   }
@@ -372,7 +467,7 @@ export class IncibaseClient {
   readonly storage = {
     /** Uploads to a URL from `ctx.storage.generateUploadUrl()`. */
     upload: async (uploadUrl: string, file: Blob): Promise<Id<"_storage">> => {
-      const res = await this.fetchImpl(uploadUrl, {
+      const res = await this.fetchRetryingUnprocessed(uploadUrl, {
         method: "POST",
         body: file,
         headers: file.type ? { "content-type": file.type } : {},

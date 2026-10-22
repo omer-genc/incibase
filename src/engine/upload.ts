@@ -2,7 +2,7 @@
 // it is counted and hashed, so an upload never sits in memory whole.
 import { closeSync, openSync, readdirSync, rmSync, writeSync } from "node:fs";
 import { join } from "node:path";
-import { LimitError } from "./limits.ts";
+import { ConcurrencyGate, LimitError } from "./limits.ts";
 import { logEvent } from "./log.ts";
 
 const TEMP_PREFIX = ".tmp-";
@@ -101,74 +101,12 @@ export async function receiveToFile(body: ReadableStream<Uint8Array> | null, pat
  * At most `limit` uploads at a time. The rest wait in order for up to
  * `maxWaitMs`, then get UPLOADS_BUSY (503).
  */
-export class UploadGate {
-  private running = 0;
-  private readonly waiting: { start: () => void; fail: (err: unknown) => void }[] = [];
-
-  constructor(
-    readonly limit: number,
-    private readonly maxWaitMs: number,
-  ) {}
-
-  get active() {
-    return this.running;
-  }
-
-  get queued() {
-    return this.waiting.length;
-  }
-
-  /** Waits for a free slot; the returned function frees it. A request that is aborted while waiting leaves the queue. */
-  async acquire(signal?: AbortSignal): Promise<() => void> {
-    if (this.running < this.limit && this.waiting.length === 0) {
-      this.running++;
-      return this.releaser();
-    }
-    await new Promise<void>((resolve, reject) => {
-      const entry = {
-        start: () => {
-          done();
-          resolve();
-        },
-        fail: (err: unknown) => {
-          done();
-          reject(err);
-        },
-      };
-      const leave = () => {
-        const i = this.waiting.indexOf(entry);
-        if (i >= 0) this.waiting.splice(i, 1);
-      };
-      const timer = setTimeout(() => {
-        leave();
-        entry.fail(
-          new LimitError({ code: "UPLOADS_BUSY", message: `Too many uploads in progress (at most ${this.limit} at a time); try again shortly` }, 503, 5),
-        );
-      }, this.maxWaitMs);
-      const onAbort = () => {
-        leave();
-        entry.fail(signal!.reason ?? new Error("The upload was aborted"));
-      };
-      const done = () => {
-        clearTimeout(timer);
-        signal?.removeEventListener("abort", onAbort);
-      };
-      if (signal?.aborted) return onAbort();
-      signal?.addEventListener("abort", onAbort, { once: true });
-      this.waiting.push(entry);
+export class UploadGate extends ConcurrencyGate {
+  constructor(limit: number, maxWaitMs: number) {
+    super(limit, maxWaitMs, {
+      busy: () =>
+        new LimitError({ code: "UPLOADS_BUSY", message: `Too many uploads in progress (at most ${limit} at a time); try again shortly` }, 503, 5),
+      aborted: "The upload was aborted",
     });
-    return this.releaser();
-  }
-
-  private releaser() {
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      const next = this.waiting.shift();
-      // The slot passes straight to the next upload, so a new arrival cannot take it first.
-      if (next) next.start();
-      else this.running--;
-    };
   }
 }

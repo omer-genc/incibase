@@ -16,6 +16,7 @@ import { loadAppFromDir, schemaOf } from "./engine/loader.ts";
 import { verifyBundle } from "./engine/manifest.ts";
 import { color, isJson, logEvent, parseLogFormat, setLogFormat, stripQuery } from "./engine/log.ts";
 import { MigrationError } from "./engine/migrate.ts";
+import { finishMigrateOnly } from "./engine/preflight.ts";
 import { handleReloads, serviceKeysFromEnv, type ReloadTarget } from "./engine/service-keys.ts";
 import { checkHostedSecrets, corsOriginsFromEnv } from "./engine/surface.ts";
 import { DataDirLockedError, readMeta } from "./engine/store.ts";
@@ -65,6 +66,8 @@ Options:
                     s, m). A call past its deadline is rolled back and gets
                     504 FUNCTION_TIMEOUT (serve, dev; default:
                     $INCIBASE_TIMEOUTS, otherwise none)
+  --migrate-only    serve: start as usual, migrate the database, then exit 0
+                    without listening (a preflight on a copy of the data)
 `;
 
 /** The app a built binary carries. */
@@ -102,6 +105,7 @@ function parse(argv: string[]) {
       "log-format": { type: "string" },
       "allow-field-removal": { type: "boolean", default: false },
       timeouts: { type: "string" },
+      "migrate-only": { type: "boolean", default: false },
       dev: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -166,6 +170,9 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
           ? "Pass either --bundle or --dir, not both"
           : null;
     if (conflict) exitOnStartError(new ConfigError(conflict));
+  }
+  if (values["migrate-only"] && !["serve", "start"].includes(command)) {
+    exitOnStartError(new ConfigError(`--migrate-only is for serve, not ${command}`));
   }
 
   switch (command) {
@@ -325,6 +332,7 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
     for (const f of m.removedFields) console.log(`- field ${f.table}.${f.field} (data deleted from ${f.documents} document(s))`);
     if (m.rewrittenDocuments) console.log(`~ ${m.rewrittenDocuments} document(s) updated to the new schema`);
   }
+  if (values["migrate-only"]) return finishMigrateOnly(engine);
 
   engine.start();
   const dashboard = !values["no-dashboard"];

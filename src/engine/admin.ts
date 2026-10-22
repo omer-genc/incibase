@@ -8,6 +8,7 @@ import { describeApp } from "./describe.ts";
 import { logEvent } from "./log.ts";
 import { visibilityOf } from "./storage.ts";
 import type { Engine } from "./engine.ts";
+import type { Surface } from "./surface.ts";
 import { VERSION } from "./version.ts";
 
 export interface AdminTool {
@@ -59,10 +60,20 @@ const rangeOp = z.object({
   value: z.union([z.string(), z.number(), z.boolean(), z.null()]),
 });
 
-export function adminTools(engine: Engine): Record<string, AdminTool> {
+/**
+ * The branch a host runs this process as, from `INCIBASE_BRANCH_LABEL` (e.g.
+ * `shop/prod`) and `INCIBASE_BRANCH_KIND` (e.g. `prod`); nulls for a single app.
+ */
+export function branchFromEnv(): { label: string | null; kind: string | null } {
+  return { label: process.env.INCIBASE_BRANCH_LABEL || null, kind: process.env.INCIBASE_BRANCH_KIND || null };
+}
+
+/** `surface` is the listener the tools are called through (admin_overview reports it). */
+export function adminTools(engine: Engine, { surface = "combined" }: { surface?: Surface } = {}): Record<string, AdminTool> {
   return {
     admin_overview: {
-      description: "Server status: version, uptime, document counts per table, function counts, live subscriptions and recent errors.",
+      description:
+        "Server status: version, uptime, branch, listener surface, document counts per table, function counts, live subscriptions and recent errors.",
       input: z.object({}),
       readOnly: true,
       run: async () => {
@@ -71,6 +82,8 @@ export function adminTools(engine: Engine): Record<string, AdminTool> {
         return {
           version: VERSION,
           dev: !!engine.options.dev,
+          branch: branchFromEnv(),
+          surface,
           startedAt: engine.startedAt,
           uptimeMs: Date.now() - engine.startedAt,
           publicUrl: engine.options.publicUrl,

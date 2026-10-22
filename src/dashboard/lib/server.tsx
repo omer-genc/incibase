@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
-import { admin, health, type AppInfo } from "./api";
+import { admin, health, type AppInfo, type Overview } from "./api";
+import type { BranchInfo } from "./branch";
 
 interface ServerState {
   online: boolean;
@@ -8,6 +9,8 @@ interface ServerState {
   startedAt?: number;
   app?: AppInfo;
   appError?: Error;
+  /** The branch a host runs this server as (null for a single app, or until known). */
+  branch: BranchInfo | null;
   reloadApp: () => Promise<void>;
 }
 
@@ -22,9 +25,15 @@ export function ServerProvider({ children }: { children: ReactNode }) {
   const [info, setInfo] = useState<{ version?: string; startedAt?: number }>({});
   const [app, setApp] = useState<AppInfo>();
   const [appError, setAppError] = useState<Error>();
+  const [branch, setBranch] = useState<BranchInfo | null>(null);
   const startedAt = useRef<number | undefined>(undefined);
 
   const reloadApp = useCallback(async () => {
+    // The branch can change only with a restart, which reloads the app too.
+    void admin<Overview>("admin_overview").then(
+      (o) => setBranch(o.branch ?? null),
+      () => {},
+    );
     try {
       setApp(await admin<AppInfo>("admin_schema"));
       setAppError(undefined);
@@ -70,7 +79,7 @@ export function ServerProvider({ children }: { children: ReactNode }) {
   }, [reloadApp]);
 
   return (
-    <ServerContext.Provider value={{ online, ...info, app, appError, reloadApp }}>{children}</ServerContext.Provider>
+    <ServerContext.Provider value={{ online, ...info, app, appError, branch, reloadApp }}>{children}</ServerContext.Provider>
   );
 }
 

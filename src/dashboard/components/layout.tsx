@@ -13,6 +13,7 @@ import {
   TerminalSquareIcon,
   WifiOffIcon,
 } from "lucide-react";
+import { ProductionBanner } from "@/components/branch";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -24,6 +25,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from "@/components/ui/sheet";
+import { serverName } from "@/lib/branch";
 import { useServer } from "@/lib/server";
 import { useTheme, type Theme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
@@ -99,12 +101,12 @@ function ThemeMenu() {
 }
 
 function ServerStatus() {
-  const { online, version } = useServer();
+  const { online, version, branch } = useServer();
   return (
     <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
       <span className={cn("size-2 shrink-0 rounded-full", online ? "bg-success" : "bg-destructive animate-pulse")} />
-      <span className="truncate">
-        {location.host}
+      <span className="truncate" title={location.host}>
+        {serverName(branch, location.host)}
         {version && <span className="opacity-70"> · v{version}</span>}
       </span>
     </div>
@@ -127,40 +129,44 @@ function SidebarFooter({ onSignOut }: { onSignOut: () => void }) {
 
 export function AppShell({ page, onSignOut, children }: { page: string; onSignOut: () => void; children: ReactNode }) {
   const [menuOpen, setMenuOpen] = useState(false);
-  const { online } = useServer();
+  const { online, branch } = useServer();
   return (
-    <div className="flex h-full">
-      <aside className="hidden w-56 shrink-0 flex-col gap-5 border-r bg-card/50 px-3 py-4 md:flex">
-        <Logo className="px-2.5" />
-        <NavLinks page={page} />
-        <SidebarFooter onSignOut={onSignOut} />
-      </aside>
+    <div className="flex h-full flex-col">
+      <ProductionBanner branch={branch} />
+      <div className="flex min-h-0 flex-1">
+        <aside className="hidden w-56 shrink-0 flex-col gap-5 border-r bg-card/50 px-3 py-4 md:flex">
+          <Logo className="px-2.5" />
+          <NavLinks page={page} />
+          <SidebarFooter onSignOut={onSignOut} />
+        </aside>
 
-      <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-12 shrink-0 items-center gap-2 border-b px-3 md:hidden">
-          <Button variant="ghost" size="icon" className="size-8" onClick={() => setMenuOpen(true)} aria-label="Menu">
-            <MenuIcon />
-          </Button>
-          <Logo />
-        </header>
-        <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
-          <SheetContent side="left" className="w-64 gap-5 px-3 py-4">
-            <SheetTitle className="sr-only">Navigation</SheetTitle>
-            <SheetDescription className="sr-only">Dashboard pages</SheetDescription>
-            <Logo className="px-2.5" />
-            <NavLinks page={page} onNavigate={() => setMenuOpen(false)} />
-            <SidebarFooter onSignOut={onSignOut} />
-          </SheetContent>
-        </Sheet>
+        <div className="flex min-w-0 flex-1 flex-col">
+          <header className="flex h-12 shrink-0 items-center gap-2 border-b px-3 md:hidden">
+            <Button variant="ghost" size="icon" className="size-8" onClick={() => setMenuOpen(true)} aria-label="Menu">
+              <MenuIcon />
+            </Button>
+            <Logo />
+            {branch?.label && <span className="ml-auto truncate text-xs text-muted-foreground">{branch.label}</span>}
+          </header>
+          <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
+            <SheetContent side="left" className="w-64 gap-5 px-3 py-4">
+              <SheetTitle className="sr-only">Navigation</SheetTitle>
+              <SheetDescription className="sr-only">Dashboard pages</SheetDescription>
+              <Logo className="px-2.5" />
+              <NavLinks page={page} onNavigate={() => setMenuOpen(false)} />
+              <SidebarFooter onSignOut={onSignOut} />
+            </SheetContent>
+          </Sheet>
 
-        {!online && (
-          <div className="flex items-center gap-2 border-b border-warning/30 bg-warning/10 px-4 py-2 text-sm text-warning">
-            <WifiOffIcon className="size-4" /> Can't reach the server. Retrying… (it may be restarting)
-          </div>
-        )}
-        <main className="min-h-0 flex-1 overflow-auto">
-          <div className="mx-auto w-full max-w-7xl px-4 py-5 sm:px-6 sm:py-6">{children}</div>
-        </main>
+          {!online && (
+            <div className="flex items-center gap-2 border-b border-warning/30 bg-warning/10 px-4 py-2 text-sm text-warning">
+              <WifiOffIcon className="size-4" /> Can't reach the server. Retrying… (it may be restarting)
+            </div>
+          )}
+          <main className="min-h-0 flex-1 overflow-auto">
+            <div className="mx-auto w-full max-w-7xl px-4 py-5 sm:px-6 sm:py-6">{children}</div>
+          </main>
+        </div>
       </div>
     </div>
   );
