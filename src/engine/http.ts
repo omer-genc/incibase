@@ -8,6 +8,7 @@ import { dashboardHtml } from "./dashboard.ts";
 import { describeApp } from "./describe.ts";
 import { toErrorPayload, type Engine, type Identity } from "./engine.ts";
 import { ConfigError } from "./exit-codes.ts";
+import { LimitError, limitResponse } from "./limits.ts";
 import { ridFrom, withRid } from "./log.ts";
 import { handleMcp } from "./mcp.ts";
 import type { SocketData } from "./realtime.ts";
@@ -135,6 +136,7 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
     const { status, error } = toErrorPayload(err, dev);
     // Admin callers get the message of an internal error (not the stack) in production too, as on MCP.
     if (status === 500 && admin && !dev) error.message = String(err);
+    if (err instanceof LimitError) return limitResponse(err, error);
     return Response.json({ error }, { status: err instanceof BodyTooLargeError ? 413 : status });
   };
 
@@ -287,10 +289,8 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
           if (!grant) {
             throw new IncibaseError({ code: "FORBIDDEN", message: "Invalid or expired upload URL" });
           }
-          // Counted as it streams, so a chunked body without Content-Length cannot skip the limit.
-          const limit = Math.min(grant.maxBytes ?? Infinity, engine.storage.maxUploadBytes);
-          const blob = await readBody(req, limit, { code: "FILE_TOO_LARGE", message: `File exceeds ${limit} bytes` });
-          const storageId = await engine.storage.store(blob, { ...grant, contentType: req.headers.get("content-type") ?? undefined });
+          // Streamed to disk and counted as it arrives, so a chunked body without Content-Length cannot skip the limit.
+          const storageId = await engine.storage.receive(req, grant);
           return Response.json({ storageId });
         },
       }),

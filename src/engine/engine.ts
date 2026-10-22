@@ -10,6 +10,7 @@ import { AuthService } from "./auth.ts";
 import { DbSession, ValidationError } from "./database.ts";
 import { DefinitionError } from "./exit-codes.ts";
 import { argsSchemaOf } from "./jsonschema.ts";
+import { checkLimitsEnv, databaseFullError, isDatabaseFull, limitDatabaseSize } from "./limits.ts";
 import { color, isJson, logEvent, markLogged, SLOW_CALL_MS, wasLogged } from "./log.ts";
 import { migrate, type MigrationReport } from "./migrate.ts";
 import type { ReadSet } from "./readset.ts";
@@ -37,6 +38,8 @@ export interface EngineOptions {
   allowFieldRemoval?: boolean;
   /** Deadlines per call type (`--timeouts`); none by default. Scheduled jobs and crons use their function's type. */
   timeouts?: Timeouts;
+  /** Largest the database may grow, in bytes (`PRAGMA max_page_count`). `INCIBASE_MAX_DB_BYTES` wins when set. */
+  maxDbBytes?: number;
 }
 
 export interface Identity {
@@ -146,12 +149,15 @@ export class Engine {
     const { crons, http } = this.register(app);
     this.crons = crons;
     this.http = http;
+    checkLimitsEnv();
 
     ensurePrivateDir(options.dataDir);
     this.store = new Store(join(options.dataDir, "data.db"));
     // A constructor that throws returns no engine to stop(): close the store here, or the data dir stays locked.
     try {
       this.migration = migrate(this.store, app.schema, { allowFieldRemoval: options.allowFieldRemoval });
+      // After migrating, so a database at its cap still starts.
+      limitDatabaseSize(this.store.write, options.maxDbBytes);
       this.adminKey = options.adminKey ?? process.env.INCIBASE_ADMIN_KEY ?? this.loadOrCreateAdminKey();
       this.auth = new AuthService(this);
       this.storage = new StorageService(this, options.storage);
@@ -272,10 +278,14 @@ export class Engine {
         });
         // A handler that only awaited ctx.db never let the timer fire; past its deadline it rolls back instead of committing late.
         deadline?.checkTime();
+        // A handler that caught DATABASE_FULL returns normally, but SQLite already rolled the transaction back.
+        if (!db.inTransaction) {
+          throw session.rolledBackFull ? databaseFullError() : new Error("The transaction was rolled back before it could commit");
+        }
         db.run("COMMIT");
       } catch (err) {
         if (db.inTransaction) db.run("ROLLBACK");
-        throw err;
+        throw isDatabaseFull(err) ? databaseFullError() : err;
       }
       session.runCommitHooks();
       if (session.changes.length) this.realtime.invalidate(session.changes);

@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { rmSync } from "node:fs";
+import { renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { S3Client } from "bun";
 import { IncibaseError } from "../errors.ts";
@@ -8,6 +8,8 @@ import { collectHeldIds, contentTypeMatches } from "./files.ts";
 import { ensurePrivateDir, quoteIdent } from "./store.ts";
 import type { Engine, Identity } from "./engine.ts";
 import { logEvent } from "./log.ts";
+import { bytesFromEnv, checkBytes, checkPositiveInt, LimitError, positiveIntFromEnv, s3Key, s3PrefixFrom } from "./limits.ts";
+import { receiveToFile, removeTempFiles, tempPathFor, UploadGate } from "./upload.ts";
 
 const UPLOAD_URL_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_SIGNED_URL_SECONDS = 60 * 60;
@@ -80,14 +82,23 @@ export interface StorageOptions {
   backend?: "local" | "s3";
   /** S3 bucket; falls back to `S3_BUCKET`. */
   bucket?: string;
-  /** Max upload size in bytes. Default 100 MB. */
+  /** Max upload size in bytes. Default 100 MB. `INCIBASE_MAX_UPLOAD_BYTES` wins when set. */
   maxUploadBytes?: number;
+  /** Max bytes of all stored files together; uploads past it fail with STORAGE_QUOTA. Default none. `INCIBASE_MAX_STORAGE_BYTES` wins when set. */
+  maxStorageBytes?: number;
+  /** Uploads processed at once (default 2); `INCIBASE_UPLOAD_CONCURRENCY` wins when set. */
+  uploadConcurrency?: number;
+  /** How long an upload waits for a free slot before UPLOADS_BUSY (default 30 s). */
+  uploadQueueTimeoutMs?: number;
+  /** Prefix of every S3 object key, e.g. `"shop/b7k2m9q4/"`; falls back to `INCIBASE_S3_PREFIX`. */
+  s3Prefix?: string;
   /** Deleting unused files (see StorageService.cleanup); false turns it off. */
   cleanup?: { unattachedHours?: number; detachedHours?: number } | false;
 }
 
 interface Backend {
-  put(key: string, data: Blob, contentType?: string): Promise<void>;
+  /** Stores the file at `path` (a temp file in the storage dir) under `key`; the caller removes `path` afterwards if it is still there. */
+  putFile(key: string, path: string, contentType?: string): Promise<void>;
   get(key: string): Promise<Blob | null>;
   delete(key: string): Promise<void>;
   /** A direct download URL valid for `seconds`, when the backend can serve files itself. */
@@ -98,8 +109,8 @@ class LocalBackend implements Backend {
   constructor(private readonly dir: string) {
     ensurePrivateDir(dir);
   }
-  async put(key: string, data: Blob) {
-    await Bun.write(join(this.dir, key), data);
+  async putFile(key: string, path: string) {
+    renameSync(path, join(this.dir, key));
   }
   async get(key: string) {
     const file = Bun.file(join(this.dir, key));
@@ -110,24 +121,43 @@ class LocalBackend implements Backend {
   }
 }
 
-class S3Backend implements Backend {
-  private readonly client: S3Client;
-  constructor(bucket?: string) {
-    this.client = new S3Client(bucket ? { bucket } : {});
+/** The parts of Bun's S3Client the backend uses (a test passes a fake). */
+export type S3Like = Pick<S3Client, "write" | "file" | "delete" | "presign">;
+
+/** Objects are keyed `<prefix><storage id>`, so branches can share a bucket without sharing keys. */
+export class S3Backend implements Backend {
+  private readonly client: S3Like;
+  constructor(
+    bucket?: string,
+    private readonly prefix = "",
+    client?: S3Like,
+  ) {
+    this.client = client ?? new S3Client(bucket ? { bucket } : {});
   }
-  async put(key: string, data: Blob, contentType?: string) {
-    await this.client.write(key, data, contentType ? { type: contentType } : {});
+  async putFile(key: string, path: string, contentType?: string) {
+    await this.client.write(s3Key(this.prefix, key), Bun.file(path), contentType ? { type: contentType } : {});
   }
   async get(key: string) {
-    const file = this.client.file(key);
+    const file = this.client.file(s3Key(this.prefix, key));
     return (await file.exists()) ? file : null;
   }
   async delete(key: string) {
-    await this.client.delete(key);
+    await this.client.delete(s3Key(this.prefix, key));
   }
   presign(key: string, seconds: number) {
-    return this.client.presign(key, { expiresIn: seconds });
+    return this.client.presign(s3Key(this.prefix, key), { expiresIn: seconds });
   }
+}
+
+const STORAGE_BYTES_KEY = "storage_bytes";
+
+/** Bytes of a `_storage` document's file. */
+const sizeOf = (doc: Record<string, unknown>) => (typeof doc.size === "number" && Number.isFinite(doc.size) ? doc.size : 0);
+
+/** Adds `delta` to the stored total, in the transaction that adds or removes the `_storage` rows. */
+function addStoredBytes(session: DbSession, delta: number) {
+  if (delta === 0) return;
+  session.conn.query(`UPDATE _incibase_meta SET value = CAST(value AS INTEGER) + ? WHERE key = ?`).run(delta, STORAGE_BYTES_KEY);
 }
 
 /** Files are blobs keyed by their `_storage` document id. */
@@ -135,6 +165,10 @@ export class StorageService {
   private readonly backend: Backend;
   private readonly secret: string;
   readonly maxUploadBytes: number;
+  readonly maxStorageBytes: number | undefined;
+  readonly uploads: UploadGate;
+  /** Where uploads are received before they are stored: the local storage dir, so storing one locally is a rename. */
+  private readonly tempDir: string;
   private readonly cleanupPolicy: { unattachedHours: number; detachedHours: number } | null;
 
   constructor(
@@ -142,9 +176,17 @@ export class StorageService {
     options: StorageOptions = {},
   ) {
     const backend = options.backend ?? (process.env.INCIBASE_STORAGE === "s3" ? "s3" : "local");
-    this.backend =
-      backend === "s3" ? new S3Backend(options.bucket) : new LocalBackend(join(engine.options.dataDir, "storage"));
-    this.maxUploadBytes = options.maxUploadBytes ?? 100 * 1024 * 1024;
+    this.maxUploadBytes = bytesFromEnv("INCIBASE_MAX_UPLOAD_BYTES") ?? checkBytes(options.maxUploadBytes, "maxUploadBytes") ?? 100 * 1024 * 1024;
+    this.maxStorageBytes = bytesFromEnv("INCIBASE_MAX_STORAGE_BYTES") ?? checkBytes(options.maxStorageBytes, "maxStorageBytes");
+    this.uploads = new UploadGate(
+      positiveIntFromEnv("INCIBASE_UPLOAD_CONCURRENCY") ?? checkPositiveInt(options.uploadConcurrency, "uploadConcurrency") ?? 2,
+      checkPositiveInt(options.uploadQueueTimeoutMs, "uploadQueueTimeoutMs") ?? 30_000,
+    );
+    this.tempDir = join(engine.options.dataDir, "storage");
+    this.backend = backend === "s3" ? new S3Backend(options.bucket, s3PrefixFrom(options.s3Prefix)) : new LocalBackend(this.tempDir);
+    ensurePrivateDir(this.tempDir);
+    removeTempFiles(this.tempDir);
+    this.syncStoredBytes();
     this.cleanupPolicy =
       options.cleanup === false || process.env.INCIBASE_STORAGE_CLEANUP === "off"
         ? null
@@ -220,28 +262,107 @@ export class StorageService {
   async store(blob: Blob, options: UploadGrant & { contentType?: string } = {}): Promise<string> {
     const limit = Math.min(options.maxBytes ?? Infinity, this.maxUploadBytes);
     if (blob.size > limit) throw new IncibaseError({ code: "FILE_TOO_LARGE", message: `File exceeds ${limit} bytes` });
-    const visibility = parseVisibility(options.visibility);
-    const bytes = new Uint8Array(await blob.arrayBuffer());
-    // Trust the bytes over the declared type when they are recognisable.
-    const type = sniffContentType(bytes) ?? (options.contentType || blob.type || undefined);
-    if (options.contentTypes && !contentTypeMatches(type, options.contentTypes)) {
-      throw new IncibaseError({
-        code: "UNSUPPORTED_FILE_TYPE",
-        message: `Accepted types: ${options.contentTypes.join(", ")}; got ${type ?? "unknown"}`,
-      });
+    return this.storeStream(blob.stream(), blob.size, { ...options, contentType: options.contentType || blob.type || undefined });
+  }
+
+  /**
+   * Stores an upload's body (`POST /api/storage/upload`) under `grant`.
+   * At most `uploads.limit` run at once; the rest wait their turn (see UploadGate).
+   */
+  async receive(req: Request, grant: UploadGrant): Promise<string> {
+    const declared = Number(req.headers.get("content-length") ?? NaN);
+    // Refused before waiting for a slot, when the declared size already says no.
+    this.checkUploadSize(declared, this.uploadLimit(grant.maxBytes), this.quotaLeft());
+    const release = await this.uploads.acquire(req.signal);
+    try {
+      return await this.storeStream(req.body, declared, { ...grant, contentType: req.headers.get("content-type") ?? undefined });
+    } finally {
+      release();
     }
-    const sha256 = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+  }
+
+  /** Bytes of all stored files, as kept in `_incibase_meta`. */
+  storedBytes(): number {
+    return Number(this.engine.store.getMeta(STORAGE_BYTES_KEY) ?? 0);
+  }
+
+  /** Sets the stored total from the `_storage` rows, which a binary without the total (or a manual edit) may have changed. */
+  private syncStoredBytes() {
+    const { bytes } = this.engine.store.write
+      .query(`SELECT COALESCE(SUM(json_extract(data, '$.size')), 0) AS bytes FROM _storage`)
+      .get() as { bytes: number };
+    const kept = this.engine.store.getMeta(STORAGE_BYTES_KEY);
+    if (kept !== String(bytes)) this.engine.store.setMeta(STORAGE_BYTES_KEY, String(bytes));
+  }
+
+  private uploadLimit(grantMaxBytes: number | undefined) {
+    return Math.min(grantMaxBytes ?? Infinity, this.maxUploadBytes);
+  }
+
+  private quotaLeft() {
+    return this.maxStorageBytes === undefined ? Infinity : this.maxStorageBytes - this.storedBytes();
+  }
+
+  private quotaError() {
+    return new LimitError(
+      { code: "STORAGE_QUOTA", message: `Storage is full: this file would take the stored files past ${this.maxStorageBytes} bytes` },
+      507,
+    );
+  }
+
+  /** Throws when `size` bytes (NaN: unknown yet) cannot be stored. */
+  private checkUploadSize(size: number, limit: number, quotaLeft: number) {
+    if (size > limit) throw new LimitError({ code: "FILE_TOO_LARGE", message: `File exceeds ${limit} bytes` }, 413);
+    if (size > quotaLeft) throw this.quotaError();
+  }
+
+  /**
+   * Streams `body` into a temp file (counted, hashed, its type checked from
+   * the first bytes), stores it with the backend, then adds the `_storage`
+   * row and its bytes to the total in one transaction, checking the quota.
+   * The file is never in memory whole, and nothing is left behind on failure.
+   */
+  private async storeStream(
+    body: ReadableStream<Uint8Array> | null,
+    declaredSize: number,
+    options: UploadGrant & { contentType?: string },
+  ): Promise<string> {
+    const limit = this.uploadLimit(options.maxBytes);
+    const quotaLeft = this.quotaLeft();
+    this.checkUploadSize(declaredSize, limit, quotaLeft);
+    const visibility = parseVisibility(options.visibility);
     const table = this.engine.store.tables.get("_storage")!;
     const id = this.engine.store.newId(table);
-    await this.backend.put(id, new Blob([bytes], type ? { type } : {}), type);
+    let type: string | undefined;
+    const file = await receiveToFile(body, tempPathFor(this.tempDir, id), {
+      checkSize: (size) => this.checkUploadSize(size, limit, quotaLeft),
+      checkHead: (head) => {
+        // Trust the bytes over the declared type when they are recognisable.
+        type = sniffContentType(head) ?? (options.contentType || undefined);
+        if (options.contentTypes && !contentTypeMatches(type, options.contentTypes)) {
+          throw new IncibaseError({
+            code: "UNSUPPORTED_FILE_TYPE",
+            message: `Accepted types: ${options.contentTypes.join(", ")}; got ${type ?? "unknown"}`,
+          });
+        }
+      },
+    });
+    try {
+      // Other uploads may have finished meanwhile; checked again in the transaction.
+      if (file.size > this.quotaLeft()) throw this.quotaError();
+      await this.backend.putFile(id, file.path, type);
+    } finally {
+      rmSync(file.path, { force: true });
+    }
     try {
       await this.engine.writeTx((session) => {
+        if (this.maxStorageBytes !== undefined && this.storedBytes() + file.size > this.maxStorageBytes) throw this.quotaError();
         session.insertRaw(
           table,
           JSON.stringify({
             ...(type ? { contentType: type } : {}),
-            size: bytes.byteLength,
-            sha256,
+            size: file.size,
+            sha256: file.sha256,
             visibility,
             ...(options.ownerId ? { ownerId: options.ownerId } : {}),
             ...(options.anonymous && !options.ownerId ? { anonymous: true } : {}),
@@ -250,6 +371,7 @@ export class StorageService {
           }),
           id,
         );
+        addStoredBytes(session, file.size);
       });
     } catch (err) {
       await this.backend.delete(id);
@@ -299,6 +421,7 @@ export class StorageService {
       for (const row of due) {
         if (referenced.has(row._id)) continue;
         session.deleteRaw(table, row._id);
+        addStoredBytes(session, -sizeOf(JSON.parse(row.data)));
         session.onCommit(() => void this.backend.delete(row._id).catch((err) => blobDeleteFailed(row._id, err)));
         deleted++;
       }
@@ -394,8 +517,9 @@ export class StorageService {
   }
 
   private async deleteIn(session: DbSession, id: string, identity: Identity, bypass?: boolean) {
-    await this.loadOwned(session, id, identity, bypass, "delete");
+    const doc = await this.loadOwned(session, id, identity, bypass, "delete");
     session.deleteRaw(this.storageTable(session, id), id);
+    addStoredBytes(session, -sizeOf(doc));
     session.onCommit(() => void this.backend.delete(id).catch((err) => blobDeleteFailed(id, err)));
   }
 
