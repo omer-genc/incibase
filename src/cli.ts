@@ -3,6 +3,7 @@ import { watch, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { buildApp, IS_COMPILED } from "./engine/build.ts";
+import { bundleApp, loadAppFromBundle } from "./engine/bundle.ts";
 import { codegen, writeIfChanged } from "./engine/codegen.ts";
 import { setEmbeddedDashboard } from "./engine/dashboard.ts";
 import { describeApp } from "./engine/describe.ts";
@@ -11,6 +12,7 @@ import { Engine, type AppDefinition } from "./engine/engine.ts";
 import { ConfigError, DefinitionError, describeExit, exitCodeOf, ExitCode } from "./engine/exit-codes.ts";
 import { listenError, startServer } from "./engine/http.ts";
 import { loadAppFromDir, schemaOf } from "./engine/loader.ts";
+import { verifyBundle } from "./engine/manifest.ts";
 import { color, isJson, logEvent, parseLogFormat, setLogFormat, stripQuery } from "./engine/log.ts";
 import { MigrationError } from "./engine/migrate.ts";
 import { DataDirLockedError, readMeta } from "./engine/store.ts";
@@ -25,6 +27,7 @@ Commands:
   serve       Run the server (default for built apps)
   codegen     Generate <dir>/_generated types
   build       Compile the app into a single executable
+  bundle      Bundle the app into one release file (app.ib); runs its top-level code once
   init        Create a starter <dir>
   admin-key   Print the admin key
 
@@ -36,6 +39,9 @@ Options:
   --url <url>       Public base URL (default: http://localhost:<port>)
   --outfile <path>  Output for build (default: ./app)
   --target <t>      Build target, e.g. bun-linux-x64 (default: this machine)
+  --out <path>      Output for bundle (default: app.ib)
+  --check           bundle: verify the bundle at --out without running it
+  --bundle <file>   serve: load the app from a bundle instead of --dir
   --no-dashboard    Do not serve the admin dashboard at /_/
   --log-format <f>  text (default) or json: one JSON object per line on
                     stdout (serve, dev; default: $INCIBASE_LOG_FORMAT)
@@ -71,6 +77,9 @@ function parse(argv: string[]) {
       url: { type: "string" },
       outfile: { type: "string", default: "./app" },
       target: { type: "string" },
+      out: { type: "string", default: "app.ib" },
+      check: { type: "boolean", default: false },
+      bundle: { type: "string" },
       "no-dashboard": { type: "boolean", default: false },
       "log-format": { type: "string" },
       "allow-field-removal": { type: "boolean", default: false },
@@ -127,6 +136,19 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
     }
   }
 
+  if (values.bundle !== undefined) {
+    // --dir has a default, so only the flag itself tells that both were asked for.
+    const dirGiven = argv.some((a) => a === "--dir" || a.startsWith("--dir="));
+    const conflict = !["serve", "start"].includes(command)
+      ? `--bundle is for serve, not ${command}`
+      : options.embedded
+        ? "--bundle cannot be used with a built app"
+        : dirGiven
+          ? "Pass either --bundle or --dir, not both"
+          : null;
+    if (conflict) exitOnStartError(new ConfigError(conflict));
+  }
+
   switch (command) {
     case "serve":
     case "start":
@@ -142,6 +164,8 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
       console.log(`Building ${values.outfile} ...`);
       await buildApp({ dir: values.dir, outfile: values.outfile, target: values.target });
       return console.log(`Built ${values.outfile}. Run it with: ${values.outfile} --port 3210`);
+    case "bundle":
+      return bundle(values);
     case "init":
       return init(values.dir);
     case "admin-key": {
@@ -218,10 +242,14 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
   try {
     port = portOf(values.port ?? process.env.PORT ?? "3210");
     publicUrl = (values.url ?? process.env.INCIBASE_URL ?? `http://localhost:${port}`).replace(/\/+$/, "");
-    if (!embedded && !statSync(values.dir, { throwIfNoEntry: false })?.isDirectory()) {
+    if (!embedded && values.bundle === undefined && !statSync(values.dir, { throwIfNoEntry: false })?.isDirectory()) {
       throw new ConfigError(`No app directory ${values.dir}: pass --dir, or create one with: incibase init`);
     }
-    const app = embedded ? await loadEmbedded(embedded) : await loadAppFromDir(values.dir);
+    const app = embedded
+      ? await loadEmbedded(embedded)
+      : values.bundle !== undefined
+        ? (await loadAppFromBundle(values.bundle)).app
+        : await loadAppFromDir(values.dir);
     engine = new Engine(app, { dataDir: values.data, dev, publicUrl, allowFieldRemoval: values["allow-field-removal"] });
   } catch (err) {
     exitOnStartError(err);
@@ -416,6 +444,32 @@ async function dev(argv: string[], values: Values) {
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   start();
+}
+
+/** `incibase bundle`: writes the release bundle, or with --check verifies one without running it. */
+async function bundle(values: Values) {
+  try {
+    if (values.check) {
+      const { manifest } = verifyBundle(values.out);
+      const { functions, tables } = manifest.app;
+      console.log(
+        `${values.out} is valid: incibase ${manifest.incibaseVersion}, ${functions.length} function(s), ` +
+          `${Object.keys(tables).length} table(s), sha256 ${manifest.sha256}`,
+      );
+      return;
+    }
+    const manifest = await bundleApp({ dir: values.dir, out: values.out });
+    const size = (Bun.file(values.out).size / 1024).toFixed(1);
+    console.log(
+      `Bundled ${values.out} (${size} KB): ${manifest.app.functions.length} function(s), ${Object.keys(manifest.app.tables).length} table(s)` +
+        (manifest.envNames.length ? `\n  Reads env: ${manifest.envNames.join(", ")}` : ""),
+    );
+    // The app's top-level code ran to describe it; a timer it started must not keep this command running.
+    process.exit(0);
+  } catch (err) {
+    console.error(color.red((err as Error)?.message ?? String(err)));
+    process.exit(exitCodeOf(err));
+  }
 }
 
 const STARTER_SCHEMA = `import { defineSchema, defineTable, id, z } from "incibase/server";
