@@ -258,6 +258,10 @@ export class Engine {
       let result: T;
       try {
         result = await fn(session);
+        // A handler that caught DATABASE_FULL returns normally, but SQLite already rolled the transaction back.
+        if (!db.inTransaction) {
+          throw session.rolledBackFull ? databaseFullError() : new Error("The transaction was rolled back before it could commit");
+        }
         db.run("COMMIT");
       } catch (err) {
         if (db.inTransaction) db.run("ROLLBACK");

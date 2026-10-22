@@ -260,6 +260,8 @@ export class DbSession {
   /** Documents this execution loaded; their private files may be handed out (see storage.getUrl). */
   readonly loadedIds = new Set<string>();
   private readonly commitHooks: (() => void)[] = [];
+  /** Set when a write hit DATABASE_FULL: SQLite then rolled the whole transaction back. */
+  rolledBackFull = false;
 
   constructor(
     readonly store: Store,
@@ -314,7 +316,8 @@ export class DbSession {
     if (!this.writable) throw new Error("Database writes are only allowed in mutations");
     // SQLite rolls the whole transaction back on some errors (SQLITE_FULL); a write after that would commit on its own.
     if (!this.conn.inTransaction) {
-      throw new Error("This mutation's transaction was rolled back by an earlier error (e.g. DATABASE_FULL); it cannot write any more");
+      if (this.rolledBackFull) throw databaseFullError();
+      throw new Error("This mutation's transaction was rolled back by an earlier error; it cannot write any more");
     }
   }
 
@@ -354,7 +357,10 @@ export class DbSession {
       if (message.includes("UNIQUE constraint failed")) {
         throw new IncibaseError({ code: "UNIQUE_VIOLATION", message: "A document with the same unique index value exists" });
       }
-      if (isDatabaseFull(err)) throw databaseFullError();
+      if (isDatabaseFull(err)) {
+        this.rolledBackFull = true;
+        throw databaseFullError();
+      }
       throw err;
     }
   }

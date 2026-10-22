@@ -33,6 +33,15 @@ const modules = {
         return ctx.db.insert("blobs", { text: "after the failure" });
       },
     }),
+    /** Writes, then swallows a DATABASE_FULL and returns normally: the call must still fail, nothing committed. */
+    swallow: mutation({
+      args: { big: z.string() },
+      handler: async (ctx: any, { big }: any) => {
+        await ctx.db.insert("blobs", { text: "before the failure" });
+        await ctx.db.insert("blobs", { text: big }).catch(() => {});
+        return "swallowed";
+      },
+    }),
     count: mutation({ handler: async (ctx: any) => (await ctx.db.query("blobs").collect()).length }),
   },
 };
@@ -377,7 +386,19 @@ describe("database size cap", () => {
     expect(((await res.json()) as any).error.code).toBe("DATABASE_FULL");
 
     // The first insert's failure rolled the transaction back; the second must not commit on its own.
-    expect(await engine.call("blobs:addTwice", { big: "x".repeat(800 * 1024) }, admin).catch((e) => e)).toBeInstanceOf(Error);
+    const twice: any = await engine.call("blobs:addTwice", { big: "x".repeat(800 * 1024) }, admin).catch((e) => e);
+    expect([twice.data?.code, twice.status]).toEqual(["DATABASE_FULL", 507]);
+    expect(await engine.call("blobs:count", {}, admin)).toBe(1);
+
+    // A handler that swallows DATABASE_FULL and returns still fails with it, over HTTP too, and its earlier write is gone.
+    for (const path of ["blobs:swallow", "blobs:addTwice"]) {
+      const swallowed = await fetch(`${url}/api/mutation`, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({ path, args: { big: "x".repeat(800 * 1024) } }),
+      });
+      expect([path, swallowed.status, ((await swallowed.json()) as any).error.code]).toEqual([path, 507, "DATABASE_FULL"]);
+    }
     expect(await engine.call("blobs:count", {}, admin)).toBe(1);
     await engine.call("blobs:add", { text: "still fits" }, admin);
     expect(await engine.call("blobs:count", {}, admin)).toBe(2);
