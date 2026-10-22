@@ -123,6 +123,45 @@ export function functionPathOf(modulePath: string, exportName: string) {
   return `${modulePath}:${exportName}`;
 }
 
+/**
+ * The app's functions by path, its crons and its http router, checked as serve
+ * checks them before migrating; throws DefinitionError for what could not run.
+ */
+export function checkDefinitions(app: AppDefinition): {
+  functions: Map<string, RegisteredFunction>;
+  crons: CronJobs | null;
+  http: HttpRouter | null;
+} {
+  if (app.schema !== undefined) {
+    if ((app.schema as { __incibase?: string } | null)?.__incibase !== "schema") {
+      throw new DefinitionError("The schema must be `export default defineSchema({...})`");
+    }
+    for (const [name, table] of Object.entries(app.schema.tables)) {
+      if ((table as { __incibase?: string } | null)?.__incibase !== "table") {
+        throw new DefinitionError(`Table "${name}" in the schema must be defineTable({...})`);
+      }
+    }
+  }
+  const functions = new Map<string, RegisteredFunction>();
+  let crons: CronJobs | null = null;
+  let http: HttpRouter | null = null;
+  for (const [modulePath, ns] of Object.entries(app.modules)) {
+    if (!MODULE_PATH_REGEX.test(modulePath)) {
+      throw new DefinitionError(`Invalid module path "${modulePath}": use letters, digits and "_", separated by "/"`);
+    }
+    for (const [name, value] of Object.entries(ns)) {
+      const marker = (value as { __incibase?: string } | null)?.__incibase;
+      if (marker === "function") {
+        if (!EXPORT_NAME_REGEX.test(name)) throw new DefinitionError(`Invalid function name "${name}" in ${modulePath}`);
+        functions.set(functionPathOf(modulePath, name), value as RegisteredFunction);
+      } else if (marker === "crons" && name === "default") crons = value as CronJobs;
+      else if (marker === "httpRouter" && name === "default") http = value as HttpRouter;
+    }
+  }
+  validateCrons(crons, functions);
+  return { functions, crons, http };
+}
+
 export class Engine {
   readonly store: Store;
   readonly functions = new Map<string, RegisteredFunction>();
@@ -172,32 +211,8 @@ export class Engine {
 
   /** Registers the app's functions and checks its definitions; throws DefinitionError for what could not run. */
   private register(app: AppDefinition): { crons: CronJobs | null; http: HttpRouter | null } {
-    if (app.schema !== undefined) {
-      if ((app.schema as { __incibase?: string } | null)?.__incibase !== "schema") {
-        throw new DefinitionError("The schema must be `export default defineSchema({...})`");
-      }
-      for (const [name, table] of Object.entries(app.schema.tables)) {
-        if ((table as { __incibase?: string } | null)?.__incibase !== "table") {
-          throw new DefinitionError(`Table "${name}" in the schema must be defineTable({...})`);
-        }
-      }
-    }
-    let crons: CronJobs | null = null;
-    let http: HttpRouter | null = null;
-    for (const [modulePath, ns] of Object.entries(app.modules)) {
-      if (!MODULE_PATH_REGEX.test(modulePath)) {
-        throw new DefinitionError(`Invalid module path "${modulePath}": use letters, digits and "_", separated by "/"`);
-      }
-      for (const [name, value] of Object.entries(ns)) {
-        const marker = (value as { __incibase?: string } | null)?.__incibase;
-        if (marker === "function") {
-          if (!EXPORT_NAME_REGEX.test(name)) throw new DefinitionError(`Invalid function name "${name}" in ${modulePath}`);
-          this.functions.set(functionPathOf(modulePath, name), value as RegisteredFunction);
-        } else if (marker === "crons" && name === "default") crons = value as CronJobs;
-        else if (marker === "httpRouter" && name === "default") http = value as HttpRouter;
-      }
-    }
-    validateCrons(crons, this.functions);
+    const { functions, crons, http } = checkDefinitions(app);
+    for (const [path, fn] of functions) this.functions.set(path, fn);
     return { crons, http };
   }
 
