@@ -1,6 +1,7 @@
 // Record-bound files: `file()` fields attach a stored file to one document.
 // Attaching checks the writer may use the file; detaching (replacing the value
-// or deleting the document) marks the file for cleanup.
+// or deleting the document) marks the file for cleanup. Writing a file's id to
+// a plain `id("_storage")` field clears its pending flag, so cleanup keeps it.
 import { z } from "zod";
 import { IncibaseError } from "../errors.ts";
 import { FILE_META_KEY, ID_TABLE_META_KEY, type FileFieldOptions } from "../values.ts";
@@ -123,6 +124,16 @@ function detach(session: DbSession, fileId: string, docId: string) {
   session.updateRaw(session.systemTable("_storage"), fileId, JSON.stringify({ ...rest, pending: true, detachedAt: Date.now() }));
 }
 
+/** A file put into a plain `id("_storage")` field is no longer pending, so cleanup leaves it alone. */
+function markReferenced(session: DbSession, fileId: string) {
+  const row = session.conn.query(`SELECT data FROM _storage WHERE _id = ?`).get(fileId) as { data: string } | null;
+  if (!row) return;
+  const file: StorageData = JSON.parse(row.data);
+  if (!file.pending) return;
+  const { pending, detachedAt, ...rest } = file;
+  session.updateRaw(session.systemTable("_storage"), fileId, JSON.stringify(rest));
+}
+
 /** Attaches newly referenced files and detaches dropped ones for a write to `docId`. */
 export function syncFiles(
   session: DbSession,
@@ -132,9 +143,12 @@ export function syncFiles(
   after: Record<string, unknown> | null,
 ) {
   for (const field of table.storageFields ?? []) {
-    if (!field.file) continue;
     const old = new Set(before ? idsAt(before, field.path) : []);
     const next = new Set(after ? idsAt(after, field.path) : []);
+    if (!field.file) {
+      for (const fileId of next) if (!old.has(fileId)) markReferenced(session, fileId);
+      continue;
+    }
     const name = field.path.filter((p) => p !== "*").join(".");
     for (const fileId of next) if (!old.has(fileId)) attach(session, fileId, { table: table.name, id: docId, field: name }, field.file);
     for (const fileId of old) if (!next.has(fileId)) detach(session, fileId, docId);

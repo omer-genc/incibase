@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { S3Client } from "bun";
 import { IncibaseError } from "../errors.ts";
 import type { DbSession } from "./database.ts";
-import { contentTypeMatches, idsAt } from "./files.ts";
+import { contentTypeMatches } from "./files.ts";
 import { quoteIdent } from "./store.ts";
 import type { Engine, Identity } from "./engine.ts";
 
@@ -263,45 +263,64 @@ export class StorageService {
   /**
    * Deletes files nobody uses: uploads never put into a document within
    * `unattachedHours`, and files dropped from a `file()` field more than
-   * `detachedHours` ago. Files referenced by an `id("_storage")` field are
-   * kept; files stored before this existed are never touched.
+   * `detachedHours` ago. Files whose id a document still holds (in any table,
+   * removed ones included) stay; files put into an `id("_storage")` field or
+   * stored before this existed are not pending, so they are never collected.
+   * Candidates are picked and checked inside the deleting transaction, so a
+   * write that uses a file first keeps it.
    */
   async cleanup(now = Date.now()): Promise<number> {
     if (!this.cleanupPolicy) return 0;
     const { unattachedHours, detachedHours } = this.cleanupPolicy;
-    const rows = this.engine.store.write
-      .query(`SELECT _id, _creationTime, data FROM _storage WHERE json_extract(data, '$.pending') = 1`)
-      .all() as { _id: string; _creationTime: number; data: string }[];
-    const due = rows.filter((row) => {
-      const d = JSON.parse(row.data);
-      if (d.attachedTo) return false;
-      return typeof d.detachedAt === "number"
-        ? d.detachedAt < now - detachedHours * 3600_000
-        : row._creationTime < now - unattachedHours * 3600_000;
-    });
-    if (due.length === 0) return 0;
+    return this.engine.writeTx((session) => {
+      const rows = session.conn
+        .query(`SELECT _id, _creationTime, data FROM _storage WHERE json_extract(data, '$.pending') = 1`)
+        .all() as { _id: string; _creationTime: number; data: string }[];
+      const due = rows.filter((row) => {
+        const d = JSON.parse(row.data);
+        if (d.attachedTo) return false;
+        return typeof d.detachedAt === "number"
+          ? d.detachedAt < now - detachedHours * 3600_000
+          : row._creationTime < now - unattachedHours * 3600_000;
+      });
+      if (due.length === 0) return 0;
 
-    // Keep anything a plain id("_storage") field still points to.
-    const referenced = new Set<string>();
-    for (const table of this.engine.store.tables.values()) {
-      const plain = (table.storageFields ?? []).filter((f) => !f.file);
-      if (plain.length === 0) continue;
-      for (const { data } of this.engine.store.write.query(`SELECT data FROM ${quoteIdent(table.name)}`).all() as { data: string }[]) {
-        const doc = JSON.parse(data);
-        for (const field of plain) for (const ref of idsAt(doc, field.path)) referenced.add(ref);
-      }
-    }
-
-    const doomed = due.filter((row) => !referenced.has(row._id));
-    if (doomed.length === 0) return 0;
-    await this.engine.writeTx((session) => {
+      const referenced = this.referencedIds(session, new Set(due.map((row) => row._id)));
       const table = session.systemTable("_storage");
-      for (const row of doomed) {
+      let deleted = 0;
+      for (const row of due) {
+        if (referenced.has(row._id)) continue;
         session.deleteRaw(table, row._id);
         session.onCommit(() => void this.backend.delete(row._id).catch((err) => console.error("[incibase] blob delete failed:", err)));
+        deleted++;
       }
+      return deleted;
     });
-    return doomed.length;
+  }
+
+  /**
+   * The `candidates` some user document still holds anywhere (whatever its
+   * field's type now), including tables removed from the schema.
+   */
+  private referencedIds(session: DbSession, candidates: Set<string>): Set<string> {
+    const found = new Set<string>();
+    const walk = (value: unknown) => {
+      if (typeof value === "string") {
+        if (candidates.has(value)) found.add(value);
+      } else if (typeof value === "object" && value !== null) {
+        for (const child of Object.values(value)) walk(child);
+      }
+    };
+    // Ids end with their table's two-character code: a document without that
+    // code before a closing quote holds no file id and is not parsed.
+    const marker = `${[...candidates][0]!.slice(-2)}"`;
+    const tables = session.conn.query(`SELECT name FROM _incibase_tables`).all() as { name: string }[];
+    for (const { name } of tables) {
+      const rows = session.conn.query(`SELECT data FROM ${quoteIdent(name)} WHERE instr(data, ?) > 0`).all(marker) as { data: string }[];
+      for (const { data } of rows) walk(JSON.parse(data));
+      if (found.size === candidates.size) break;
+    }
+    return found;
   }
 
   async get(id: string): Promise<Blob | null> {

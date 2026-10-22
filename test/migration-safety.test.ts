@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { defineSchema, defineTable, z, type SchemaDefinition } from "incibase";
+import { defineSchema, defineTable, file, id, z, type SchemaDefinition } from "incibase";
 import { Engine, type EngineOptions } from "../src/engine/engine.ts";
 import { MigrationError } from "../src/engine/migrate.ts";
 import { tempDir } from "./helpers.ts";
@@ -38,6 +38,8 @@ function openError(schema: SchemaDefinition | undefined, dataDir: string, option
 
 const rawDocs = (engine: Engine, table: string) =>
   (engine.store.write.query(`SELECT data FROM "${table}" ORDER BY _creationTime`).all() as { data: string }[]).map((r) => JSON.parse(r.data));
+
+const HOUR = 3600_000;
 
 describe("removing fields", () => {
   const v1 = defineSchema({
@@ -181,6 +183,126 @@ describe("missing schema", () => {
     await first.stop();
     const empty = open(defineSchema({}), data);
     expect(empty.migration.deactivatedTables.sort()).toEqual(["notes", "tasks"]);
+  });
+});
+
+const blob = (text: string) => new Blob([text], { type: "text/plain" });
+const meta = (engine: Engine, fileId: string) =>
+  engine.store.write.query(`SELECT data FROM _storage WHERE _id = ?`).get(fileId) as { data: string } | null;
+
+describe("files behind plain id(\"_storage\") fields", () => {
+  const contracts = defineSchema({
+    contracts: defineTable({ title: z.string(), pdf: id("_storage") }),
+  });
+
+  async function withContract() {
+    const data = dir();
+    const first = open(contracts, data);
+    const pdf = await first.storage.store(blob("signed contract"));
+    await first.writeTx((s) => s.insert("contracts", { title: "Lease", pdf }));
+    expect(JSON.parse(meta(first, pdf)!.data).pending).toBeUndefined();
+    await first.stop();
+    return { data, pdf };
+  }
+
+  test("removing the table from the schema keeps its files past the grace period", async () => {
+    const { data, pdf } = await withContract();
+    const second = open(defineSchema({ other: defineTable({ x: z.string() }) }), data);
+    expect(second.migration.deactivatedTables).toEqual(["contracts"]);
+    expect(await second.storage.cleanup(Date.now() + 25 * HOUR)).toBe(0);
+    expect(meta(second, pdf)).not.toBeNull();
+    expect(await (await second.storage.get(pdf))!.text()).toBe("signed contract");
+    await second.stop();
+
+    const third = open(contracts, data);
+    const [contract] = rawDocs(third, "contracts");
+    expect(contract.pdf).toBe(pdf);
+    expect(await (await third.storage.get(contract.pdf))!.text()).toBe("signed contract");
+  });
+
+  test("changing the field's type keeps its files", async () => {
+    const { data, pdf } = await withContract();
+    const second = open(defineSchema({ contracts: defineTable({ title: z.string(), pdf: z.string() }) }), data);
+    expect(await second.storage.cleanup(Date.now() + 25 * HOUR)).toBe(0);
+    expect(await second.storage.get(pdf)).not.toBeNull();
+  });
+
+  test("cleanup still finds references in removed tables and changed fields for files left pending", async () => {
+    const data = dir();
+    const v1 = defineSchema({
+      contracts: defineTable({ pdf: id("_storage") }),
+      invoices: defineTable({ scan: id("_storage") }),
+    });
+    const first = open(v1, data);
+    const pdf = await first.storage.store(blob("pdf"));
+    const scan = await first.storage.store(blob("scan"));
+    const orphan = await first.storage.store(blob("orphan"));
+    await first.writeTx(async (s) => {
+      await s.insert("contracts", { pdf });
+      await s.insert("invoices", { scan });
+    });
+    // As written before plain references cleared the flag.
+    first.store.write.run(`UPDATE _storage SET data = json_set(data, '$.pending', json('true'))`);
+    await first.stop();
+
+    const second = open(defineSchema({ invoices: defineTable({ scan: z.string() }) }), data);
+    expect(await second.storage.cleanup(Date.now() + 25 * HOUR)).toBe(1);
+    expect(meta(second, orphan)).toBeNull();
+    expect(await second.storage.get(pdf)).not.toBeNull();
+    expect(await second.storage.get(scan)).not.toBeNull();
+  });
+});
+
+describe("cleanup racing writes", () => {
+  const albums = defineSchema({ albums: defineTable({ title: z.string(), cover: file().optional() }) });
+
+  async function setup() {
+    const engine = open(albums, dir());
+    const first = await engine.storage.store(blob("first"));
+    const second = await engine.storage.store(blob("second"));
+    const albumId = await engine.writeTx((s) => s.insert("albums", { title: "Trip", cover: first }));
+    return { engine, first, second, albumId };
+  }
+
+  test("a write queued before cleanup that takes a detached file back keeps it", async () => {
+    const { engine, first, second, albumId } = await setup();
+    await engine.writeTx((s) => s.patch(albumId, { cover: second })); // first is now detached
+    expect(JSON.parse(meta(engine, first)!.data).pending).toBe(true);
+
+    const gate = Promise.withResolvers<void>();
+    const putBack = engine.writeTx(async (s) => {
+      await gate.promise;
+      await s.patch(albumId, { cover: first });
+    });
+    const cleaning = engine.storage.cleanup(Date.now() + 2 * HOUR);
+    gate.resolve();
+    await putBack;
+
+    expect(await cleaning).toBe(1); // second, detached by putBack
+    expect(JSON.parse(meta(engine, first)!.data).attachedTo.id).toBe(albumId);
+    expect(await engine.storage.get(first)).not.toBeNull();
+    expect(meta(engine, second)).toBeNull();
+  });
+
+  test("cleanup never acts on a write that is later rolled back", async () => {
+    const { engine, first, albumId } = await setup();
+    const reached = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    const failing = engine.writeTx(async (s) => {
+      await s.delete(albumId); // detaches first, uncommitted
+      reached.resolve();
+      await gate.promise;
+      throw new Error("rolled back");
+    });
+    await reached.promise;
+    const cleaning = engine.storage.cleanup(Date.now() + 2 * HOUR);
+    gate.resolve();
+    await expect(failing).rejects.toThrow("rolled back");
+
+    expect(await cleaning).toBe(0);
+    expect(rawDocs(engine, "albums")).toHaveLength(1);
+    expect(JSON.parse(meta(engine, first)!.data).attachedTo.id).toBe(albumId);
+    expect(await engine.storage.get(first)).not.toBeNull();
   });
 });
 
