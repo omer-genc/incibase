@@ -259,14 +259,27 @@ export class DbSession {
   /** Documents this execution loaded; their private files may be handed out (see storage.getUrl). */
   readonly loadedIds = new Set<string>();
   private readonly commitHooks: (() => void)[] = [];
+  /** Set by `close`: every later database access throws it. */
+  private closedBy: Error | null = null;
 
   constructor(
     readonly store: Store,
-    readonly conn: Database,
+    private readonly connection: Database,
     readonly writable: boolean,
     /** Who writes; undefined for trusted engine code. */
     readonly identity?: Identity,
   ) {}
+
+  /** The connection; throws once the session is closed, so code left running cannot read or write through it. */
+  get conn(): Database {
+    if (this.closedBy) throw this.closedBy;
+    return this.connection;
+  }
+
+  /** Ends the session for good (e.g. its call timed out): every later access through it throws `reason`. */
+  close(reason: Error) {
+    this.closedBy ??= reason;
+  }
 
   track(read: ReadSet) {
     this.reads.push(read);
@@ -310,6 +323,7 @@ export class DbSession {
   }
 
   private assertWritable() {
+    if (this.closedBy) throw this.closedBy;
     if (!this.writable) throw new Error("Database writes are only allowed in mutations");
   }
 

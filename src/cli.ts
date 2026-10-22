@@ -14,6 +14,7 @@ import { loadAppFromDir, schemaOf } from "./engine/loader.ts";
 import { color, isJson, logEvent, parseLogFormat, setLogFormat, stripQuery } from "./engine/log.ts";
 import { MigrationError } from "./engine/migrate.ts";
 import { DataDirLockedError, readMeta } from "./engine/store.ts";
+import { parseTimeouts, type Timeouts } from "./engine/timeouts.ts";
 import { VERSION } from "./engine/version.ts";
 
 const HELP = `incibase ${VERSION} — Zod-typed backend in one binary
@@ -43,6 +44,11 @@ Options:
                     Let a migration delete the stored data of fields removed
                     from the schema (serve, dev); otherwise it is refused.
                     dev drops it once a server has started
+  --timeouts <spec> Deadlines per call type, e.g.
+                    query=10s,mutation=10s,action=120s,http=120s (units ms,
+                    s, m). A call past its deadline is rolled back and gets
+                    504 FUNCTION_TIMEOUT (serve, dev; default:
+                    $INCIBASE_TIMEOUTS, otherwise none)
 `;
 
 /** The app a built binary carries. */
@@ -74,6 +80,7 @@ function parse(argv: string[]) {
       "no-dashboard": { type: "boolean", default: false },
       "log-format": { type: "string" },
       "allow-field-removal": { type: "boolean", default: false },
+      timeouts: { type: "string" },
       dev: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -215,14 +222,16 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
   let port: number;
   let publicUrl: string;
   let engine: Engine;
+  let timeouts: Timeouts;
   try {
     port = portOf(values.port ?? process.env.PORT ?? "3210");
+    timeouts = parseTimeouts(values.timeouts);
     publicUrl = (values.url ?? process.env.INCIBASE_URL ?? `http://localhost:${port}`).replace(/\/+$/, "");
     if (!embedded && !statSync(values.dir, { throwIfNoEntry: false })?.isDirectory()) {
       throw new ConfigError(`No app directory ${values.dir}: pass --dir, or create one with: incibase init`);
     }
     const app = embedded ? await loadEmbedded(embedded) : await loadAppFromDir(values.dir);
-    engine = new Engine(app, { dataDir: values.data, dev, publicUrl, allowFieldRemoval: values["allow-field-removal"] });
+    engine = new Engine(app, { dataDir: values.data, dev, publicUrl, allowFieldRemoval: values["allow-field-removal"], timeouts });
   } catch (err) {
     exitOnStartError(err);
   }
@@ -281,6 +290,7 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
       tables: tableCount,
       dashboard,
       data: resolve(values.data),
+      ...(Object.keys(timeouts).length ? { timeouts } : {}),
       ...(process.env.INCIBASE_RESTART ? { restart: true } : {}),
     });
   } else if (process.env.INCIBASE_RESTART) {

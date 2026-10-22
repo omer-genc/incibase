@@ -222,7 +222,7 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
     if (!action) return withCors(req, Response.json({ error: { code: "NOT_FOUND", message: "Not found" } }, { status: 404 }));
     const started = performance.now();
     try {
-      const res = await action.handler(engine.actionCtx(engine.auth.identifyRequest(req)), req);
+      const res = await engine.runHttpAction(action.handler, engine.auth.identifyRequest(req), req, `${req.method} ${url.pathname}`);
       engine.log({ type: "http", path: `${req.method} ${url.pathname}`, durationMs: performance.now() - started, ok: true });
       return res;
     } catch (err) {
