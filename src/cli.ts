@@ -255,7 +255,8 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
     exitOnStartError(err);
   }
 
-  if (dev && !embedded) {
+  // A bundle has no source dir to describe.
+  if (dev && !embedded && values.bundle === undefined) {
     writeIfChanged(join(values.dir, "_generated", "schema.json"), JSON.stringify(describeApp(engine), null, 2) + "\n");
   }
   const m = engine.migration;

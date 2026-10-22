@@ -1,26 +1,24 @@
 // Release bundles (`app.ib`): the app's modules and its npm dependencies in
 // one ESM file, with incibase and zod left as imports that resolve to the
 // framework copy of the process that loads it (see installModuleAliases).
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import type { BunPlugin } from "bun";
-import type { RegisteredFunction } from "../api.ts";
-import type { CronJobs, HttpRouter } from "../server.ts";
 import { codegen } from "./codegen.ts";
-import type { AppDefinition } from "./engine.ts";
+import { checkDefinitions, type AppDefinition } from "./engine.ts";
 import { ConfigError, DefinitionError } from "./exit-codes.ts";
 import { discoverModules, installModuleAliases, schemaOf } from "./loader.ts";
 import { logEvent } from "./log.ts";
 import {
   envNamesOf,
   manifestLine,
+  MAX_MANIFEST_BYTES,
   sha256Hex,
   verifyBundle,
   type AppSummary,
   type BundleManifest,
 } from "./manifest.ts";
-import { validateCrons } from "./scheduler.ts";
 import { VERSION } from "./version.ts";
 
 /** The imports installModuleAliases serves; everything else is inlined. */
@@ -28,9 +26,12 @@ const FRAMEWORK_MODULES = new Set(["incibase", "incibase/server", "incibase/clie
 
 /**
  * Leaves the framework imports to the loading process, refuses framework
- * subpaths it would not serve and native addons, which one file cannot carry.
+ * subpaths it would not serve and native addons, which one file cannot carry:
+ * `.node` files the build would load, and packages that ship one for code
+ * that loads it from a computed path (node-gyp-build, bindings).
  */
-function bundlePlugin(nativeImports: string[]): BunPlugin {
+function bundlePlugin(nativeImports: string[], nativePackages: string[]): BunPlugin {
+  const packages = new Set<string>();
   return {
     name: "incibase-bundle",
     setup(build) {
@@ -44,8 +45,61 @@ function bundlePlugin(nativeImports: string[]): BunPlugin {
         nativeImports.push(`${args.path} (imported by ${args.importer})`);
         return { path: args.path, external: true };
       });
+      // A package whose main is a .node file resolves to it under a bare name.
+      build.onLoad({ filter: /\.node$/ }, (args) => {
+        nativeImports.push(displayPath(args.path));
+        return { contents: "export default undefined;", loader: "js" };
+      });
+      // Returning nothing leaves the file to the default loader.
+      build.onLoad({ filter: /[\\/]node_modules[\\/]/ }, (args) => {
+        const root = packageRoot(args.path);
+        if (!root || packages.has(root)) return undefined;
+        packages.add(root);
+        const addon = nativeAddonOf(root);
+        if (addon) nativePackages.push(`${displayPath(root)} ships ${addon}`);
+        return undefined;
+      });
     },
   };
+}
+
+/** `path` relative to the working directory when it is under it, else as it is. */
+function displayPath(path: string): string {
+  const rel = relative(process.cwd(), path);
+  return rel && !rel.startsWith("..") ? rel : path;
+}
+
+/** The package directory of a file under node_modules (`.../node_modules/@scope/pkg`), or null. */
+function packageRoot(file: string): string | null {
+  const parts = file.split(/[\\/]/);
+  const at = parts.lastIndexOf("node_modules");
+  if (at === -1 || at + 1 >= parts.length - 1) return null;
+  return parts.slice(0, at + (parts[at + 1]!.startsWith("@") ? 3 : 2)).join("/");
+}
+
+/** What marks `root` as a package with a native addon: a .node file, binding.gyp or prebuilds/; null otherwise. */
+function nativeAddonOf(root: string): string | null {
+  for (const marker of ["binding.gyp", "prebuilds"]) if (existsSync(join(root, marker))) return marker;
+  // Breadth first and bounded, skipping nested packages: addons sit near the package root.
+  let level = [""];
+  for (let depth = 0; depth < 5 && level.length; depth++) {
+    const next: string[] = [];
+    for (const rel of level) {
+      let entries: Dirent[];
+      try {
+        entries = readdirSync(join(root, rel), { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const e of entries) {
+        const path = rel ? `${rel}/${e.name}` : e.name;
+        if (e.isFile() && e.name.endsWith(".node")) return path;
+        if (e.isDirectory() && e.name !== "node_modules" && !e.name.startsWith(".")) next.push(path);
+      }
+    }
+    level = next.slice(0, 1000);
+  }
+  return null;
 }
 
 /** The entry module: `schema` (the schema file's namespace) and `modules` (module path → namespace). */
@@ -84,10 +138,12 @@ export async function bundleApp(options: BundleOptions): Promise<BundleManifest>
   }
   codegen(dir);
   const work = mkdtempSync(join(tmpdir(), "incibase-bundle-"));
+  // At a fixed path (codegen's directory, which discovery skips): the build names it in a comment.
+  const entry = join(dir, "_generated", "bundle-entry.ts");
   try {
-    const entry = join(work, "entry.ts");
     writeFileSync(entry, entrySource(dir));
     const nativeImports: string[] = [];
+    const nativePackages: string[] = [];
     let result: Awaited<ReturnType<typeof Bun.build>>;
     try {
       result = await Bun.build({
@@ -95,14 +151,14 @@ export async function bundleApp(options: BundleOptions): Promise<BundleManifest>
         target: "bun",
         format: "esm",
         minify: options.minify ?? false,
-        plugins: [bundlePlugin(nativeImports)],
+        plugins: [bundlePlugin(nativeImports, nativePackages)],
       });
     } catch (err) {
       // A plugin's DefinitionError comes back wrapped in the build's logs.
       throw bundleError(err);
     }
-    if (nativeImports.length) {
-      throw new DefinitionError(`Native addons cannot be bundled: ${nativeImports.join(", ")}`);
+    if (nativeImports.length || nativePackages.length) {
+      throw new DefinitionError(`Native addons cannot be bundled: ${[...nativeImports, ...nativePackages].join(", ")}`);
     }
     if (!result.success) throw bundleError(new AggregateError(result.logs));
     const outputs = result.outputs.map((o) => relative(work, o.path) || o.path);
@@ -113,6 +169,7 @@ export async function bundleApp(options: BundleOptions): Promise<BundleManifest>
       );
     }
     const body = await result.outputs[0]!.text();
+    warnBuildPaths(body);
     const app = await describeBundle(work, body);
     const manifest: BundleManifest = {
       format: 1,
@@ -122,13 +179,32 @@ export async function bundleApp(options: BundleOptions): Promise<BundleManifest>
       app,
       envNames: envNamesOf(body),
     };
+    const line = manifestLine(manifest);
+    if (Buffer.byteLength(line) > MAX_MANIFEST_BYTES) {
+      throw new DefinitionError(`The bundle's manifest would be longer than ${MAX_MANIFEST_BYTES} bytes, which serve refuses`);
+    }
     const out = resolve(options.out);
     mkdirSync(dirname(out), { recursive: true });
-    writeFileSync(out, `${manifestLine(manifest)}\n${body}`);
+    writeFileSync(out, `${line}\n${body}`);
     return manifest;
   } finally {
+    rmSync(entry, { force: true });
     rmSync(work, { recursive: true, force: true });
   }
+}
+
+/**
+ * Warns about `__dirname`/`__filename`, which the build fixes to this
+ * machine's paths: they do not exist where the bundle is served.
+ */
+function warnBuildPaths(body: string) {
+  const paths = new Set<string>();
+  for (const m of body.matchAll(/\b(__dirname|__filename) = ("(?:[^"\\\n]|\\.)*")/g)) {
+    paths.add(`${m[1]} = ${displayPath(JSON.parse(m[2]!) as string)}`);
+  }
+  if (!paths.size) return;
+  const msg = `the bundle fixes ${[...paths].join(", ")} to this machine's paths; code that reads files through them will not find them where the bundle is served`;
+  logEvent("warn", { ev: "bundle_build_paths", paths: [...paths], msg }, [`[incibase] ${msg}`]);
 }
 
 /** A DefinitionError thrown by the plugin as itself; any other build failure as a DefinitionError with the logs. */
@@ -162,18 +238,7 @@ function appOf(ns: Record<string, unknown>, file: string): AppDefinition {
 
 /** What `describeApp` reports, from the definitions alone; runs the checks serve runs before migrating. */
 export function summarizeApp(app: AppDefinition): AppSummary {
-  const functions = new Map<string, RegisteredFunction>();
-  let crons: CronJobs | null = null;
-  let http: HttpRouter | null = null;
-  for (const [modulePath, ns] of Object.entries(app.modules)) {
-    for (const [name, value] of Object.entries(ns)) {
-      const marker = (value as { __incibase?: string } | null)?.__incibase;
-      if (marker === "function") functions.set(`${modulePath}:${name}`, value as RegisteredFunction);
-      else if (marker === "crons" && name === "default") crons = value as CronJobs;
-      else if (marker === "httpRouter" && name === "default") http = value as HttpRouter;
-    }
-  }
-  validateCrons(crons, functions);
+  const { functions, crons, http } = checkDefinitions(app);
   const tables: AppSummary["tables"] = {};
   for (const [name, table] of Object.entries(app.schema?.tables ?? {})) {
     tables[name] = { indexes: table.indexes.map((i) => ({ name: i.name, fields: [...i.fields], unique: i.unique })) };

@@ -101,6 +101,8 @@ export function readManifest(file: string): BundleManifest {
       if (n === 0) break;
       const newline = chunk.subarray(0, n).indexOf(0x0a);
       if (newline !== -1) {
+        // The same limit verifyBundle applies, so what this accepts serve accepts too.
+        if (length + newline > MAX_MANIFEST_BYTES) throw tooLong(file);
         chunks.push(Buffer.from(chunk.subarray(0, newline)));
         return parseManifestLine(decode(Buffer.concat(chunks), file), file);
       }
@@ -143,10 +145,14 @@ export function verifyBundle(file: string): VerifiedBundle {
 
 /** Why a file whose first `MAX_MANIFEST_BYTES` hold no newline is refused. */
 function noNewline(start: Buffer, file: string): ConfigError {
-  if (start.length > MAX_MANIFEST_BYTES) return new ConfigError(`${file}: the manifest line is longer than ${MAX_MANIFEST_BYTES} bytes`);
+  if (start.length > MAX_MANIFEST_BYTES) return tooLong(file);
   // Not a manifest at all is the more useful message.
   parseManifestLine(decode(start, file), file);
   return new ConfigError(`${file} is not an incibase bundle: no module after the manifest line`);
+}
+
+function tooLong(file: string): ConfigError {
+  return new ConfigError(`${file}: the manifest line is longer than ${MAX_MANIFEST_BYTES} bytes`);
 }
 
 export function sha256Hex(bytes: Uint8Array | string): string {

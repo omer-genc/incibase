@@ -67,9 +67,13 @@ async function run(args: string[], { bin, env }: { bin?: string; env?: Record<st
 }
 
 /** Starts `serve --bundle` with json logs and returns the address it listens on. */
-async function serveBundle(bundle: string, data: string, { bin, env }: { bin?: string; env?: Record<string, string> } = {}) {
-  const args = ["serve", "--bundle", bundle, "--data", data, "--port", "0", "--host", "127.0.0.1", "--log-format", "json"];
-  const proc = Bun.spawn([...(bin ? [bin] : [process.execPath, CLI]), ...args], { stdout: "pipe", stderr: "pipe", env: childEnv(env) });
+async function serveBundle(
+  bundle: string,
+  data: string,
+  { bin, env, extra = [], cwd }: { bin?: string; env?: Record<string, string>; extra?: string[]; cwd?: string } = {},
+) {
+  const args = ["serve", "--bundle", bundle, "--data", data, "--port", "0", "--host", "127.0.0.1", "--log-format", "json", ...extra];
+  const proc = Bun.spawn([...(bin ? [bin] : [process.execPath, CLI]), ...args], { stdout: "pipe", stderr: "pipe", env: childEnv(env), cwd });
   procs.push(proc);
   const out = { stdout: "", stderr: "" };
   for (const name of ["stdout", "stderr"] as const) {
@@ -258,6 +262,44 @@ describe("incibase bundle", () => {
     expect(existsSync(dep.out)).toBe(false);
   }, 30_000);
 
+  test("a native addon behind a bare import or a computed require path is refused", async () => {
+    // A package whose main is the addon itself.
+    const main = project({
+      "node_modules/napidep/package.json": JSON.stringify({ name: "napidep", main: "addon.node" }),
+      "node_modules/napidep/addon.node": "binary",
+      "app/a.ts": `import addon from "napidep";\nexport const x = addon;\n`,
+    });
+    const err = await bundleApp({ dir: main.source, out: main.out }).catch((e) => e);
+    expect(err).toBeInstanceOf(DefinitionError);
+    expect(err.message).toMatch(/^Native addons cannot be bundled: .*node_modules\/napidep\/addon\.node$/);
+    expect(existsSync(main.out)).toBe(false);
+
+    // node-gyp-build / bindings: the path is computed, so only the package's files tell.
+    const gyp = project({
+      "node_modules/gypdep/package.json": JSON.stringify({ name: "gypdep", main: "index.js" }),
+      "node_modules/gypdep/index.js": `const path = require("path");\nmodule.exports = require(path.join(__dirname, "build", "Release", "gyp.node"));\n`,
+      "node_modules/gypdep/build/Release/gyp.node": "binary",
+      "app/a.ts": `import gyp from "gypdep";\nexport const x = gyp;\n`,
+    });
+    const cli = await run(["bundle", "--dir", gyp.source, "--out", gyp.out]);
+    expect(cli.code).toBe(ExitCode.DEFINITION);
+    expect(cli.stderr).toMatch(/Native addons cannot be bundled: .*node_modules\/gypdep ships build\/Release\/gyp\.node/);
+    expect(existsSync(gyp.out)).toBe(false);
+
+    // A scoped package that ships prebuilds/ (node-gyp-build) and nothing else.
+    const prebuilt = project({
+      "node_modules/@acme/fast/package.json": JSON.stringify({ name: "@acme/fast", main: "index.js" }),
+      "node_modules/@acme/fast/index.js": `module.exports = require("node-gyp-build")(__dirname);\n`,
+      "node_modules/@acme/fast/prebuilds/README": "addons go here",
+      "node_modules/node-gyp-build/package.json": JSON.stringify({ name: "node-gyp-build", main: "index.js" }),
+      "node_modules/node-gyp-build/index.js": `module.exports = (dir) => require(dir + "/prebuilds/x.node");\n`,
+      "app/a.ts": `import fast from "@acme/fast";\nexport const x = fast;\n`,
+    });
+    const scoped = await bundleApp({ dir: prebuilt.source, out: prebuilt.out }).catch((e) => e);
+    expect(scoped).toBeInstanceOf(DefinitionError);
+    expect(scoped.message).toMatch(/node_modules\/@acme\/fast ships prebuilds/);
+  }, 30_000);
+
   test("a build with more than one output file is refused", async () => {
     const p = project({
       "app/logo.png": "\x89PNG not really",
@@ -292,6 +334,66 @@ describe("incibase bundle", () => {
     const err = await bundleApp({ dir: unresolved.source, out: unresolved.out }).catch((e) => e);
     expect(err).toBeInstanceOf(DefinitionError);
     expect(err.message).toMatch(/Bundling failed:\n.*broken\.ts:1:\d+: Could not resolve: "\.\/nowhere"/);
+  }, 30_000);
+
+  test("bundle runs the same checks as serve: function names and schema tables", async () => {
+    const badName = project({
+      "app/m.ts": `import { query } from "incibase/server";\nconst q = query({ handler: async () => 1 });\nexport { q as "bad-name" };\n`,
+    });
+    const cli = await run(["bundle", "--dir", badName.source, "--out", badName.out]);
+    expect(cli.code).toBe(ExitCode.DEFINITION);
+    expect(cli.stderr).toContain(`Invalid function name "bad-name" in m`);
+    expect(existsSync(badName.out)).toBe(false);
+    const served = await run(["serve", "--dir", badName.source, "--data", badName.data, "--port", "0", "--host", "127.0.0.1"]);
+    expect(served.code).toBe(ExitCode.DEFINITION);
+    expect(served.stderr).toContain(`Invalid function name "bad-name" in m`);
+
+    const rawTable = project({
+      "app/schema.ts": `import { defineSchema, z } from "incibase/server";\nexport default defineSchema({ t: { body: z.string() } as any });\n`,
+    });
+    const err = await bundleApp({ dir: rawTable.source, out: rawTable.out }).catch((e) => e);
+    expect(err).toBeInstanceOf(DefinitionError);
+    expect(err.message).toBe(`Table "t" in the schema must be defineTable({...})`);
+    expect(existsSync(rawTable.out)).toBe(false);
+  }, 30_000);
+
+  test("bundling the same source twice gives the same bytes, with no temporary paths in them", async () => {
+    const { source, root } = exampleCopy();
+    const a = await bundleApp({ dir: source, out: join(root, "a.ib") });
+    const b = await bundleApp({ dir: source, out: join(root, "b.ib") });
+    expect(b.sha256).toBe(a.sha256);
+    const text = readFileSync(join(root, "a.ib"), "utf8");
+    // The build names its entry in a comment: a fixed path, not a fresh temporary dir.
+    expect(text).not.toContain("incibase-bundle-");
+    expect(text).toContain("_generated/bundle-entry.ts\n");
+    // The fixed entry file does not stay behind.
+    expect(existsSync(join(source, "_generated", "bundle-entry.ts"))).toBe(false);
+  }, 30_000);
+
+  test("__dirname and __filename fixed to the build machine's paths are warned about", async () => {
+    const p = project({
+      "node_modules/wheredep/package.json": JSON.stringify({ name: "wheredep", main: "index.js" }),
+      "node_modules/wheredep/index.js": `exports.where = __dirname;\n`,
+      "app/m.ts": `import { query } from "incibase/server";\nimport { where } from "wheredep";\nexport const w = query({ handler: async () => where });\n`,
+    });
+    const cli = await run(["bundle", "--dir", p.source, "--out", p.out]);
+    expect(cli.code).toBe(0);
+    expect(cli.stderr).toContain("the bundle fixes __dirname = ");
+    expect(cli.stderr).toContain("wheredep");
+    const plain = project({ "app/m.ts": `export const n = 1;\n` });
+    const quiet = await run(["bundle", "--dir", plain.source, "--out", plain.out]);
+    expect(quiet.code).toBe(0);
+    expect(quiet.stderr).not.toContain("the bundle fixes");
+  }, 30_000);
+
+  test("a manifest longer than serve accepts is refused when bundling", async () => {
+    const p = project({
+      "app/m.ts": `import { query } from "incibase/server";\nexport const big = query({ description: "x".repeat(${MAX_MANIFEST_BYTES}), handler: async () => 1 });\n`,
+    });
+    const err = await bundleApp({ dir: p.source, out: p.out }).catch((e) => e);
+    expect(err).toBeInstanceOf(DefinitionError);
+    expect(err.message).toContain(`longer than ${MAX_MANIFEST_BYTES} bytes`);
+    expect(existsSync(p.out)).toBe(false);
   }, 30_000);
 
   test("a timer the app starts on import does not keep the bundle command running", async () => {
@@ -386,6 +488,31 @@ describe("bundle verification", () => {
     expect(() => readManifest(join(root, "missing.ib"))).toThrow(ConfigError);
   });
 
+  test("readManifest and verifyBundle agree on the longest manifest line", () => {
+    const root = dir();
+    const file = join(root, "x.ib");
+    const body = "export {};\n";
+    // A manifest whose line is exactly `bytes` long: each "x" of the description adds one byte.
+    const padded = (bytes: number) => {
+      const manifest = handMadeBundle(file, body);
+      const fn = { path: "a:b", type: "query" as const, visibility: "public" as const, description: "" };
+      manifest.app.functions = [fn];
+      fn.description = "x".repeat(bytes - Buffer.byteLength(manifestLine(manifest)));
+      const line = manifestLine(manifest);
+      expect(Buffer.byteLength(line)).toBe(bytes);
+      writeFileSync(file, `${line}\n${body}`);
+      return manifest;
+    };
+    const atLimit = padded(MAX_MANIFEST_BYTES);
+    expect(readManifest(file)).toEqual(atLimit);
+    expect(verifyBundle(file).manifest).toEqual(atLimit);
+    for (const bytes of [MAX_MANIFEST_BYTES + 1, MAX_MANIFEST_BYTES + 1000]) {
+      padded(bytes);
+      expect(() => readManifest(file)).toThrow(`the manifest line is longer than ${MAX_MANIFEST_BYTES} bytes`);
+      expect(() => verifyBundle(file)).toThrow(`the manifest line is longer than ${MAX_MANIFEST_BYTES} bytes`);
+    }
+  });
+
   test("the manifest line survives */ in strings", () => {
     const root = dir();
     const file = join(root, "a.ib");
@@ -417,6 +544,22 @@ describe("serve --bundle flags", () => {
     expect(fatal).toMatchObject({ ev: "fatal", exitCode: ExitCode.CONFIG });
     expect(fatal.msg).toContain("Cannot read bundle");
     expect(existsSync(join(root, "data"))).toBe(false);
+  }, 30_000);
+
+  test("serve --dev --bundle runs without a source dir and writes nothing into one", async () => {
+    const { root, source, out, data } = exampleCopy();
+    await bundleApp({ dir: source, out });
+    const generated = join(source, "_generated", "schema.json");
+    rmSync(generated, { force: true });
+    // From the project root, where the default --dir (incibase) is the source the bundle came from.
+    const { url } = await serveBundle(out, data, { extra: ["--dev"], cwd: root });
+    await exerciseExample(url);
+    expect(existsSync(generated)).toBe(false);
+    // And from a dir with no incibase/ in it.
+    const elsewhere = dir();
+    const other = await serveBundle(out, join(elsewhere, "data"), { extra: ["--dev"], cwd: elsewhere });
+    expect(await call(other.url, "query", "channels:list")).toEqual([]);
+    expect(existsSync(join(elsewhere, "incibase"))).toBe(false);
   }, 30_000);
 });
 
