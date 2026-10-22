@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { defineSchema, defineTable, z } from "incibase";
 import { query } from "incibase/server";
 import { adminTools } from "../src/engine/admin.ts";
-import { assertReadQuery, runAdminSql } from "../src/engine/adminsql.ts";
+import { assertReadQuery, runAdminSql, runUncheckedQuery } from "../src/engine/adminsql.ts";
 import { ANONYMOUS, Engine } from "../src/engine/engine.ts";
 import { fieldExpr } from "../src/engine/store.ts";
 import { tempDir } from "./helpers.ts";
@@ -197,7 +198,7 @@ describe("admin_sql", () => {
     expect(err.data?.code).toBe("SQL_TIMEOUT");
     expect(performance.now() - started).toBeLessThan(2000);
     expect(ticks).toBeGreaterThan(5); // the event loop kept running meanwhile
-    // The terminated worker does not hold a slot for long.
+    // The killed process does not hold a slot for long.
     await Bun.sleep(500);
     expect((await sql("SELECT 1 AS one")).rows).toEqual([{ one: 1 }]);
   });
@@ -212,6 +213,85 @@ describe("admin_sql", () => {
     expect(busy.data?.code).toBe("SQL_BUSY");
     for (const hog of await Promise.all(hogs)) expect(hog.data?.code).toBe("SQL_TIMEOUT");
     expect((await sql("SELECT 1 AS one")).rows).toEqual([{ one: 1 }]);
+  });
+
+  // An aggregate over an endless join: one SQLite step that never yields a row.
+  const stuck = "SELECT count(*) AS n FROM notes, (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c)";
+  /** A TRUNCATE checkpoint on a fresh connection, which reports busy instead of waiting. */
+  const checkpoint = () => {
+    const db = new Database(engine.store.path);
+    try {
+      db.run("PRAGMA busy_timeout = 0");
+      return db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
+    } finally {
+      db.close();
+    }
+  };
+  const write = () => engine.writeTx((s) => s.insert("notes", { owner: "carol", text: "c1" }));
+
+  test("kills a query that never yields a row, so its slot and WAL snapshot come back", async () => {
+    const errs = await Promise.all([1, 2].map(() => errorOf(runAdminSql(engine.store.path, stuck, [], { timeoutMs: 300 }))));
+    expect(errs.map((e) => e.data?.code)).toEqual(["SQL_TIMEOUT", "SQL_TIMEOUT"]);
+    // A thread stuck in that step would keep both slots until restart.
+    expect((await runAdminSql(engine.store.path, "SELECT 1 AS one", [], { timeoutMs: 1000 })).rows).toEqual([{ one: 1 }]);
+    // And its read snapshot, which stops checkpoints from ever resetting the WAL.
+    await write();
+    expect(checkpoint().busy).toBe(0);
+  });
+
+  test("one deadline covers waiting for a slot and running the query", async () => {
+    const hogs = [1, 2].map(() => errorOf(runAdminSql(engine.store.path, stuck, [], { timeoutMs: 400 })));
+    const started = performance.now();
+    const late = await errorOf(runAdminSql(engine.store.path, stuck, [], { timeoutMs: 700 }));
+    const elapsed = performance.now() - started;
+    expect(late.data?.code).toBe("SQL_TIMEOUT");
+    // About 400ms waiting for a slot, then the 300ms left; not another 700ms.
+    expect(elapsed).toBeGreaterThan(650);
+    expect(elapsed).toBeLessThan(1000);
+    await Promise.all(hogs);
+  });
+
+  test("a query process does not outlive a server that dies before killing it", async () => {
+    const server = [
+      `import { runAdminSql } from ${JSON.stringify(join(import.meta.dir, "..", "src", "engine", "adminsql.ts"))};`,
+      `runAdminSql(${JSON.stringify(engine.store.path)}, ${JSON.stringify(stuck)}, [], { timeoutMs: 1000 }).catch(() => {});`,
+      `await Bun.sleep(400);`,
+      `process.kill(process.pid, "SIGKILL");`,
+    ].join("\n");
+    await Bun.spawn([process.execPath, "-e", server]).exited;
+    const died = performance.now();
+    await write();
+    // The orphaned query still runs on its old snapshot...
+    expect(checkpoint().busy).toBe(1);
+    // ...until it kills itself, a second past the dead server's deadline.
+    while (checkpoint().busy) {
+      expect(performance.now() - died).toBeLessThan(3000);
+      await Bun.sleep(50);
+    }
+  });
+});
+
+describe("the query process without the text check", () => {
+  const run = (query: string) => runUncheckedQuery(engine.store.path, query, []);
+  const otherDb = () => join(dirs[1]!, "data.db");
+
+  test("refuses a query that attached a database", async () => {
+    // Only the ATTACH runs; the check on the database list then fails the call.
+    const err = await errorOf(run(`ATTACH '${otherDb()}' AS p; SELECT value FROM p._incibase_meta`));
+    expect(err.data?.code).toBe("SQL_ERROR");
+    expect(err.message).toContain("must not attach databases");
+  });
+
+  test("cannot write, not even to a temp table", async () => {
+    expect((await errorOf(run("CREATE TEMP TABLE t (a)"))).message).toContain("readonly database");
+    expect((await errorOf(run("DELETE FROM notes"))).message).toContain("readonly database");
+  });
+
+  test("opens a new connection for every call", async () => {
+    expect((await run("PRAGMA query_only = OFF")).rows).toEqual([]);
+    expect((await errorOf(run("CREATE TEMP TABLE t (a)"))).message).toContain("readonly database");
+    await errorOf(run(`ATTACH '${otherDb()}' AS p`));
+    expect((await run("SELECT name FROM pragma_database_list")).rows).toEqual([{ name: "main" }]);
   });
 });
 
