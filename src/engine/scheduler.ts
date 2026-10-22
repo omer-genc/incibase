@@ -280,7 +280,7 @@ export class Scheduler {
     const started = performance.now();
     let error: string | undefined;
     try {
-      await this.engine.call(job.name, job.args, SYSTEM_IDENTITY, { allowInternal: true });
+      await this.engine.call(job.name, job.args, SYSTEM_IDENTITY, { allowInternal: true, deadlineAtLock: true });
     } catch (err) {
       error = (err as Error)?.message ?? String(err);
     }
@@ -334,7 +334,7 @@ export class Scheduler {
           busy = true;
           const started = performance.now();
           try {
-            await this.engine.call(job.path, job.args, SYSTEM_IDENTITY, { allowInternal: true });
+            await this.engine.call(job.path, job.args, SYSTEM_IDENTITY, { allowInternal: true, deadlineAtLock: true });
             this.engine.log({ type: "cron", path: `${job.name} → ${job.path}`, durationMs: performance.now() - started, ok: true });
           } catch (err) {
             this.engine.log({

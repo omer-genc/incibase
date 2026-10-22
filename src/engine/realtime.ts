@@ -5,6 +5,7 @@ import type { Engine, Identity } from "./engine.ts";
 import { ANONYMOUS, toErrorPayload } from "./engine.ts";
 import { logEvent, newRid, withRid } from "./log.ts";
 import { affects, type Change, type ReadSet } from "./readset.ts";
+import { FunctionTimeoutError } from "./timeouts.ts";
 
 /** Commits within this window are coalesced into one rerun per affected subscription. */
 const BATCH_MS = 10;
@@ -54,6 +55,8 @@ interface SharedSubscription {
   last: string | null;
   dirty: boolean;
   running: boolean;
+  /** Its runs so far all timed out, so what it reads is unknown: any committed change reruns it. */
+  readsUnknown: boolean;
 }
 
 /**
@@ -205,7 +208,7 @@ export class Realtime {
 
     let sub = this.subs.get(key);
     if (!sub) {
-      sub = { key, path, args, identity, clients: new Map(), reads: [], tables: new Set(), runs: 0, pending: [], last: null, dirty: true, running: false };
+      sub = { key, path, args, identity, clients: new Map(), reads: [], tables: new Set(), runs: 0, pending: [], last: null, dirty: true, running: false, readsUnknown: false };
       this.subs.set(key, sub);
     }
     let ids = sub.clients.get(ws);
@@ -253,10 +256,17 @@ export class Realtime {
           );
           sub.reads = reads;
           sub.tables = new Set(reads.map((r) => r.table));
+          sub.readsUnknown = false;
           // A write that landed mid-run may or may not be in this result; rerun if it could matter.
           if (sub.pending.some((change) => reads.some((read) => affects(read, change)))) sub.dirty = true;
           body = `"type":"data","value":${JSON.stringify(value)}`;
         } catch (err) {
+          if (err instanceof FunctionTimeoutError) {
+            // A timeout may pass once the data changes, so it must not leave the subscription stuck on the error:
+            // a change that landed during the run reruns it, judged by the last reads known, or by none yet.
+            sub.readsUnknown = sub.reads.length === 0;
+            if (sub.pending.some((change) => sub.readsUnknown || sub.reads.some((read) => affects(read, change)))) sub.dirty = true;
+          }
           const { error } = toErrorPayload(err, !!this.engine.options.dev);
           body = `"type":"error","error":${JSON.stringify(error)}`;
         }
@@ -281,6 +291,10 @@ export class Realtime {
         continue;
       }
       if (sub.dirty) continue;
+      if (sub.readsUnknown) {
+        sub.dirty = any = true;
+        continue;
+      }
       let hit = false;
       for (const table of sub.tables) if (tables.has(table)) hit = true;
       if (!hit) continue;

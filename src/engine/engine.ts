@@ -17,6 +17,7 @@ import { Realtime } from "./realtime.ts";
 import { Scheduler, validateCrons } from "./scheduler.ts";
 import { StorageService, type StorageOptions } from "./storage.ts";
 import { ensurePrivateDir, Store } from "./store.ts";
+import { Deadline, formatMs, FunctionTimeoutError, guardCtx, raceDeadline, type TimeoutKind, type Timeouts } from "./timeouts.ts";
 
 export interface AppDefinition {
   schema?: SchemaDefinition;
@@ -34,6 +35,8 @@ export interface EngineOptions {
   quiet?: boolean;
   /** Let a migration delete stored fields the schema no longer has (otherwise it is refused). */
   allowFieldRemoval?: boolean;
+  /** Deadlines per call type (`--timeouts`); none by default. Scheduled jobs and crons use their function's type. */
+  timeouts?: Timeouts;
 }
 
 export interface Identity {
@@ -49,6 +52,12 @@ export interface CallOptions {
   /** Internal functions are callable from server code, the scheduler and admins only. */
   allowInternal?: boolean;
   expectType?: FunctionType;
+  /**
+   * Start a query's or mutation's deadline once it holds its lock, not at the
+   * call: for scheduled jobs and crons, which nobody waits on, so one queued
+   * behind a hung job still gets its full deadline.
+   */
+  deadlineAtLock?: boolean;
 }
 
 export class FunctionNotFoundError extends Error {
@@ -75,6 +84,8 @@ export interface WriteTxOptions {
    * event loop, so background work that retries on its own waits briefly.
    */
   busyTimeoutMs?: number;
+  /** The call's deadline: when it passes, the transaction is rolled back and the session closed. */
+  deadline?: Deadline;
 }
 
 /** `BEGIN IMMEDIATE`, waiting at most `busyTimeoutMs` (when given) for the write lock. */
@@ -245,13 +256,22 @@ export class Engine {
   /** Serialized write transaction on the write connection. Notifies subscribers after commit. */
   /** `identity` is who writes, for file ownership checks; omitted means trusted engine code. */
   writeTx<T>(fn: (session: DbSession) => Promise<T> | T, identity?: Identity, options: WriteTxOptions = {}): Promise<T> {
-    return this.writeLock.run(async () => {
+    const { deadline } = options;
+    const locked = () => this.writeLock.run(async () => {
+      // Its deadline passed while it waited for the lock: it does not start, so it cannot commit after its caller got the timeout.
+      deadline?.checkTime();
       const db = this.store.write;
       const session = new DbSession(this.store, db, true, identity);
       begin(db, options.busyTimeoutMs);
       let result: T;
       try {
-        result = await fn(session);
+        result = await raceDeadline(deadline, () => fn(session), (err) => {
+          // Runs in the timer callback, before the abandoned handler can run again: its next ctx.db call throws and nothing commits.
+          session.close(err);
+          if (db.inTransaction) db.run("ROLLBACK");
+        });
+        // A handler that only awaited ctx.db never let the timer fire; past its deadline it rolls back instead of committing late.
+        deadline?.checkTime();
         db.run("COMMIT");
       } catch (err) {
         if (db.inTransaction) db.run("ROLLBACK");
@@ -261,20 +281,29 @@ export class Engine {
       if (session.changes.length) this.realtime.invalidate(session.changes);
       return result;
     });
+    // A deadline that counts from the start of the call also covers the wait for the lock, so a caller queued behind hung mutations gets its answer in time.
+    return deadline?.started ? deadline.race(locked) : locked();
   }
 
   /** Snapshot read transaction on the read connection. */
-  readTx<T>(fn: (session: DbSession) => Promise<T> | T): Promise<{ result: T; session: DbSession }> {
-    return this.readLock.run(async () => {
+  readTx<T>(fn: (session: DbSession) => Promise<T> | T, options: { deadline?: Deadline } = {}): Promise<{ result: T; session: DbSession }> {
+    const { deadline } = options;
+    const locked = () => this.readLock.run(async () => {
+      deadline?.checkTime();
       const db = this.store.read;
       const session = new DbSession(this.store, db, false);
       db.run("BEGIN");
       try {
-        return { result: await fn(session), session };
+        const result = await raceDeadline(deadline, () => fn(session), (err) => {
+          session.close(err);
+          if (db.inTransaction) db.run("COMMIT");
+        });
+        return { result, session };
       } finally {
         if (db.inTransaction) db.run("COMMIT");
       }
     });
+    return deadline?.started ? deadline.race(locked) : locked();
   }
 
   // -------------------------------------------------------------------------
@@ -319,13 +348,15 @@ export class Engine {
   ): Promise<{ value: unknown; reads: ReadSet[] }> {
     const fn = this.resolve(path, options);
     const started = performance.now();
+    const deadline = this.deadlineFor(fn.type, path, !options.deadlineAtLock);
     try {
       const parsed = this.parseArgs(fn, args);
       let value: unknown;
       let reads: ReadSet[] = [];
       if (fn.type === "query") {
-        const { result, session } = await this.readTx(async (session) =>
-          this.finish(fn, await fn.handler(this.queryCtx(session, identity), parsed)),
+        const { result, session } = await this.readTx(
+          async (session) => this.finish(fn, await fn.handler(this.queryCtx(session, identity), parsed)),
+          { deadline },
         );
         value = result;
         reads = session.reads;
@@ -333,9 +364,10 @@ export class Engine {
         value = await this.writeTx(
           async (session) => this.finish(fn, await fn.handler(this.mutationCtx(session, identity), parsed)),
           identity,
+          { deadline },
         );
       } else {
-        value = this.finish(fn, await fn.handler(this.actionCtx(identity), parsed));
+        value = this.finish(fn, await raceDeadline(deadline, () => fn.handler(this.actionCtx(identity, deadline), parsed)));
       }
       this.log({ type: fn.type, path, durationMs: performance.now() - started, ok: true, userId: identity.userId });
       return { value, reads };
@@ -353,6 +385,34 @@ export class Engine {
       );
       throw err;
     }
+  }
+
+  /**
+   * A deadline for one call of `kind`, or none when `--timeouts` sets none.
+   * With `startNow` it counts from now, the start of the call: time a query
+   * or mutation spends waiting for its lock counts too, so the caller is
+   * answered within the deadline and a call that ran out while queued never
+   * starts. Otherwise it starts once the call holds its lock.
+   */
+  deadlineFor(kind: TimeoutKind, path: string, startNow = true): Deadline | undefined {
+    const ms = this.options.timeouts?.[kind];
+    if (!ms) return undefined;
+    const deadline = new Deadline(kind, path, ms, () => {
+      const text = this.options.quiet || this.options.dev ? undefined : [`[incibase] ${kind} ${path} timed out after ${formatMs(ms)}`];
+      logEvent("warn", { ev: "timeout", type: kind, path, ms }, text);
+    });
+    return startNow ? deadline.start() : deadline;
+  }
+
+  /** Runs an httpAction under the http deadline. */
+  runHttpAction(
+    handler: (ctx: ActionCtx, req: Request) => Response | Promise<Response>,
+    identity: Identity,
+    req: Request,
+    path: string,
+  ): Promise<Response> | Response {
+    const deadline = this.deadlineFor("http", path);
+    return raceDeadline(deadline, () => handler(this.actionCtx(identity, deadline), req));
   }
 
   // -------------------------------------------------------------------------
@@ -388,17 +448,19 @@ export class Engine {
     };
   }
 
-  actionCtx(identity: Identity): ActionCtx {
+  /** With a `deadline`, every ctx method throws FUNCTION_TIMEOUT once it passed, so an abandoned action starts nothing new. */
+  actionCtx(identity: Identity, deadline?: Deadline): ActionCtx {
     const run = (type: FunctionType) => (ref: any, args?: unknown) =>
       this.call(getFunctionPath(ref), args ?? {}, identity, { allowInternal: true, expectType: type });
-    return {
+    const ctx = {
       runQuery: run("query"),
       runMutation: run("mutation"),
       runAction: run("action"),
       auth: this.authFor(identity, async () => (await this.readTx((s) => s.get(identity.userId!))).result),
       storage: this.storage.actionWriter(identity),
       scheduler: this.scheduler.standalone(),
-    } as unknown as ActionCtx;
+    };
+    return guardCtx(ctx, deadline) as unknown as ActionCtx;
   }
 }
 
@@ -420,7 +482,7 @@ export function toErrorPayload(err: unknown, dev: boolean): { status: number; er
   if (isIncibaseError(err)) {
     const data = err.data as { code?: unknown; message?: unknown } | string;
     const code = typeof data === "object" && data && typeof data.code === "string" ? data.code : "APPLICATION_ERROR";
-    const status = code === "UNAUTHENTICATED" ? 401 : code === "FORBIDDEN" ? 403 : code === "NOT_FOUND" ? 404 : 400;
+    const status = err instanceof FunctionTimeoutError ? 504 : code === "UNAUTHENTICATED" ? 401 : code === "FORBIDDEN" ? 403 : code === "NOT_FOUND" ? 404 : 400;
     const message = typeof data === "string" ? data : typeof data?.message === "string" ? data.message : err.message;
     return { status, error: { code, message, data: err.data, application: true } };
   }
