@@ -36,3 +36,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # incibase
 incibase_data
 example/incibase/_generated/schema.json
+
+# Claude Code worktrees
+.claude/worktrees/
