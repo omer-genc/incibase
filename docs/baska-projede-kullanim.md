@@ -37,7 +37,11 @@ Dikkat edilecekler:
   import.meta.hot?.dispose(() => client.close());
   ```
 - **Tipsiz kullanım:** Tip dosyalarına erişim yoksa `import { anyApi } from "incibase"` → `client.query(anyApi.channels.list)`. Çalışır ama tip kontrolü yoktur.
-- **Servisler arası çağrı:** `new IncibaseClient(url, { token: ADMIN_KEY })` ile internal fonksiyonlar da çağrılabilir. Admin anahtarını sadece sunucu tarafında kullan.
-- **CORS** varsayılan olarak `*`; farklı port/domain'den bağlanmak ek ayar istemez.
-- **Claude Code** diğer repodan da bağlanabilir: `claude mcp add --transport http incibase http://localhost:3210/mcp --header "Authorization: Bearer <admin key>"`.
+- **Servisler arası çağrı (tek uygulama):** `incibase serve` `--admin-socket` olmadan çalışıyorsa `new IncibaseClient(url, { token: ADMIN_KEY })` ile internal fonksiyonlar da çağrılabilir. Admin anahtarını sadece sunucu tarafında kullan.
+- **Servisler arası çağrı (hosted kurulum):** branch'ler `--admin-socket` ile çalışır ve public adres admin anahtarına 401 döner. Başka bir sunucu bir **servis anahtarı** kullanır: `new IncibaseClient(url, { token: SERVICE_KEY })`, anahtar `ik_svc_<id>_<secret>` biçimindedir.
+  - Servis anahtarı admin değildir: `ctx.auth.isAdmin` false olur, fonksiyon kodu onu `ctx.auth.service` (`{ keyId, scopes }`) ile görür. `isAdmin`'e bakan httpAction'lar `ctx.auth.service`'e geçmeli.
+  - Kapsamlar: `internal` (varsayılan) internal fonksiyonları çağırır; `impersonate` `x-incibase-as-user` ile bir kullanıcı adına çalışır; `upload` imzalı URL olmadan `/api/storage/upload`'a yükler; bu yolla yüklediği dosyaları (yalnızca kendi yüklediklerini) bir `file()` alanına bağlayabilir.
+  - Branch anahtarların yalnızca sha256'sını `INCIBASE_SERVICE_KEYS_FILE` dosyasından okur: `[{ "id": "billing", "sha256": "<anahtarın sha256'sı, hex>", "scopes": ["internal"], "label": "faturalama", "revoked": false }]`. Dosya SIGHUP (`systemctl reload`) ile yeniden okunur; anahtar restart olmadan eklenir ya da iptal edilir.
+- **CORS** varsayılan olarak `*`; farklı port/domain'den bağlanmak ek ayar istemez. İzin listesi için `INCIBASE_CORS_ORIGINS=https://shop.com,https://admin.shop.com`.
+- **Claude Code** diğer repodan da bağlanabilir: `claude mcp add --transport http incibase http://localhost:3210/mcp --header "Authorization: Bearer <admin key>"`. Hosted kurulumda admin araçları yalnızca admin soketinde (SSH tüneli üzerinden) vardır; admin soketi de uygulamanın httpAction'larını ve dosyalarını sunmaz, onlar public adrestedir.
 - `incibase`, `incibase/client` ve `incibase/react` derlenmiş ESM ve `.d.ts` olarak gelir; Node, Vite, Next.js ve Metro doğrudan kullanabilir. CLI (`incibase dev`, `serve`, `build`) Bun gerektirir.

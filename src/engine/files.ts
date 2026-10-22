@@ -100,6 +100,8 @@ interface StorageData {
   size: number;
   ownerId?: string;
   anonymous?: boolean;
+  /** The service key that uploaded the file without a signed URL. */
+  serviceKeyId?: string;
   visibility?: string;
   attachedTo?: { table: string; id: string; field: string };
   pending?: boolean;
@@ -113,11 +115,16 @@ function loadFile(session: DbSession, fileId: string): StorageData {
   return JSON.parse(row.data);
 }
 
-/** Who may put a file into a document: its owner, admins and system code; anyone for anonymous uploads. */
+/**
+ * Who may put a file into a document: its owner, admins and system code;
+ * anyone for anonymous uploads; the service key that uploaded it without a
+ * signed URL. Other files without an owner (admin and system uploads) stay
+ * with admins and system code.
+ */
 function mayAttach(file: StorageData, identity: Identity | undefined): boolean {
   if (!identity || identity.admin || identity.system) return true;
   if (file.ownerId) return file.ownerId === identity.userId;
-  return !!file.anonymous;
+  return !!file.anonymous || (!!file.serviceKeyId && file.serviceKeyId === identity.service?.keyId);
 }
 
 function attach(session: DbSession, fileId: string, target: { table: string; id: string; field: string }, options: FileFieldOptions) {

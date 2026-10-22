@@ -4,6 +4,8 @@ import { IncibaseError } from "../errors.ts";
 import { ValidationError, type DbSession } from "./database.ts";
 import type { Engine, Identity } from "./engine.ts";
 import { ANONYMOUS } from "./engine.ts";
+import { SERVICE_KEY_PREFIX } from "./service-keys.ts";
+import type { Surface } from "./surface.ts";
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -184,7 +186,8 @@ export class AuthService {
 
   /**
    * Resolves an `Authorization: Bearer <token>` value. The admin key yields an
-   * admin identity; `asUser` lets an admin act as a given user.
+   * admin identity and a service key a service one; `asUser` lets an admin,
+   * or a service key with the `impersonate` scope, act as a given user.
    */
   identify(token: unknown, asUser?: string | null): Identity {
     return this.authenticate(token, asUser).identity;
@@ -194,14 +197,47 @@ export class AuthService {
     return this.authenticateRequest(req).identity;
   }
 
-  /** Like `identify`, plus the session a user identity came from (null for anonymous and admin). */
-  authenticate(token: unknown, asUser?: string | null): { identity: Identity; session: SessionRef | null } {
+  /**
+   * Throws (401) for a credential `surface` does not take: the admin key on
+   * the public listener, a service key on the admin listener. Listeners check
+   * each request's bearer with it, and `authenticate` in-band tokens.
+   */
+  assertAccepted(token: unknown, surface: Surface = "combined") {
+    if (surface === "combined" || typeof token !== "string" || !token) return;
+    const admin = safeEqual(token, this.engine.adminKey);
+    if (surface === "public" && admin) {
+      throw new IncibaseError({ code: "UNAUTHENTICATED", message: "The admin key is not accepted here; use the admin socket" });
+    }
+    if (surface === "admin" && !admin && token.startsWith(SERVICE_KEY_PREFIX)) {
+      throw new IncibaseError({ code: "UNAUTHENTICATED", message: "Service keys are not accepted on the admin socket; use the admin key" });
+    }
+  }
+
+  /**
+   * Like `identify`, plus the session a user identity came from (null for
+   * anonymous, admin and service callers). `surface` is the listener the
+   * token came in on (see `assertAccepted`).
+   */
+  authenticate(token: unknown, asUser?: string | null, surface: Surface = "combined"): { identity: Identity; session: SessionRef | null } {
     // Tokens arrive from untrusted JSON too (WebSocket auth); anything but a string is anonymous.
     if (typeof token !== "string" || !token) return { identity: ANONYMOUS, session: null };
+    this.assertAccepted(token, surface);
     if (safeEqual(token, this.engine.adminKey)) {
       const userId = asUser && this.engine.store.tableOfId(asUser)?.name === "_users" ? asUser : null;
       return { identity: { userId, admin: true }, session: null };
     }
+    const service = token.startsWith(SERVICE_KEY_PREFIX) ? this.engine.options.serviceKeys?.match(token) : null;
+    if (service) {
+      if (asUser && !service.scopes.includes("impersonate")) {
+        throw new IncibaseError({
+          code: "FORBIDDEN",
+          message: `x-incibase-as-user needs a service key with the impersonate scope; "${service.keyId}" does not have it`,
+        });
+      }
+      const userId = asUser && this.engine.store.tableOfId(asUser)?.name === "_users" ? asUser : null;
+      return { identity: { userId, admin: false, service }, session: null };
+    }
+    // An unknown or revoked service key finds no session either: anonymous, like an expired session token.
     const session = this.activeSession(sha256(token));
     return session ? { identity: { userId: session.userId, admin: false }, session } : { identity: ANONYMOUS, session: null };
   }

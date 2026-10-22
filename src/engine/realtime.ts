@@ -6,6 +6,8 @@ import { ANONYMOUS, toErrorPayload } from "./engine.ts";
 import { logEvent, newRid, withRid } from "./log.ts";
 import { affects, type Change, type ReadSet } from "./readset.ts";
 import { FunctionTimeoutError } from "./timeouts.ts";
+import { allowsInternal } from "./service-keys.ts";
+import type { Surface } from "./surface.ts";
 
 /** Commits within this window are coalesced into one rerun per affected subscription. */
 const BATCH_MS = 10;
@@ -29,6 +31,8 @@ export interface SocketData {
    * drops a subscription.
    */
   maxSubscriptionBytes?: number;
+  /** The listener the socket came in on, which decides what an in-band auth token may be. */
+  surface?: Surface;
 }
 
 const clientId = z.string().max(256);
@@ -124,7 +128,7 @@ export class Realtime {
     const msg = parsed.data;
     switch (msg.type) {
       case "auth": {
-        const { identity, session } = this.engine.auth.authenticate(msg.token ?? null);
+        const { identity, session } = this.engine.auth.authenticate(msg.token ?? null, null, ws.data.surface);
         this.setIdentity(ws, identity, session);
         break;
       }
@@ -160,6 +164,13 @@ export class Realtime {
     }
   }
 
+  /** Signs out sockets whose identity matches, e.g. one from a service key that was revoked. */
+  revokeIdentities(match: (identity: Identity) => boolean) {
+    for (const ws of [...this.sockets]) {
+      if (match(ws.data.identity)) this.setIdentity(ws, ANONYMOUS, null);
+    }
+  }
+
   /** Signs out sockets whose session expired since they authenticated. */
   private dropExpired(sockets: Iterable<ServerWebSocket<SocketData>>, now = Date.now()) {
     for (const ws of [...sockets]) {
@@ -181,7 +192,8 @@ export class Realtime {
 
   private subscribe(ws: ServerWebSocket<SocketData>, clientId: string, path: string, args: unknown, { rekey = false } = {}) {
     const identity = ws.data.identity;
-    const key = JSON.stringify([path, args, identity.userId, identity.admin]);
+    // The service key is part of who runs it: it can reach internal functions and shows in ctx.auth.service.
+    const key = JSON.stringify([path, args, identity.userId, identity.admin, identity.service ?? null]);
     const previous = ws.data.subs.get(clientId);
     if (previous === key) return;
     if (!previous && ws.data.subs.size >= MAX_SUBSCRIPTIONS_PER_SOCKET) {
@@ -252,7 +264,7 @@ export class Realtime {
           sub.runs++;
           // Each run is a request of its own in the log; one serves every client of the subscription.
           const { value, reads } = await withRid(newRid(), () =>
-            this.engine.callTracked(sub.path, sub.args, sub.identity, { expectType: "query", allowInternal: sub.identity.admin }),
+            this.engine.callTracked(sub.path, sub.args, sub.identity, { expectType: "query", allowInternal: allowsInternal(sub.identity) }),
           );
           sub.reads = reads;
           sub.tables = new Set(reads.map((r) => r.table));

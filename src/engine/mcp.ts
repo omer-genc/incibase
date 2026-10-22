@@ -121,7 +121,7 @@ export async function handleMcp(engine: Engine, req: Request, readBody = () => r
 
   const identity = engine.auth.identifyRequest(req);
   const header = req.headers.get("authorization");
-  if (header && !identity.admin && !identity.userId) {
+  if (header && !identity.admin && !identity.userId && !identity.service) {
     return Response.json(rpcError(null, -32001, "Invalid or expired token"), { status: 401 });
   }
 
