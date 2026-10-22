@@ -10,7 +10,7 @@ import { AuthService, type AuthOptions } from "./auth.ts";
 import { DbSession, ValidationError } from "./database.ts";
 import { DefinitionError } from "./exit-codes.ts";
 import { argsSchemaOf } from "./jsonschema.ts";
-import { checkLimitsEnv, databaseFullError, isDatabaseFull, limitDatabaseSize } from "./limits.ts";
+import { checkLimitsEnv, databaseFullError, isDatabaseFull, limitDatabaseSize, maxDbBytesFrom } from "./limits.ts";
 import { EXPORT_NAME_REGEX, MODULE_PATH_REGEX } from "./manifest.ts";
 import { color, isJson, logEvent, markLogged, SLOW_CALL_MS, wasLogged } from "./log.ts";
 import { migrate, type MigrationReport } from "./migrate.ts";
@@ -19,7 +19,7 @@ import { Realtime } from "./realtime.ts";
 import { Scheduler, validateCrons } from "./scheduler.ts";
 import type { ServiceKeys } from "./service-keys.ts";
 import { StorageService, type StorageOptions } from "./storage.ts";
-import { ensurePrivateDir, Store } from "./store.ts";
+import { ensurePrivateDir, Store, unusableDatabase } from "./store.ts";
 import {
   Deadline,
   formatMs,
@@ -213,7 +213,11 @@ export class Engine {
     this.store = new Store(join(options.dataDir, "data.db"));
     // A constructor that throws returns no engine to stop(): close the store here, or the data dir stays locked.
     try {
-      this.migration = migrate(this.store, app.schema, { allowFieldRemoval: options.allowFieldRemoval });
+      // The migration checks the cap itself: one that would take the database past it is refused (exit 65).
+      this.migration = migrate(this.store, app.schema, {
+        allowFieldRemoval: options.allowFieldRemoval,
+        maxDbBytes: maxDbBytesFrom(options.maxDbBytes),
+      });
       // After migrating, so a database at its cap still starts.
       limitDatabaseSize(this.store.write, options.maxDbBytes);
       this.adminKey = options.adminKey ?? process.env.INCIBASE_ADMIN_KEY ?? this.loadOrCreateAdminKey();
@@ -223,7 +227,8 @@ export class Engine {
       this.realtime = new Realtime(this);
     } catch (err) {
       this.store.close();
-      throw err;
+      // SQLite may open a file it cannot write read-only; the first write (the migration's) then says so.
+      throw unusableDatabase(err, this.store.path);
     }
     (globalThis as Record<symbol, unknown>)[ID_TABLE_RESOLVER] = (id: string) => this.store.tableOfId(id)?.name ?? null;
   }

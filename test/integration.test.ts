@@ -1,13 +1,18 @@
 // Problems that only show when M1's features run together (a review of the
 // merged steps 1-8): drain and the client's retry, migrations and the
 // database cap, uploads and the quota, and serve's start order.
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { IncibaseClient } from "incibase/client";
 import { action, defineSchema, defineTable, mutation, query, z } from "incibase/server";
 import { Engine, type AppDefinition } from "../src/engine/engine.ts";
+import { ConfigError, exitCodeOf, ExitCode } from "../src/engine/exit-codes.ts";
 import { startServer } from "../src/engine/http.ts";
+import { loadAppFromDir } from "../src/engine/loader.ts";
+import { MigrationError } from "../src/engine/migrate.ts";
+import { Store } from "../src/engine/store.ts";
 import { memoryStorage, tempDir } from "./helpers.ts";
 
 const dirs: string[] = [];
@@ -132,3 +137,264 @@ describe("calls a drain cuts", () => {
     expect((await next.readTx((s) => s.query("notes").collect())).result.map((n) => n.body)).toEqual(["resent"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Migrations under the database cap, and errors that are no verdict on the release
+
+const notesSchema = (withIndex: boolean) =>
+  defineSchema({ notes: withIndex ? defineTable({ body: z.string() }).index("by_body", ["body"]) : defineTable({ body: z.string() }) });
+
+/** A data dir holding `count` notes of about 1 KB each; returns its database size in bytes. */
+async function bigNotes(dataDir: string, count: number) {
+  const engine = new Engine({ schema: notesSchema(false), modules: {} }, { dataDir, quiet: true, publicUrl: "http://localhost" });
+  const body = "x".repeat(1000);
+  await engine.writeTx(async (s) => {
+    for (let i = 0; i < count; i++) await s.insert("notes", { body: `${i}${body}` });
+  });
+  await engine.stop();
+  return dbBytes(dataDir);
+}
+
+function dbBytes(dataDir: string) {
+  const db = new Database(join(dataDir, "data.db"), { readonly: true });
+  try {
+    const { page_count } = db.query("PRAGMA page_count").get() as { page_count: number };
+    const { page_size } = db.query("PRAGMA page_size").get() as { page_size: number };
+    return page_count * page_size;
+  } finally {
+    db.close();
+  }
+}
+
+function indexesOf(dataDir: string) {
+  const db = new Database(join(dataDir, "data.db"), { readonly: true });
+  try {
+    return (db.query(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'notes' ORDER BY name`).all() as { name: string }[]).map((r) => r.name);
+  } finally {
+    db.close();
+  }
+}
+
+describe("migrations and the database cap", () => {
+  test("a migration that would grow the database past INCIBASE_MAX_DB_BYTES is refused (65) and changes nothing", async () => {
+    const data = dir();
+    const before = await bigNotes(data, 3000);
+    const cap = before + 64 * 1024;
+    let err: unknown;
+    try {
+      open({ schema: notesSchema(true), modules: {} }, data, { maxDbBytes: cap });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(MigrationError);
+    expect(exitCodeOf(err)).toBe(ExitCode.MIGRATION_REFUSED);
+    expect((err as Error).message).toContain(`past INCIBASE_MAX_DB_BYTES (${cap})`);
+    expect(indexesOf(data)).not.toContain("notes__by_body");
+    expect(dbBytes(data)).toBe(before);
+    // The environment variable is the same cap.
+    const prev = process.env.INCIBASE_MAX_DB_BYTES;
+    process.env.INCIBASE_MAX_DB_BYTES = String(cap);
+    try {
+      expect(() => open({ schema: notesSchema(true), modules: {} }, data)).toThrow(MigrationError);
+    } finally {
+      if (prev === undefined) delete process.env.INCIBASE_MAX_DB_BYTES;
+      else process.env.INCIBASE_MAX_DB_BYTES = prev;
+    }
+    // With room for it, the same migration commits.
+    const engine = open({ schema: notesSchema(true), modules: {} }, data, { maxDbBytes: before * 10 });
+    expect(engine.migration.addedIndexes).toEqual(["notes.by_body"]);
+  }, 30_000);
+
+  test("a database already over its cap still starts, and migrates when the migration does not grow it", async () => {
+    const data = dir();
+    const before = await bigNotes(data, 500);
+    const quiet = silence();
+    try {
+      // Dropping nothing and adding nothing: no growth.
+      const same = open({ schema: notesSchema(false), modules: {} }, data, { maxDbBytes: 4096 });
+      await same.stop();
+      expect(dbBytes(data)).toBe(before);
+      // A new empty table needs pages: refused.
+      expect(() =>
+        open({ schema: defineSchema({ notes: defineTable({ body: z.string() }), more: defineTable({ n: z.number() }) }), modules: {} }, data, {
+          maxDbBytes: 4096,
+        }),
+      ).toThrow(MigrationError);
+    } finally {
+      quiet.restore();
+    }
+  }, 30_000);
+
+  test("only a constraint failure while building an index refuses the migration; a write error is thrown as it is", async () => {
+    const data = dir();
+    await bigNotes(data, 10);
+    const create = spyOn(Store.prototype, "createIndex").mockImplementation(function (this: Store, table: string) {
+      if (table !== "notes") return;
+      throw Object.assign(new Error("disk I/O error"), { code: "SQLITE_IOERR_WRITE" });
+    });
+    let err: unknown;
+    try {
+      open({ schema: notesSchema(true), modules: {} }, data);
+    } catch (e) {
+      err = e;
+    } finally {
+      create.mockRestore();
+    }
+    expect(err).not.toBeInstanceOf(MigrationError);
+    expect((err as { code?: string }).code).toBe("SQLITE_IOERR_WRITE");
+    expect(exitCodeOf(err)).toBe(ExitCode.CRASH);
+    // Duplicates under a unique index are still a refused migration.
+    const unique = defineSchema({ notes: defineTable({ body: z.string() }).index("by_body", ["body"], { unique: true }) });
+    const engine = open({ schema: notesSchema(false), modules: {} }, dir());
+    await engine.writeTx(async (s) => {
+      await s.insert("notes", { body: "same" });
+      await s.insert("notes", { body: "same" });
+    });
+    const dupData = engine.options.dataDir;
+    await engine.stop();
+    expect(() => open({ schema: unique, modules: {} }, dupData)).toThrow(MigrationError);
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// A data dir whose database cannot be used at all
+
+describe("an unusable database", () => {
+  const app = () => ({ schema: notesSchema(false), modules: {} });
+  const configError = (dataDir: string, what: string) => {
+    let err: unknown;
+    try {
+      open(app(), dataDir);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ConfigError);
+    expect(exitCodeOf(err)).toBe(ExitCode.CONFIG);
+    expect((err as Error).message).toContain(what);
+  };
+
+  test("LOCK or data.db being a directory is a ConfigError (64), not a crash to restart", () => {
+    const lockDir = dir();
+    mkdirSync(join(lockDir, "LOCK"));
+    configError(lockDir, "LOCK");
+    const dbDir = dir();
+    mkdirSync(join(dbDir, "data.db"));
+    configError(dbDir, "data.db");
+  });
+
+  test.skipIf(process.getuid?.() === 0)("a read-only data.db is a ConfigError (64) naming the owner and mode", async () => {
+    const data = dir();
+    await bigNotes(data, 1);
+    chmodSync(join(data, "data.db"), 0o400);
+    try {
+      configError(data, "owner and mode");
+    } finally {
+      chmodSync(join(data, "data.db"), 0o600);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// serve, from the CLI
+
+const CLI = join(import.meta.dir, "..", "src", "cli.ts");
+
+function childEnv(extra: Record<string, string> = {}) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("INCIBASE_") && k !== "NO_COLOR" && k !== "FORCE_COLOR"));
+  return { ...env, INCIBASE_RESTART: "1", ...extra };
+}
+
+async function cli(args: string[], env: Record<string, string> = {}) {
+  const proc = Bun.spawn([process.execPath, CLI, ...args], { stdout: "pipe", stderr: "pipe", env: childEnv(env), timeout: 20_000, killSignal: "SIGKILL" });
+  const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  const events = stdout
+    .split("\n")
+    .filter((l) => l.startsWith("{"))
+    .map((l) => JSON.parse(l) as Record<string, any>);
+  return { stdout, stderr, code, events };
+}
+
+const APP_SCHEMA = `import { defineSchema, defineTable, z } from "incibase/server";
+export default defineSchema({ notes: defineTable({ body: z.string() }) });
+`;
+const APP_MODULE = `import { internalMutation, mutation, z } from "incibase/server";
+export const later = mutation({ handler: async (ctx) => ctx.scheduler.runAfter(0, "app:job" as any) });
+export const job = internalMutation({ handler: async (ctx) => { await ctx.db.insert("notes", { body: "job" }); await Bun.sleep(300); } });
+`;
+
+function appDir() {
+  const root = dir();
+  const source = join(root, "app");
+  mkdirSync(source);
+  writeFileSync(join(source, "schema.ts"), APP_SCHEMA);
+  writeFileSync(join(source, "app.ts"), APP_MODULE);
+  return { root, source, data: join(root, "data") };
+}
+
+describe("serve --migrate-only on a data dir without a database", () => {
+  test("is refused (64) and creates nothing, unless --allow-empty says it is a new app", async () => {
+    const p = appDir();
+    mkdirSync(p.data);
+    const refused = await cli(["serve", "--migrate-only", "--dir", p.source, "--data", p.data, "--port", "0", "--log-format", "json"]);
+    expect(refused.code).toBe(ExitCode.CONFIG);
+    expect(refused.events.find((e) => e.ev === "fatal")!.msg).toContain("no database at");
+    expect(existsSync(join(p.data, "data.db"))).toBe(false);
+    const missingDir = await cli(["serve", "--migrate-only", "--dir", p.source, "--data", join(p.root, "nowhere"), "--port", "0"]);
+    expect(missingDir.code).toBe(ExitCode.CONFIG);
+    expect(existsSync(join(p.root, "nowhere"))).toBe(false);
+    const empty = await cli(["serve", "--migrate-only", "--allow-empty", "--dir", p.source, "--data", p.data, "--port", "0", "--log-format", "json"]);
+    expect(empty.code).toBe(0);
+    expect(empty.events.find((e) => e.ev === "migrate_only")).toMatchObject({ changed: true, createdTables: ["notes"] });
+    // On its own, --allow-empty is a mistake.
+    expect((await cli(["serve", "--allow-empty", "--dir", p.source, "--data", p.data, "--port", "0"])).code).toBe(ExitCode.CONFIG);
+  }, 30_000);
+});
+
+const HOSTED = { INCIBASE_ADMIN_KEY: "ik_admin_integration_test_key", INCIBASE_STORAGE_SECRET: "integration-test-storage-secret-0123456789" };
+
+describe("serve's start order", () => {
+  test("a listener that fails (75) leaves due jobs unclaimed: the scheduler starts only once serve listens", async () => {
+    const p = appDir();
+    // Hosted mode refuses a database that holds secrets, so this one is made without them.
+    process.env.INCIBASE_STORAGE_SECRET = HOSTED.INCIBASE_STORAGE_SECRET;
+    try {
+      const engine = new Engine(await loadAppFromDir(p.source), { dataDir: p.data, quiet: true, publicUrl: "http://localhost", adminKey: HOSTED.INCIBASE_ADMIN_KEY });
+      await engine.call("app:later", {}, { userId: null, admin: true });
+      await engine.stop();
+    } finally {
+      delete process.env.INCIBASE_STORAGE_SECRET;
+    }
+    // A live server on the admin socket path: serve binds the public socket, probes the admin one, then exits 75.
+    const admin = join(p.root, "admin.sock");
+    const squatter = Bun.listen({ unix: admin, socket: { data() {} } });
+    try {
+      const result = await cli(
+        ["serve", "--dir", p.source, "--data", p.data, "--socket", join(p.root, "http.sock"), "--admin-socket", admin, "--url", "https://shop.test", "--log-format", "json"],
+        HOSTED,
+      );
+      expect(result.code).toBe(ExitCode.TEMPORARY);
+    } finally {
+      squatter.stop(true);
+    }
+    const db = new Database(join(p.data, "data.db"), { readonly: true });
+    try {
+      const jobs = (db.query(`SELECT data FROM _scheduled`).all() as { data: string }[]).map((r) => JSON.parse(r.data));
+      expect(jobs).toMatchObject([{ name: "app:job", state: "pending" }]);
+      expect(jobs[0].attempts ?? 0).toBe(0);
+      expect(db.query(`SELECT COUNT(*) AS n FROM notes`).get()).toEqual({ n: 0 });
+    } finally {
+      db.close();
+    }
+  }, 30_000);
+});
+
+function silence() {
+  const methods = ["log", "warn", "error"] as const;
+  const saved = methods.map((m) => console[m]);
+  for (const m of methods) console[m] = () => {};
+  return {
+    restore() {
+      methods.forEach((m, i) => (console[m] = saved[i]!));
+    },
+  };
+}

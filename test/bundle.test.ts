@@ -544,7 +544,7 @@ describe("bundle verification", () => {
     expect(() => readManifest(file)).toThrow(`the manifest contains "*/"`);
     const check = await run(["bundle", "--check", "--out", file]);
     expect(check.code).toBe(ExitCode.CONFIG);
-    const serve = await run(["serve", "--bundle", file, "--data", join(root, "data"), "--migrate-only"]);
+    const serve = await run(["serve", "--bundle", file, "--data", join(root, "data"), "--migrate-only", "--allow-empty"]);
     expect(serve.code).toBe(ExitCode.CONFIG);
     expect(existsSync(marker)).toBe(false);
     // An unknown key is refused too.
@@ -583,7 +583,7 @@ describe("bundle verification", () => {
     const file = join(root, "app.ib");
     const body = `import { query } from "incibase/server";\nexport const schema = undefined;\nexport const modules = { m: { which: query({ handler: async () => process.env.WHICH_ONE }) } };\n`;
     const app = { functions: [{ path: "m:which", type: "query" as const, visibility: "public" as const }], tables: {}, crons: [], http: [] };
-    const args = ["serve", "--bundle", file, "--data", join(root, "data"), "--migrate-only"];
+    const args = ["serve", "--bundle", file, "--data", join(root, "data"), "--migrate-only", "--allow-empty"];
     handMadeBundle(file, body, { app: { ...app, functions: [] }, envNames: ["WHICH_ONE"] });
     const hidden = await run(args);
     expect(hidden.code).toBe(ExitCode.CONFIG);

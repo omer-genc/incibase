@@ -152,6 +152,11 @@ export function checkPositiveInt(value: number | undefined, what: string, unit =
 
 export const checkBytes = (value: number | undefined, what: string) => checkPositiveInt(value, what, "number of bytes");
 
+/** The database size cap: `INCIBASE_MAX_DB_BYTES`, else `maxDbBytes`, else none. */
+export function maxDbBytesFrom(maxDbBytes?: number): number | undefined {
+  return bytesFromEnv("INCIBASE_MAX_DB_BYTES") ?? checkBytes(maxDbBytes, "maxDbBytes");
+}
+
 /**
  * Caps the database at `INCIBASE_MAX_DB_BYTES` (or `maxDbBytes`) with
  * `PRAGMA max_page_count` on the write connection, the only one that writes.
@@ -160,7 +165,7 @@ export const checkBytes = (value: number | undefined, what: string) => checkPosi
  * the cap fail with DATABASE_FULL (see `databaseFullError`).
  */
 export function limitDatabaseSize(db: Database, maxDbBytes?: number) {
-  const bytes = bytesFromEnv("INCIBASE_MAX_DB_BYTES") ?? checkBytes(maxDbBytes, "maxDbBytes");
+  const bytes = maxDbBytesFrom(maxDbBytes);
   if (bytes === undefined) return;
   const { page_size: pageSize } = db.query("PRAGMA page_size").get() as { page_size: number };
   const pages = Math.max(1, Math.floor(bytes / pageSize));
