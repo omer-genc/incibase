@@ -1,6 +1,6 @@
 # Değişiklikler
 
-## 0.3.0-alpha.0
+## 0.3.0
 
 M1 Faz A: tek sunucuda proje ve branch barındıracak host katmanının (Faz B) üzerine kurulacağı `serve` özellikleri. Tasarım: [docs/m1-mimari.md](docs/m1-mimari.md). Yeni davranışların çoğu bayrak ya da env ile açılır; bayraksız `serve`/`dev` aşağıda listelenenler dışında aynı çalışır.
 
