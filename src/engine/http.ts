@@ -7,6 +7,7 @@ import { dashboardHtml } from "./dashboard.ts";
 import { describeApp } from "./describe.ts";
 import { ValidationError } from "./database.ts";
 import { toErrorPayload, type Engine, type Identity } from "./engine.ts";
+import { ConfigError } from "./exit-codes.ts";
 import { handleMcp } from "./mcp.ts";
 import type { SocketData } from "./realtime.ts";
 import { VERSION } from "./version.ts";
@@ -34,7 +35,7 @@ function maxJsonBytesFromEnv(): number | undefined {
   if (!value) return undefined;
   const bytes = Number(value);
   if (!Number.isSafeInteger(bytes) || bytes <= 0) {
-    throw new Error(`INCIBASE_MAX_JSON_BYTES must be a positive whole number of bytes, got "${value}"`);
+    throw new ConfigError(`INCIBASE_MAX_JSON_BYTES must be a positive whole number of bytes, got "${value}"`);
   }
   return bytes;
 }

@@ -6,6 +6,7 @@ import * as indexNs from "../index.ts";
 import type { SchemaDefinition } from "../schema.ts";
 import * as serverNs from "../server.ts";
 import type { AppDefinition } from "./engine.ts";
+import { DefinitionError } from "./exit-codes.ts";
 
 const MODULE_SEGMENT = /^[A-Za-z0-9_]+$/;
 const SCHEMA_FILES = ["schema.ts", "schema.js", "schema.mts", "schema.mjs"];
@@ -72,15 +73,17 @@ export async function loadAppFromDir(dir: string): Promise<AppDefinition> {
   for (const file of skipped) {
     console.warn(`[incibase] skipping ${relative(process.cwd(), join(dir, file))}: module paths may only use letters, digits and "_"`);
   }
-  let schema: SchemaDefinition | undefined;
-  if (schemaFile) {
-    const ns = await import(schemaFile);
-    schema = ns.default;
-    if ((schema as { __incibase?: string } | undefined)?.__incibase !== "schema") {
-      throw new Error(`${schemaFile} must \`export default defineSchema({...})\``);
-    }
-  }
+  const schema = schemaFile ? schemaOf(await import(schemaFile), schemaFile) : undefined;
   const loaded: AppDefinition["modules"] = {};
   for (const m of modules) loaded[m.modulePath] = await import(m.absolutePath);
   return { schema, modules: loaded };
+}
+
+/** The schema a schema file exports; DefinitionError when its default export is anything else. */
+export function schemaOf(ns: Record<string, unknown>, file: string): SchemaDefinition {
+  const schema = ns.default;
+  if ((schema as { __incibase?: string } | undefined)?.__incibase !== "schema") {
+    throw new DefinitionError(`${file} must \`export default defineSchema({...})\``);
+  }
+  return schema as SchemaDefinition;
 }

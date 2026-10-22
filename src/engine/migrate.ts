@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { IndexDefinition, SchemaDefinition } from "../schema.ts";
 import { collectHeldIds, storageFieldsOf, WRAPPERS } from "./files.ts";
+import { EXIT_CODE, ExitCode } from "./exit-codes.ts";
 import { toJsonSchema } from "./jsonschema.ts";
 import { FIRST_USER_TABLE_NUMBER, quoteIdent, type DocumentRow, type Store } from "./store.ts";
 
@@ -60,6 +61,8 @@ function describeProblems(problems: Problem[], removedFields: RemovedField[]) {
 }
 
 export class MigrationError extends Error {
+  readonly [EXIT_CODE] = ExitCode.MIGRATION_REFUSED;
+
   constructor(
     readonly problems: Problem[],
     readonly removedFields: RemovedField[] = [],
@@ -165,7 +168,8 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined, opti
           try {
             store.createIndex(name, index);
           } catch (err) {
-            throw new Error(`Cannot create index ${name}.${index.name}: ${(err as Error).message}`);
+            // Existing data the index cannot hold (e.g. duplicates for a unique one): refused like any mismatch.
+            throw new MigrationError([], [], `Cannot create index ${name}.${index.name}: ${(err as Error).message}`);
           }
           report.addedIndexes.push(`${name}.${index.name}`);
         }

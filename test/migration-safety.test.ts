@@ -451,7 +451,7 @@ describe("incibase serve", () => {
     const { data, source } = await app();
 
     const refused = serve(source, data);
-    expect(await refused.exited).toBe(1);
+    expect(await refused.exited).toBe(65);
     expect(await new Response(refused.stderr).text()).toContain("customers.taxNumber: 1 document(s)");
 
     const allowed = serve(source, data, "--allow-field-removal");

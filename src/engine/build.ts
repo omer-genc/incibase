@@ -1,6 +1,6 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import type { BunPlugin } from "bun";
 import { buildDashboardHtml } from "./dashboard.ts";
 import { embeddedRuntime } from "./embedded.ts";
@@ -106,17 +106,23 @@ export async function buildApp(options: BuildOptions): Promise<void> {
   const entry = join(work, "entry.ts");
   const dashboard = join(work, "dashboard.html");
   writeFileSync(dashboard, paths.dashboard ? await Bun.file(paths.dashboard).text() : await buildDashboardHtml());
+  // Dynamic imports, so an app module that throws on import fails `serve` with its exit code
+  // instead of killing the process before the CLI runs.
   writeFileSync(
     entry,
     [
       `import { runCli } from ${JSON.stringify(paths.cli)};`,
       `import dashboardHtml from "./dashboard.html" with { type: "text" };`,
-      schemaFile ? `import schema from ${JSON.stringify(schemaFile)};` : `const schema = undefined;`,
-      ...modules.map((m, i) => `import * as m${i} from ${JSON.stringify(m.absolutePath)};`),
       `await runCli(process.argv.slice(2), {`,
-      `  embedded: { schema, modules: {`,
-      ...modules.map((m, i) => `    ${JSON.stringify(m.modulePath)}: m${i},`),
-      `  } },`,
+      `  embedded: {`,
+      ...(schemaFile ? [`    schemaFile: ${JSON.stringify(relative(dir, schemaFile))},`] : []),
+      `    load: async () => ({`,
+      ...(schemaFile ? [`      schema: await import(${JSON.stringify(schemaFile)}),`] : []),
+      `      modules: {`,
+      ...modules.map((m) => `        ${JSON.stringify(m.modulePath)}: await import(${JSON.stringify(m.absolutePath)}),`),
+      `      },`,
+      `    }),`,
+      `  },`,
       `  dashboardHtml,`,
       `});`,
       ``,

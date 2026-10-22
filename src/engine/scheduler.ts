@@ -1,8 +1,9 @@
 import { getFunctionPath } from "../api.ts";
 import { IncibaseError } from "../errors.ts";
-import type { CronJob } from "../server.ts";
+import type { CronJob, CronJobs } from "../server.ts";
 import type { DbSession } from "./database.ts";
 import type { Engine, Identity, WriteTxOptions } from "./engine.ts";
+import { DefinitionError } from "./exit-codes.ts";
 import { quoteIdent, rowToDoc, type DocumentRow } from "./store.ts";
 
 const SYSTEM_IDENTITY: Identity = { userId: null, admin: false, system: true };
@@ -21,6 +22,26 @@ const BACKGROUND: WriteTxOptions = { busyTimeoutMs: 50 };
 
 function backoff(failures: number) {
   return Math.min(RETRY_MIN_MS * 2 ** failures, RETRY_MAX_MS);
+}
+
+/**
+ * Throws DefinitionError for a cron job that could never run: one that points
+ * to a function the app does not have, or whose schedule does not parse or
+ * never fires. The engine checks this before it migrates, so a bad cron
+ * commits nothing.
+ */
+export function validateCrons(crons: CronJobs | null, functions: ReadonlyMap<string, unknown>) {
+  for (const job of crons?.jobs ?? []) {
+    if (!functions.has(job.path)) throw new DefinitionError(`Cron "${job.name}" points to unknown function "${job.path}"`);
+    if (job.schedule.kind !== "cron") continue;
+    let next: Date | null;
+    try {
+      next = Bun.cron.parse(job.schedule.expression, Date.now(), job.schedule.tz ? { tz: job.schedule.tz } : undefined);
+    } catch (err) {
+      throw new DefinitionError(`Cron "${job.name}": ${(err as Error).message}`);
+    }
+    if (!next) throw new DefinitionError(`Cron "${job.name}" never fires: ${job.schedule.expression}`);
+  }
 }
 
 interface ScheduledDoc {
@@ -325,7 +346,6 @@ export class Scheduler {
       );
       this.cronTimers.push(timer);
     };
-    if (!this.engine.functions.has(job.path)) throw new Error(`Cron "${job.name}" points to unknown function "${job.path}"`);
     arm();
   }
 

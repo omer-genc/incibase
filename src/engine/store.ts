@@ -3,8 +3,10 @@ import { chmodSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } fro
 import { dirname, join, resolve } from "node:path";
 import type { z } from "zod";
 import { FIELD_PATH_REGEX, type IndexDefinition } from "../schema.ts";
+import { ConfigError, EXIT_CODE, ExitCode } from "./exit-codes.ts";
 import type { StorageField } from "./files.ts";
 import { ID_REGEX } from "../values.ts";
+import { VERSION } from "./version.ts";
 
 const ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";
 
@@ -147,6 +149,8 @@ function openElsewhere(path: string): boolean {
 }
 
 export class DataDirLockedError extends Error {
+  readonly [EXIT_CODE] = ExitCode.TEMPORARY;
+
   constructor(readonly dataDir: string) {
     super(`Data directory ${dataDir} is in use by another incibase process. Stop it first, or use a different data directory.`);
     this.name = "DataDirLockedError";
@@ -210,6 +214,26 @@ export class DataDirLock {
 }
 
 /**
+ * Version of incibase's own tables (`_incibase_*`, `_sessions`, `_passwords`
+ * and the system document tables), kept in `_incibase_meta`. Raise it when a
+ * release changes them in a way an older binary would get wrong.
+ */
+export const SYSTEM_SCHEMA_VERSION = 1;
+
+export class SystemSchemaTooNewError extends ConfigError {
+  constructor(
+    readonly path: string,
+    readonly version: number,
+  ) {
+    super(
+      `${resolve(path)} has system schema version ${version}; incibase ${VERSION} supports up to ${SYSTEM_SCHEMA_VERSION}. ` +
+        `A newer incibase has used this database: run that version (or a later one).`,
+    );
+    this.name = "SystemSchemaTooNewError";
+  }
+}
+
+/**
  * Reads one `_incibase_meta` value over a read-only connection: no lock, no
  * DDL and no writes, so it is safe while a server runs on the database.
  */
@@ -267,6 +291,11 @@ export class Store {
 
   private initSystem() {
     const db = this.write;
+    // Before any DDL: an older binary must not "repair" system tables a newer one changed.
+    const stored = db.query(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_incibase_meta'`).get()
+      ? Number(this.getMeta("system_schema_version") ?? 0)
+      : 0;
+    if (!(stored <= SYSTEM_SCHEMA_VERSION)) throw new SystemSchemaTooNewError(this.path, stored);
     db.run(`CREATE TABLE IF NOT EXISTS _incibase_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
     db.run(`CREATE TABLE IF NOT EXISTS _incibase_tables (
       name TEXT PRIMARY KEY,
@@ -288,6 +317,7 @@ export class Store {
       for (const index of indexes) this.createIndex(name, index);
       this.register({ name, number, system: true, indexes });
     }
+    if (stored < SYSTEM_SCHEMA_VERSION) this.setMeta("system_schema_version", String(SYSTEM_SCHEMA_VERSION));
   }
 
   register(info: TableInfo) {

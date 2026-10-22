@@ -2,6 +2,7 @@
 // plain descriptor objects; the engine runs them.
 import type { z } from "zod";
 import { getFunctionPath } from "./api.ts";
+import { DefinitionError } from "./engine/exit-codes.ts";
 import type {
   ArgsInput,
   ArgsOutput,
@@ -211,8 +212,8 @@ type Builder<Type extends FunctionType, Visibility extends FunctionVisibility, C
 
 function builder(type: FunctionType, visibility: FunctionVisibility): any {
   return (definition: FunctionDefinition<any, any, any>) => {
-    if (typeof definition?.handler !== "function") throw new Error(`${type} definition needs a handler`);
-    if (visibility === "internal" && definition.mcp) throw new Error("Internal functions cannot be MCP tools");
+    if (typeof definition?.handler !== "function") throw new DefinitionError(`${type} definition needs a handler`);
+    if (visibility === "internal" && definition.mcp) throw new DefinitionError("Internal functions cannot be MCP tools");
     return { __incibase: "function", type, visibility, ...definition };
   };
 }
@@ -271,10 +272,14 @@ export class HttpRouter {
   readonly routes: HttpRoute[] = [];
 
   route(route: HttpRoute): this {
-    if (!route.path === !route.pathPrefix) throw new Error("A route needs exactly one of path or pathPrefix");
-    if (route.pathPrefix && !route.pathPrefix.endsWith("/")) throw new Error("pathPrefix must end with /");
+    if (!route.path === !route.pathPrefix) throw new DefinitionError("A route needs exactly one of path or pathPrefix");
+    if (route.pathPrefix && !route.pathPrefix.endsWith("/")) throw new DefinitionError("pathPrefix must end with /");
     const path = route.path ?? route.pathPrefix!;
-    if (path.startsWith("/api/") || path === "/mcp") throw new Error(`"${path}" is reserved`);
+    if (path.startsWith("/api/") || path === "/mcp") throw new DefinitionError(`"${path}" is reserved`);
+    // The first one would always win, so the second could never run.
+    if (this.routes.some((r) => r.method === route.method && r.path === route.path && r.pathPrefix === route.pathPrefix)) {
+      throw new DefinitionError(`Duplicate route ${route.method} ${route.path ?? `${route.pathPrefix}*`}`);
+    }
     this.routes.push(route);
     return this;
   }
@@ -319,7 +324,7 @@ export class CronJobs {
 
   interval<F extends SchedulableReference>(name: string, schedule: IntervalSchedule, fn: F, ...args: OptionalArgs<F>) {
     const ms = ((schedule.hours ?? 0) * 3600 + (schedule.minutes ?? 0) * 60 + (schedule.seconds ?? 0)) * 1000;
-    if (ms < 1000) throw new Error(`Cron "${name}": interval must be at least 1 second`);
+    if (ms < 1000) throw new DefinitionError(`Cron "${name}": interval must be at least 1 second`);
     this.add({ name, schedule: { kind: "interval", ms }, path: pathOf(fn), args: args[0] ?? {} });
   }
 
@@ -335,7 +340,7 @@ export class CronJobs {
   }
 
   private add(job: CronJob) {
-    if (this.jobs.some((j) => j.name === job.name)) throw new Error(`Duplicate cron job "${job.name}"`);
+    if (this.jobs.some((j) => j.name === job.name)) throw new DefinitionError(`Duplicate cron job "${job.name}"`);
     this.jobs.push(job);
   }
 }

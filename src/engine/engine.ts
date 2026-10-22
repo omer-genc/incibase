@@ -8,11 +8,12 @@ import { ID_TABLE_RESOLVER } from "../values.ts";
 import type { ActionCtx, CronJobs, HttpRouter } from "../server.ts";
 import { AuthService } from "./auth.ts";
 import { DbSession, ValidationError } from "./database.ts";
+import { DefinitionError } from "./exit-codes.ts";
 import { argsSchemaOf } from "./jsonschema.ts";
 import { migrate, type MigrationReport } from "./migrate.ts";
 import type { ReadSet } from "./readset.ts";
 import { Realtime } from "./realtime.ts";
-import { Scheduler } from "./scheduler.ts";
+import { Scheduler, validateCrons } from "./scheduler.ts";
 import { StorageService, type StorageOptions } from "./storage.ts";
 import { ensurePrivateDir, Store } from "./store.ts";
 
@@ -97,6 +98,11 @@ class Mutex {
   }
 }
 
+/** Module paths as the loader discovers them (`"chat/messages"`); other characters would break function paths. */
+const MODULE_PATH_REGEX = /^[A-Za-z0-9_]+(\/[A-Za-z0-9_]+)*$/;
+/** Export names a function reference (`api.chat.messages.list`) can spell. */
+const EXPORT_NAME_REGEX = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
 /** Splits the module path and the export name: `"chat/messages:list"`. */
 export function functionPathOf(modulePath: string, exportName: string) {
   return `${modulePath}:${exportName}`;
@@ -124,25 +130,16 @@ export class Engine {
     readonly app: AppDefinition,
     readonly options: EngineOptions,
   ) {
+    // Before the data dir is touched: an app incibase rejects leaves the database as it was.
+    const { crons, http } = this.register(app);
+    this.crons = crons;
+    this.http = http;
+
     ensurePrivateDir(options.dataDir);
     this.store = new Store(join(options.dataDir, "data.db"));
     // A constructor that throws returns no engine to stop(): close the store here, or the data dir stays locked.
     try {
       this.migration = migrate(this.store, app.schema, { allowFieldRemoval: options.allowFieldRemoval });
-
-      let crons: CronJobs | null = null;
-      let http: HttpRouter | null = null;
-      for (const [modulePath, ns] of Object.entries(app.modules)) {
-        for (const [name, value] of Object.entries(ns)) {
-          const marker = (value as { __incibase?: string } | null)?.__incibase;
-          if (marker === "function") this.functions.set(functionPathOf(modulePath, name), value as RegisteredFunction);
-          else if (marker === "crons" && name === "default") crons = value as CronJobs;
-          else if (marker === "httpRouter" && name === "default") http = value as HttpRouter;
-        }
-      }
-      this.crons = crons;
-      this.http = http;
-
       this.adminKey = options.adminKey ?? process.env.INCIBASE_ADMIN_KEY ?? this.loadOrCreateAdminKey();
       this.auth = new AuthService(this);
       this.storage = new StorageService(this, options.storage);
@@ -153,6 +150,37 @@ export class Engine {
       throw err;
     }
     (globalThis as Record<symbol, unknown>)[ID_TABLE_RESOLVER] = (id: string) => this.store.tableOfId(id)?.name ?? null;
+  }
+
+  /** Registers the app's functions and checks its definitions; throws DefinitionError for what could not run. */
+  private register(app: AppDefinition): { crons: CronJobs | null; http: HttpRouter | null } {
+    if (app.schema !== undefined) {
+      if ((app.schema as { __incibase?: string } | null)?.__incibase !== "schema") {
+        throw new DefinitionError("The schema must be `export default defineSchema({...})`");
+      }
+      for (const [name, table] of Object.entries(app.schema.tables)) {
+        if ((table as { __incibase?: string } | null)?.__incibase !== "table") {
+          throw new DefinitionError(`Table "${name}" in the schema must be defineTable({...})`);
+        }
+      }
+    }
+    let crons: CronJobs | null = null;
+    let http: HttpRouter | null = null;
+    for (const [modulePath, ns] of Object.entries(app.modules)) {
+      if (!MODULE_PATH_REGEX.test(modulePath)) {
+        throw new DefinitionError(`Invalid module path "${modulePath}": use letters, digits and "_", separated by "/"`);
+      }
+      for (const [name, value] of Object.entries(ns)) {
+        const marker = (value as { __incibase?: string } | null)?.__incibase;
+        if (marker === "function") {
+          if (!EXPORT_NAME_REGEX.test(name)) throw new DefinitionError(`Invalid function name "${name}" in ${modulePath}`);
+          this.functions.set(functionPathOf(modulePath, name), value as RegisteredFunction);
+        } else if (marker === "crons" && name === "default") crons = value as CronJobs;
+        else if (marker === "httpRouter" && name === "default") http = value as HttpRouter;
+      }
+    }
+    validateCrons(crons, this.functions);
+    return { crons, http };
   }
 
   start() {

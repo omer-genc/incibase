@@ -81,7 +81,7 @@ describe("data dir lock", () => {
 
     // The failed attempt must not have dropped the first engine's lock.
     const other = await run(["bun", CLI, "serve", "--dir", EXAMPLE_DIR, "--data", data, "--port", "0"]);
-    expect(other.code).toBe(1);
+    expect(other.code).toBe(75);
     expect(other.stderr).toContain(`Data directory ${resolve(data)} is in use by another incibase process`);
     await first.writeTx((s) => s.conn.run(`INSERT INTO _incibase_meta (key, value) VALUES ('still', 'mine')`));
 
@@ -388,9 +388,10 @@ describe("scheduler", () => {
     const cron = Bun.cron as { parse: typeof Bun.cron.parse };
     const parse = cron.parse;
     let calls = 0;
-    // Fires every 20ms; the re-arm after the first run fails once.
+    // Fires every 20ms; the re-arm after the first run fails once. Call 1 is the
+    // engine's check of the schedule, call 2 arms the first run.
     cron.parse = () => {
-      if (++calls === 2) throw new Error("cannot compute the next run");
+      if (++calls === 3) throw new Error("cannot compute the next run");
       return new Date(Date.now() + 20);
     };
     try {
@@ -404,7 +405,7 @@ describe("scheduler", () => {
     } finally {
       cron.parse = parse;
     }
-    expect(calls).toBeGreaterThan(2);
+    expect(calls).toBeGreaterThan(3);
   });
 });
 

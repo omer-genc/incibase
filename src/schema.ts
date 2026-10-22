@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { DefinitionError } from "./engine/exit-codes.ts";
 import type { Id, SystemFields } from "./values.ts";
 
 export const NAME_REGEX = /^[A-Za-z][A-Za-z0-9_]*$/;
@@ -24,7 +25,7 @@ export class TableDefinition<
   constructor(validator: z.ZodObject<Shape, any>, indexes: readonly IndexDefinition[] = []) {
     for (const key of Object.keys(validator.shape)) {
       if (!NAME_REGEX.test(key)) {
-        throw new Error(`Invalid field name "${key}": use letters, digits and "_", starting with a letter`);
+        throw new DefinitionError(`Invalid field name "${key}": use letters, digits and "_", starting with a letter`);
       }
     }
     this.validator = validator;
@@ -40,12 +41,12 @@ export class TableDefinition<
     fields: Fields,
     options: { unique?: boolean } = {},
   ): TableDefinition<Shape, Indexes & { [K in Name]: Fields }> {
-    if (!NAME_REGEX.test(name)) throw new Error(`Invalid index name "${name}"`);
+    if (!NAME_REGEX.test(name)) throw new DefinitionError(`Invalid index name "${name}"`);
     if (name === "by_creation_time" || this.indexes.some((i) => i.name === name)) {
-      throw new Error(`Duplicate index name "${name}"`);
+      throw new DefinitionError(`Duplicate index name "${name}"`);
     }
     for (const field of fields) {
-      if (!FIELD_PATH_REGEX.test(field)) throw new Error(`Invalid index field "${field}" in "${name}"`);
+      if (!FIELD_PATH_REGEX.test(field)) throw new DefinitionError(`Invalid index field "${field}" in "${name}"`);
     }
     return new TableDefinition(this.validator, [
       ...this.indexes,
@@ -73,7 +74,7 @@ export function defineSchema<const Tables extends Record<string, AnyTableDefinit
 ): SchemaDefinition<Tables> {
   for (const name of Object.keys(tables)) {
     if (!NAME_REGEX.test(name)) {
-      throw new Error(`Invalid table name "${name}": use letters, digits and "_", starting with a letter`);
+      throw new DefinitionError(`Invalid table name "${name}": use letters, digits and "_", starting with a letter`);
     }
   }
   return new SchemaDefinition(tables);

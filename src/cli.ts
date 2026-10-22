@@ -8,8 +8,9 @@ import { setEmbeddedDashboard } from "./engine/dashboard.ts";
 import { describeApp } from "./engine/describe.ts";
 import { embeddedRuntime } from "./engine/embedded.ts";
 import { Engine, type AppDefinition } from "./engine/engine.ts";
+import { ConfigError, DefinitionError, describeExit, exitCodeOf, ExitCode } from "./engine/exit-codes.ts";
 import { startServer } from "./engine/http.ts";
-import { loadAppFromDir } from "./engine/loader.ts";
+import { loadAppFromDir, schemaOf } from "./engine/loader.ts";
 import { MigrationError } from "./engine/migrate.ts";
 import { DataDirLockedError, readMeta } from "./engine/store.ts";
 import { VERSION } from "./engine/version.ts";
@@ -41,8 +42,16 @@ Options:
                     dev drops it once a server has started
 `;
 
+/** The app a built binary carries. */
+export interface EmbeddedApp {
+  /** The schema file's path in the app dir, for messages. */
+  schemaFile?: string;
+  /** Imports the app's modules, so one that throws on import fails `serve` with its exit code. */
+  load: () => Promise<{ schema?: Record<string, unknown>; modules: AppDefinition["modules"] }>;
+}
+
 interface CliOptions {
-  embedded?: AppDefinition;
+  embedded?: EmbeddedApp;
   /** Pre-built dashboard HTML (built apps carry it). */
   dashboardHtml?: string;
 }
@@ -70,7 +79,15 @@ function parse(argv: string[]) {
 }
 
 export async function runCli(argv: string[], options: CliOptions = {}) {
-  const { values, command: given } = parse(argv);
+  let parsed: ReturnType<typeof parse>;
+  try {
+    parsed = parse(argv);
+  } catch (err) {
+    console.error(`${(err as Error).message}\n`);
+    console.log(HELP);
+    process.exit(ExitCode.CONFIG);
+  }
+  const { values, command: given } = parsed;
   if (values.version) return console.log(VERSION);
   const command = given ?? (options.embedded ? "serve" : undefined);
   if (options.dashboardHtml) setEmbeddedDashboard(options.dashboardHtml);
@@ -123,24 +140,52 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
 
 type Values = ReturnType<typeof parse>["values"];
 
-async function serve(values: Values, embedded?: AppDefinition) {
-  const dev = values.dev;
-  const port = Number(values.port ?? process.env.PORT ?? 3210);
-  const publicUrl = (values.url ?? process.env.INCIBASE_URL ?? `http://localhost:${port}`).replace(/\/+$/, "");
+/**
+ * Reports why the server could not start and exits with the code for that
+ * kind of failure (see exit-codes.ts), so a supervisor restarts only the ones
+ * a restart can fix.
+ */
+function exitOnStartError(err: unknown): never {
+  if (err instanceof MigrationError) {
+    console.error(`\x1b[31m${err.message}\x1b[0m\nFix the schema (or the data) and save again.`);
+  } else if (err instanceof DataDirLockedError || err instanceof ConfigError || (err as { code?: string })?.code === "EADDRINUSE") {
+    console.error(`\x1b[31m${(err as Error).message}\x1b[0m`);
+  } else if (err instanceof DefinitionError) {
+    // The stack is incibase's own, except for the frame in the app that made the definition.
+    const frame = err.stack
+      ?.split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.startsWith("at ") && line.includes("/") && !line.includes(import.meta.dir));
+    console.error(`\x1b[31m${err.message}\x1b[0m${frame ? `\n  ${frame}` : ""}`);
+  } else {
+    console.error(err);
+  }
+  process.exit(exitCodeOf(err));
+}
 
+function portOf(value: string): number {
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new ConfigError(`Invalid port "${value}": use 0 to 65535`);
+  return port;
+}
+
+async function loadEmbedded(embedded: EmbeddedApp): Promise<AppDefinition> {
+  const { schema, modules } = await embedded.load();
+  return { schema: schema ? schemaOf(schema, embedded.schemaFile ?? "schema.ts") : undefined, modules };
+}
+
+async function serve(values: Values, embedded?: EmbeddedApp) {
+  const dev = values.dev;
+  let port: number;
+  let publicUrl: string;
   let engine: Engine;
   try {
-    const app = embedded ?? (await loadAppFromDir(values.dir));
+    port = portOf(values.port ?? process.env.PORT ?? "3210");
+    publicUrl = (values.url ?? process.env.INCIBASE_URL ?? `http://localhost:${port}`).replace(/\/+$/, "");
+    const app = embedded ? await loadEmbedded(embedded) : await loadAppFromDir(values.dir);
     engine = new Engine(app, { dataDir: values.data, dev, publicUrl, allowFieldRemoval: values["allow-field-removal"] });
   } catch (err) {
-    if (err instanceof MigrationError) {
-      console.error(`\x1b[31m${err.message}\x1b[0m\nFix the schema (or the data) and save again.`);
-    } else if (err instanceof DataDirLockedError) {
-      console.error(`\x1b[31m${err.message}\x1b[0m`);
-    } else {
-      console.error(err);
-    }
-    process.exit(1);
+    exitOnStartError(err);
   }
 
   if (dev && !embedded) {
@@ -156,7 +201,14 @@ async function serve(values: Values, embedded?: AppDefinition) {
 
   engine.start();
   const dashboard = !values["no-dashboard"];
-  const server = startServer(engine, { port, hostname: values.host ?? (dev ? "localhost" : "0.0.0.0"), dashboard });
+  let server: ReturnType<typeof startServer>;
+  try {
+    server = startServer(engine, { port, hostname: values.host ?? (dev ? "localhost" : "0.0.0.0"), dashboard });
+  } catch (err) {
+    await engine.stop().catch(() => {});
+    // EADDRINUSE may clear up (exit 75); a port this user may not bind will not.
+    exitOnStartError((err as { code?: string }).code === "EACCES" ? new ConfigError((err as Error).message) : err);
+  }
   // Only once serving: a startup error must still exit instead of leaving a process that serves nothing.
   installCrashHandlers();
 
@@ -245,7 +297,9 @@ async function dev(argv: string[], values: Values) {
     });
     const current = child;
     void current.exited.then((code) => {
-      if (child === current && code !== 0 && code !== null) console.log("\x1b[33mServer stopped; waiting for changes...\x1b[0m");
+      if (child === current && code !== 0 && code !== null) {
+        console.log(`\x1b[33mServer stopped (${describeExit(code)}); waiting for changes...\x1b[0m`);
+      }
     });
   };
 
