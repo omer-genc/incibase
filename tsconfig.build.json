@@ -1,0 +1,15 @@
+{
+  // Declaration emit for the published library entry points (dist/lib/*.d.ts).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "rewriteRelativeImportExtensions": true,
+    "rootDir": "./src",
+    "outDir": "./dist/lib",
+    "paths": {}
+  },
+  "files": ["src/index.ts", "src/server.ts", "src/client.ts", "src/react.ts"],
+  "include": []
+}

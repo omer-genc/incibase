@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # GitHub Release
+  id-token: write # npm provenance / trusted publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: bun install --frozen-lockfile
+      - name: Tag matches package.json version
+        run: test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
+      # prepublishOnly runs typecheck, tests and build:package.
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Build binaries
+        run: >-
+          bun scripts/build-binary.ts
+          --target bun-linux-x64 --target bun-linux-arm64
+          --target bun-darwin-x64 --target bun-darwin-arm64
+          --target bun-windows-x64
+      - name: GitHub Release
+        run: gh release create "$GITHUB_REF_NAME" dist/incibase-* --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

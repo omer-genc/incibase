@@ -2,12 +2,13 @@
 
 incibase backend'i ayaktayken (`incibase dev`, `incibase serve` ya da derlenmiş binary) onu başka bir repodan nasıl kullanacağın.
 
-incibase henüz npm'de değil; paketi yerel olarak bağla:
+Paketi kur:
 
 ```bash
-cd /path/to/incibase && bun link      # bir kez
-cd /path/to/projen && bun link incibase
+bun add incibase zod
 ```
+
+incibase'in kendisi üzerinde çalışırken yerel kopyayı bağlamak için: `cd /path/to/incibase && bun link`, sonra projende `bun link incibase`.
 
 **a) Backend aynı repoda (önerilen).** Projede `incibase/` klasörü olur, tipler `incibase/_generated/api`'den gelir:
 
@@ -29,7 +30,7 @@ import { api } from "@backend/_generated/api";
 
 Dikkat edilecekler:
 
-- **Tek React kopyası:** `bun link` incibase'in kendi `node_modules/react`'ini de görür; iki kopya "Invalid hook call" hatası verir. Vite'ta `resolve: { dedupe: ["react", "react-dom"] }` ekle.
+- **Tek React kopyası (yalnızca `bun link` ile):** bağlı kopya incibase'in kendi `node_modules/react`'ini de görür; iki kopya "Invalid hook call" hatası verir. Vite'ta `resolve: { dedupe: ["react", "react-dom"] }` ekle.
 - **Vite HMR:** İstemciyi oluşturan modül hot-reload olursa yeni bir `IncibaseClient` oluşur ve eskisinin WebSocket'i açık kalır (kütüphane HMR'ı göremez). İstemciyi oluşturduğun dosyaya şunu ekle:
   ```ts
   export const client = new IncibaseClient(url);
@@ -39,4 +40,4 @@ Dikkat edilecekler:
 - **Servisler arası çağrı:** `new IncibaseClient(url, { token: ADMIN_KEY })` ile internal fonksiyonlar da çağrılabilir. Admin anahtarını sadece sunucu tarafında kullan.
 - **CORS** varsayılan olarak `*`; farklı port/domain'den bağlanmak ek ayar istemez.
 - **Claude Code** diğer repodan da bağlanabilir: `claude mcp add --transport http incibase http://localhost:3210/mcp --header "Authorization: Bearer <admin key>"`.
-- Paket şu an `.ts` kaynaklarını sunuyor (Bun ve Vite sorunsuz okur). npm'e yayınlamak için önce bir JS build adımı gerekir.
+- `incibase`, `incibase/client` ve `incibase/react` derlenmiş ESM ve `.d.ts` olarak gelir; Node, Vite, Next.js ve Metro doğrudan kullanabilir. CLI (`incibase dev`, `serve`, `build`) Bun gerektirir.

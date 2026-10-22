@@ -232,6 +232,11 @@ Ortam değişkenleri: `INCIBASE_ADMIN_KEY`, `INCIBASE_URL`, `INCIBASE_STORAGE=s3
 bun test            # motor, HTTP, realtime, auth, storage, scheduler, MCP, panel, React hook'ları
 bun check           # test/types.check.ts tip çıkarımını da doğrular
 bun run build:binary
+bun run build:package  # npm paketinin dist/lib çıktısı
 ```
 
 `example/incibase` tüm özellikleri kullanan örnek uygulamadır ve testler onu çalıştırır.
+
+## Lisans
+
+[MIT](LICENSE)

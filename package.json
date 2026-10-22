@@ -2,24 +2,70 @@
   "name": "incibase",
   "version": "0.1.0",
   "description": "Zod-typed backend-as-a-service in a single Bun binary: realtime queries, auth, storage, scheduling and MCP.",
+  "license": "MIT",
+  "author": "Ömer Genç <omergnc1@gmail.com>",
+  "homepage": "https://github.com/omer-genc/incibase#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/omer-genc/incibase.git"
+  },
+  "bugs": {
+    "url": "https://github.com/omer-genc/incibase/issues"
+  },
+  "keywords": [
+    "bun",
+    "backend",
+    "baas",
+    "realtime",
+    "sqlite",
+    "zod",
+    "convex",
+    "pocketbase",
+    "mcp"
+  ],
   "type": "module",
-  "module": "src/index.ts",
+  "module": "./dist/lib/index.js",
+  "types": "./dist/lib/index.d.ts",
   "bin": {
     "incibase": "./src/cli.ts"
   },
   "exports": {
-    ".": "./src/index.ts",
-    "./server": "./src/server.ts",
-    "./client": "./src/client.ts",
-    "./react": "./src/react.ts"
+    ".": {
+      "types": "./dist/lib/index.d.ts",
+      "default": "./dist/lib/index.js"
+    },
+    "./server": {
+      "types": "./dist/lib/server.d.ts",
+      "default": "./dist/lib/server.js"
+    },
+    "./client": {
+      "types": "./dist/lib/client.d.ts",
+      "default": "./dist/lib/client.js"
+    },
+    "./react": {
+      "types": "./dist/lib/react.d.ts",
+      "default": "./dist/lib/react.js"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
-    "src"
+    "dist/lib",
+    "src",
+    "!src/dashboard"
   ],
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "typecheck": "bun check",
     "test": "bun test",
-    "build:binary": "bun scripts/build-binary.ts"
+    "build:binary": "bun scripts/build-binary.ts",
+    "build:package": "bun scripts/build-package.ts",
+    "prepublishOnly": "bun run typecheck && bun test && bun run build:package"
   },
   "dependencies": {
     "zod": "4.6.7"
@@ -47,6 +93,9 @@
   },
   "peerDependenciesMeta": {
     "react": {
+      "optional": true
+    },
+    "typescript": {
       "optional": true
     }
   }

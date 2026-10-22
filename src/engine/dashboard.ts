@@ -11,12 +11,18 @@ export function setEmbeddedDashboard(html: string) {
 }
 
 export async function buildDashboardHtml(): Promise<string> {
+  // The npm package ships the HTML prebuilt by scripts/build-package.ts
+  // instead of src/dashboard.
+  const source = join(import.meta.dir, "..", "dashboard", "index.html");
+  if (!(await Bun.file(source).exists())) {
+    return Bun.file(join(import.meta.dir, "..", "..", "dist", "lib", "dashboard.html")).text();
+  }
   // Built at runtime so the bundler cannot resolve it: binaries embed the
   // finished HTML and must not carry Tailwind (~800 KB).
   const pluginName = ["bun-plugin", "tailwind"].join("-");
   const tailwind = (await import(pluginName)).default;
   const result = await Bun.build({
-    entrypoints: [join(import.meta.dir, "..", "dashboard", "index.html")],
+    entrypoints: [source],
     compile: true,
     target: "browser",
     minify: true,
