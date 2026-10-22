@@ -9,10 +9,13 @@ import { describeApp } from "./engine/describe.ts";
 import { embeddedRuntime } from "./engine/embedded.ts";
 import { Engine, type AppDefinition } from "./engine/engine.ts";
 import { ConfigError, DefinitionError, describeExit, exitCodeOf, ExitCode } from "./engine/exit-codes.ts";
-import { listenError, startServer } from "./engine/http.ts";
+import { listenError } from "./engine/http.ts";
+import { checkListenFlags, startListeners, type Listeners } from "./engine/listeners.ts";
 import { loadAppFromDir, schemaOf } from "./engine/loader.ts";
 import { color, isJson, logEvent, parseLogFormat, setLogFormat, stripQuery } from "./engine/log.ts";
 import { MigrationError } from "./engine/migrate.ts";
+import { handleReloads, serviceKeysFromEnv, type ReloadTarget } from "./engine/service-keys.ts";
+import { checkHostedSecrets } from "./engine/surface.ts";
 import { DataDirLockedError, readMeta } from "./engine/store.ts";
 import { VERSION } from "./engine/version.ts";
 
@@ -37,6 +40,13 @@ Options:
   --outfile <path>  Output for build (default: ./app)
   --target <t>      Build target, e.g. bun-linux-x64 (default: this machine)
   --no-dashboard    Do not serve the admin dashboard at /_/
+  --socket <path>   Listen on this unix socket instead of --port/--host,
+                    behind a proxy (serve; needs --url)
+  --admin-socket <path>
+                    Serve the dashboard and admin API only on this unix
+                    socket, for localhost names (an SSH tunnel); the main
+                    listener then refuses the admin key. Needs
+                    INCIBASE_ADMIN_KEY and INCIBASE_STORAGE_SECRET (serve)
   --log-format <f>  text (default) or json: one JSON object per line on
                     stdout (serve, dev; default: $INCIBASE_LOG_FORMAT)
   --allow-field-removal
@@ -72,6 +82,8 @@ function parse(argv: string[]) {
       outfile: { type: "string", default: "./app" },
       target: { type: "string" },
       "no-dashboard": { type: "boolean", default: false },
+      socket: { type: "string" },
+      "admin-socket": { type: "string" },
       "log-format": { type: "string" },
       "allow-field-removal": { type: "boolean", default: false },
       dev: { type: "boolean", default: false },
@@ -211,6 +223,9 @@ async function loadEmbedded(embedded: EmbeddedApp): Promise<AppDefinition> {
 }
 
 async function serve(values: Values, embedded?: EmbeddedApp) {
+  // First of all: SIGHUP (a reload) would otherwise end a process that is still starting.
+  const reload: ReloadTarget = {};
+  if (values["admin-socket"] !== undefined || process.env.INCIBASE_SERVICE_KEYS_FILE) handleReloads(reload);
   const dev = values.dev;
   let port: number;
   let publicUrl: string;
@@ -218,11 +233,27 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
   try {
     port = portOf(values.port ?? process.env.PORT ?? "3210");
     publicUrl = (values.url ?? process.env.INCIBASE_URL ?? `http://localhost:${port}`).replace(/\/+$/, "");
+    checkListenFlags({
+      socket: values.socket,
+      adminSocket: values["admin-socket"],
+      port: values.port,
+      host: values.host,
+      url: values.url ?? process.env.INCIBASE_URL,
+    });
     if (!embedded && !statSync(values.dir, { throwIfNoEntry: false })?.isDirectory()) {
       throw new ConfigError(`No app directory ${values.dir}: pass --dir, or create one with: incibase init`);
     }
+    if (values["admin-socket"] !== undefined) checkHostedSecrets(join(values.data, "data.db"));
+    reload.keys = serviceKeysFromEnv();
     const app = embedded ? await loadEmbedded(embedded) : await loadAppFromDir(values.dir);
-    engine = new Engine(app, { dataDir: values.data, dev, publicUrl, allowFieldRemoval: values["allow-field-removal"] });
+    engine = new Engine(app, {
+      dataDir: values.data,
+      dev,
+      publicUrl,
+      allowFieldRemoval: values["allow-field-removal"],
+      serviceKeys: reload.keys,
+    });
+    reload.realtime = engine.realtime;
   } catch (err) {
     exitOnStartError(err);
   }
@@ -256,9 +287,9 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
   engine.start();
   const dashboard = !values["no-dashboard"];
   const hostname = values.host ?? (dev ? "localhost" : "0.0.0.0");
-  let server: ReturnType<typeof startServer>;
+  let server: Listeners;
   try {
-    server = startServer(engine, { port, hostname, dashboard });
+    server = await startListeners(engine, { port, hostname, dashboard, socket: values.socket, adminSocket: values["admin-socket"] });
   } catch (err) {
     await engine.stop().catch(() => {});
     // An address in use may clear up (exit 75); a host that does not resolve or a port this user may not bind will not.
@@ -274,7 +305,8 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
     logEvent("info", {
       ev: "ready",
       url: stripQuery(publicUrl),
-      listen: server.url.origin,
+      listen: server.listen,
+      ...(server.admin ? { admin: values["admin-socket"] } : {}),
       version: VERSION,
       dev,
       functions: engine.functions.size,
@@ -289,9 +321,9 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
   } else {
     console.log(`
 ${color.bold(`incibase ${VERSION}`)}${dev ? " (dev)" : ""}  ${engine.functions.size} function(s), ${tableCount} table(s)
-  API       ${publicUrl}/api${dashboard ? `\n  Dashboard ${publicUrl}/_/` : ""}
+  API       ${publicUrl}/api${dashboard && !server.admin ? `\n  Dashboard ${publicUrl}/_/` : ""}
   Realtime  ${publicUrl.replace(/^http/, "ws")}/api/ws
-  MCP       ${mcpUrl}
+  MCP       ${mcpUrl}${values.socket ? `\n  Socket    ${values.socket}` : ""}${server.admin ? `\n  Admin     ${values["admin-socket"]} (admin API, MCP admin tools${dashboard ? ", dashboard at /_/" : ""})` : ""}
   Data      ${resolve(values.data)}`);
     if (dev) {
       console.log(`  Admin key ${engine.adminKey}

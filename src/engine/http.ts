@@ -11,12 +11,25 @@ import { ConfigError } from "./exit-codes.ts";
 import { ridFrom, withRid } from "./log.ts";
 import { handleMcp } from "./mcp.ts";
 import type { SocketData } from "./realtime.ts";
+import { allowsInternal, hasScope } from "./service-keys.ts";
+import { adminRequestRefusal, corsOriginsFromEnv, routesFor, type Surface } from "./surface.ts";
 import { VERSION } from "./version.ts";
 
 export interface ServeOptions {
   port: number;
   hostname?: string;
-  /** Allowed CORS origins. Default `*` (auth uses bearer tokens, not cookies). */
+  /**
+   * Listen on this unix socket instead of `port` and `hostname`, behind a
+   * front proxy that owns the HTTP timeouts. `startListeners` (listeners.ts)
+   * removes a stale socket at the path first and sets mode 0770 after binding.
+   */
+  unix?: string;
+  /** What this listener serves and accepts (see surface.ts). Default `"combined"`, everything as in 0.2.0. */
+  surface?: Surface;
+  /**
+   * Allowed CORS origins. Default `INCIBASE_CORS_ORIGINS` or `*` (auth uses
+   * bearer tokens, not cookies). The admin surface sends no CORS headers.
+   */
   corsOrigins?: string[] | "*";
   /** Serve the admin dashboard at `/_/`. Default true. */
   dashboard?: boolean;
@@ -109,12 +122,14 @@ type Handler = (req: Request & { params: Record<string, string> }, server: Serve
 
 export function startServer(engine: Engine, options: ServeOptions): Server<SocketData> {
   const dev = !!engine.options.dev;
-  const origins = options.corsOrigins ?? "*";
+  const surface = options.surface ?? "combined";
+  const origins = options.corsOrigins ?? (surface === "admin" ? undefined : corsOriginsFromEnv()) ?? "*";
   const maxJsonBytes = options.maxJsonBytes ?? maxJsonBytesFromEnv() ?? DEFAULT_MAX_JSON_BYTES;
 
   const cors = (req: Request): Record<string, string> => {
     const origin = req.headers.get("origin");
-    if (!origin) return {};
+    // The admin surface is for its own origin only (the tunnel's), never cross-site.
+    if (!origin || surface === "admin") return {};
     if (origins !== "*" && !origins.includes(origin)) return {};
     return {
       "access-control-allow-origin": origins === "*" ? "*" : origin,
@@ -192,7 +207,7 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
         }
         const path = getFunctionPath(body.path);
         const identity = engine.auth.identifyRequest(req);
-        const value = await engine.call(path, body?.args ?? {}, identity, { expectType: type, allowInternal: identity.admin });
+        const value = await engine.call(path, body?.args ?? {}, identity, { expectType: type, allowInternal: allowsInternal(identity) });
         return Response.json({ value });
       },
     });
@@ -207,6 +222,27 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
   };
 
   const bearer = (req: Request) => req.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? null;
+
+  /**
+   * What a split surface answers before any route runs, or null to go on: the
+   * admin surface refuses other Host and Origin headers, and each surface the
+   * bearer it does not accept (the admin key on public, service keys on admin).
+   */
+  const refuse = (req: Request): Response | null => {
+    if (surface === "combined") return null;
+    if (surface === "admin") {
+      const reason = adminRequestRefusal(req);
+      if (reason) return Response.json({ error: { code: "FORBIDDEN", message: reason } }, { status: 403 });
+    }
+    try {
+      engine.auth.assertAccepted(bearer(req), surface);
+    } catch (err) {
+      return withCors(req, errorResponse(err));
+    }
+    return null;
+  };
+
+  const notFound = (req: Request) => withCors(req, Response.json({ error: { code: "NOT_FOUND", message: "Not found" } }, { status: 404 }));
 
   const mcp = route({
     GET: (req) => handleMcp(engine, req),
@@ -241,14 +277,17 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
   };
 
   return Bun.serve<SocketData>({
-    port: options.port,
-    hostname: options.hostname,
+    ...(options.unix
+      ? // The front proxy owns the timeouts: Bun's default (10 s) would cut requests it still waits for.
+        // Bun's types leave idleTimeout out for unix sockets, but it applies there too.
+        ({ unix: options.unix, idleTimeout: 0 } as { unix: string })
+      : { port: options.port, hostname: options.hostname }),
     // Bun's debug error pages show messages and source; keep them to dev.
     development: dev,
     // Routes read their bodies with their own limits; this caps everything else (HTTP actions).
     maxRequestBodySize: Math.max(engine.storage.maxUploadBytes, maxJsonBytes) + 1024 * 1024,
     error: (err) => errorResponse(err),
-    routes: {
+    routes: routesFor(surface, refuse, notFound, {
       "/api/health": route({ GET: () => Response.json({ ok: true, version: VERSION, startedAt: engine.startedAt }) }),
       "/api/query": callRoute("query"),
       "/api/mutation": callRoute("mutation"),
@@ -280,8 +319,8 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
         POST: async (req) => {
           const url = new URL(req.url);
           const identity = engine.auth.identifyRequest(req);
-          // The signed upload URL decides visibility; an admin may pass ?visibility= directly.
-          const grant = identity.admin
+          // The signed upload URL decides visibility; an admin (or the upload scope) may pass ?visibility= directly.
+          const grant = identity.admin || hasScope(identity, "upload")
             ? { visibility: (url.searchParams.get("visibility") ?? undefined) as "public" | "private" | undefined, ownerId: null }
             : engine.storage.verifyUploadToken(url.searchParams.get("token"));
           if (!grant) {
@@ -341,7 +380,7 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
       "/api/ws": (req: Request, server: Server<SocketData>) => {
         try {
           const { identity, session } = engine.auth.authenticateRequest(req);
-          const data: SocketData = { identity, session, subs: new Map(), maxSubscriptionBytes: maxJsonBytes };
+          const data: SocketData = { identity, session, subs: new Map(), maxSubscriptionBytes: maxJsonBytes, surface };
           if (server.upgrade(req, { data })) return undefined;
           return new Response("Expected a WebSocket upgrade", { status: 426 });
         } catch (err) {
@@ -350,13 +389,14 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
       },
 
       "/mcp": mcp,
-    },
+    }),
 
     // The app's own responses are left as they are: the id is only for the log.
-    fetch: (req) => withRid(ridFrom(req.headers.get("x-request-id")), () => httpAction(req)),
+    fetch: (req) => refuse(req) ?? withRid(ridFrom(req.headers.get("x-request-id")), () => httpAction(req)),
 
     websocket: {
-      idleTimeout: 120,
+      // Behind a proxy (unix socket) the first ping comes before common 60-100 s idle cutoffs.
+      idleTimeout: options.unix ? 60 : 120,
       sendPings: true,
       // Larger messages close the connection.
       maxPayloadLength: maxJsonBytes,

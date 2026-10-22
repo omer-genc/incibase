@@ -5,7 +5,7 @@ import { getFunctionPath, type FunctionType, type RegisteredFunction } from "../
 import { IncibaseError, isIncibaseError } from "../errors.ts";
 import type { SchemaDefinition } from "../schema.ts";
 import { ID_TABLE_RESOLVER } from "../values.ts";
-import type { ActionCtx, CronJobs, HttpRouter } from "../server.ts";
+import type { ActionCtx, CronJobs, HttpRouter, ServiceIdentity } from "../server.ts";
 import { AuthService } from "./auth.ts";
 import { DbSession, ValidationError } from "./database.ts";
 import { DefinitionError } from "./exit-codes.ts";
@@ -15,6 +15,7 @@ import { migrate, type MigrationReport } from "./migrate.ts";
 import type { ReadSet } from "./readset.ts";
 import { Realtime } from "./realtime.ts";
 import { Scheduler, validateCrons } from "./scheduler.ts";
+import type { ServiceKeys } from "./service-keys.ts";
 import { StorageService, type StorageOptions } from "./storage.ts";
 import { ensurePrivateDir, Store } from "./store.ts";
 
@@ -34,6 +35,8 @@ export interface EngineOptions {
   quiet?: boolean;
   /** Let a migration delete stored fields the schema no longer has (otherwise it is refused). */
   allowFieldRemoval?: boolean;
+  /** Service keys (`ik_svc_…`) accepted besides sessions and the admin key. */
+  serviceKeys?: ServiceKeys | null;
 }
 
 export interface Identity {
@@ -41,6 +44,8 @@ export interface Identity {
   admin: boolean;
   /** Scheduled jobs and crons: trusted server code without a user. */
   system?: boolean;
+  /** The service key the caller used; `userId` is set when it acts as a user. Never admin. */
+  service?: ServiceIdentity | null;
 }
 
 export const ANONYMOUS: Identity = { userId: null, admin: false };
@@ -361,6 +366,7 @@ export class Engine {
   private authFor(identity: Identity, loadUser: () => Promise<any>) {
     return {
       isAdmin: identity.admin,
+      service: identity.service ? Object.freeze({ keyId: identity.service.keyId, scopes: Object.freeze([...identity.service.scopes]) }) : null,
       getUserId: async () => identity.userId,
       getUser: async () => (identity.userId ? await loadUser() : null),
       requireUser: async () => {

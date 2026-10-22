@@ -95,6 +95,21 @@ export interface Auth {
   requireUser(): Promise<AuthUser>;
   /** True when the caller used the admin key. */
   readonly isAdmin: boolean;
+  /**
+   * The service key (`ik_svc_<id>_…`) the caller used, or null. Another
+   * server calls with one where the admin key is not accepted (hosted setups);
+   * it is never the admin, so `isAdmin` is false for it.
+   */
+  readonly service: ServiceIdentity | null;
+}
+
+/** What a service key may do: call internal functions, act as a user (`x-incibase-as-user`), upload without a signed URL. */
+export type ServiceScope = "internal" | "impersonate" | "upload";
+
+export interface ServiceIdentity {
+  /** The key's id, the `<id>` in `ik_svc_<id>_<secret>`. */
+  keyId: string;
+  scopes: readonly ServiceScope[];
 }
 
 export type FileVisibility = "public" | "private";

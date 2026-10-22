@@ -149,7 +149,8 @@ export class StorageService {
       options.cleanup === false || process.env.INCIBASE_STORAGE_CLEANUP === "off"
         ? null
         : { unattachedHours: options.cleanup?.unattachedHours ?? 24, detachedHours: options.cleanup?.detachedHours ?? 1 };
-    let secret = engine.store.getMeta("storage_secret");
+    // From the environment (hosted mode), it is never read from or written to the database.
+    let secret = process.env.INCIBASE_STORAGE_SECRET || engine.store.getMeta("storage_secret");
     if (!secret) {
       secret = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
       engine.store.setMeta("storage_secret", secret);
