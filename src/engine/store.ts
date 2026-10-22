@@ -1,13 +1,14 @@
 import { Database } from "bun:sqlite";
 import type { z } from "zod";
 import type { IndexDefinition } from "../schema.ts";
+import type { StorageField } from "./files.ts";
 import { ID_REGEX } from "../values.ts";
 
 const ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";
 
 export const SYSTEM_TABLES: Record<string, { number: number; indexes: IndexDefinition[] }> = {
   _users: { number: 1, indexes: [{ name: "by_email", fields: ["email"], unique: true }] },
-  _storage: { number: 2, indexes: [] },
+  _storage: { number: 2, indexes: [{ name: "by_owner", fields: ["ownerId"], unique: false }] },
   _scheduled: { number: 3, indexes: [{ name: "by_state_runAt", fields: ["state", "runAt"], unique: false }] },
 };
 export const FIRST_USER_TABLE_NUMBER = 16;
@@ -19,6 +20,8 @@ export interface TableInfo {
   system: boolean;
   validator?: z.ZodObject<any, any>;
   indexes: IndexDefinition[];
+  /** Fields holding `_storage` ids (`file()` or `id("_storage")`). */
+  storageFields?: StorageField[];
 }
 
 export interface Document {

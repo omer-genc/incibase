@@ -5,7 +5,7 @@ import type { DbSession } from "./database.ts";
 import type { Engine, Identity } from "./engine.ts";
 import { quoteIdent, rowToDoc, type DocumentRow } from "./store.ts";
 
-const SYSTEM_IDENTITY: Identity = { userId: null, admin: false };
+const SYSTEM_IDENTITY: Identity = { userId: null, admin: false, system: true };
 const MAX_TIMEOUT = 2 ** 31 - 1;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_CONCURRENT = 8;
@@ -40,7 +40,10 @@ export class Scheduler {
       }
     });
     for (const job of this.engine.crons?.jobs ?? []) this.startCron(job);
-    this.pruneTimer = setInterval(() => void this.prune(), 60 * 60 * 1000);
+    this.pruneTimer = setInterval(() => {
+      void this.prune();
+      void this.engine.storage.cleanup().catch((err) => console.error("[incibase] storage cleanup failed:", err));
+    }, 60 * 60 * 1000);
     this.poke();
   }
 

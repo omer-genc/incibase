@@ -2,6 +2,8 @@ import type { Database } from "bun:sqlite";
 import { z } from "zod";
 import { IncibaseError } from "../errors.ts";
 import type { IndexDefinition } from "../schema.ts";
+import type { Identity } from "./engine.ts";
+import { syncFiles } from "./files.ts";
 import type { Change, RangeRead, ReadSet } from "./readset.ts";
 import { fieldExpr, quoteIdent, rowToDoc, type Document, type DocumentRow, type Store, type TableInfo } from "./store.ts";
 
@@ -197,6 +199,7 @@ export class QueryBuilder {
         const doc = rowToDoc(row);
         last = cols.map((_, i) => row[`c${i}`]);
         if (this.predicates.every((p) => p(doc))) {
+          this.session.loadedIds.add(doc._id);
           docs.push(doc);
           if (docs.length >= max) {
             return { docs, last, done: rows.length < limit && row === rows.at(-1) };
@@ -248,12 +251,16 @@ export class DbSession {
   readonly reads: ReadSet[] = [];
   /** Documents this transaction wrote, with their before/after state. */
   readonly changes: Change[] = [];
+  /** Documents this execution loaded; their private files may be handed out (see storage.getUrl). */
+  readonly loadedIds = new Set<string>();
   private readonly commitHooks: (() => void)[] = [];
 
   constructor(
     readonly store: Store,
     readonly conn: Database,
     readonly writable: boolean,
+    /** Who writes; undefined for trusted engine code. */
+    readonly identity?: Identity,
   ) {}
 
   track(read: ReadSet) {
@@ -302,25 +309,31 @@ export class DbSession {
   }
 
   private validate(table: TableInfo, value: unknown): string {
+    return this.validated(table, value).data;
+  }
+
+  private validated(table: TableInfo, value: unknown): { data: string; value: Record<string, unknown> } {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
       throw new ValidationError(`Document for "${table.name}" must be an object`);
     }
     for (const key of Object.keys(value)) {
       if (key.startsWith("_")) throw new ValidationError(`System field "${key}" cannot be written`);
     }
-    if (!table.validator) return JSON.stringify(value);
+    if (!table.validator) return { data: JSON.stringify(value), value: value as Record<string, unknown> };
     const result = table.validator.safeParse(value);
     if (!result.success) {
       throw new ValidationError(`Invalid document for "${table.name}":\n${z.prettifyError(result.error)}`, result.error.issues);
     }
-    return JSON.stringify(result.data);
+    return { data: JSON.stringify(result.data), value: result.data };
   }
 
   private load(table: TableInfo, id: string): Document | null {
     const row = this.conn
       .query(`SELECT _id, _creationTime, data FROM ${quoteIdent(table.name)} WHERE _id = ?`)
       .get(id) as DocumentRow | null;
-    return row ? rowToDoc(row) : null;
+    if (!row) return null;
+    this.loadedIds.add(id);
+    return rowToDoc(row);
   }
 
   private unique<T>(fn: () => T): T {
@@ -355,8 +368,10 @@ export class DbSession {
     this.assertWritable();
     const table = this.tableNamed(tableName);
     if (table.system) throw new Error(`System table "${tableName}" is read-only`);
-    const data = this.validate(table, value);
-    return this.insertRaw(table, data);
+    const { data, value: parsed } = this.validated(table, value);
+    const id = this.insertRaw(table, data);
+    syncFiles(this, table, id, null, parsed);
+    return id;
   }
 
   async patch(id: string, value: Record<string, unknown>): Promise<void> {
@@ -374,20 +389,28 @@ export class DbSession {
       if (v === undefined) delete fields[key];
       else fields[key] = v;
     }
-    this.updateRaw(table, id, this.validate(table, fields));
+    const { data, value: parsed } = this.validated(table, fields);
+    this.updateRaw(table, id, data);
+    syncFiles(this, table, id, current, parsed);
   }
 
   async replace(id: string, value: Record<string, unknown>): Promise<void> {
     this.assertWritable();
     const table = this.writableTable(id);
-    if (!this.load(table, id)) throw new IncibaseError({ code: "NOT_FOUND", message: `Document "${id}" not found` });
+    const current = this.load(table, id);
+    if (!current) throw new IncibaseError({ code: "NOT_FOUND", message: `Document "${id}" not found` });
     const { _id, _creationTime, ...fields } = value ?? {};
-    this.updateRaw(table, id, this.validate(table, fields));
+    const { data, value: parsed } = this.validated(table, fields);
+    this.updateRaw(table, id, data);
+    syncFiles(this, table, id, current, parsed);
   }
 
   async delete(id: string): Promise<void> {
     this.assertWritable();
-    this.deleteRaw(this.writableTable(id), id);
+    const table = this.writableTable(id);
+    const current = this.load(table, id);
+    this.deleteRaw(table, id);
+    syncFiles(this, table, id, current, null);
   }
 
   // Unvalidated writes, used by the engine (system tables, admin tools).

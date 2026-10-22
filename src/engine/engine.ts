@@ -35,6 +35,8 @@ export interface EngineOptions {
 export interface Identity {
   userId: string | null;
   admin: boolean;
+  /** Scheduled jobs and crons: trusted server code without a user. */
+  system?: boolean;
 }
 
 export const ANONYMOUS: Identity = { userId: null, admin: false };
@@ -164,10 +166,11 @@ export class Engine {
   // Transactions
 
   /** Serialized write transaction on the write connection. Notifies subscribers after commit. */
-  writeTx<T>(fn: (session: DbSession) => Promise<T> | T): Promise<T> {
+  /** `identity` is who writes, for file ownership checks; omitted means trusted engine code. */
+  writeTx<T>(fn: (session: DbSession) => Promise<T> | T, identity?: Identity): Promise<T> {
     return this.writeLock.run(async () => {
       const db = this.store.write;
-      const session = new DbSession(this.store, db, true);
+      const session = new DbSession(this.store, db, true, identity);
       db.run("BEGIN IMMEDIATE");
       let result: T;
       try {
@@ -250,8 +253,9 @@ export class Engine {
         value = result;
         reads = session.reads;
       } else if (fn.type === "mutation") {
-        value = await this.writeTx(async (session) =>
-          this.finish(fn, await fn.handler(this.mutationCtx(session, identity), parsed)),
+        value = await this.writeTx(
+          async (session) => this.finish(fn, await fn.handler(this.mutationCtx(session, identity), parsed)),
+          identity,
         );
       } else {
         value = this.finish(fn, await fn.handler(this.actionCtx(identity), parsed));

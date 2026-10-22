@@ -145,12 +145,12 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
           if (!grant) {
             throw new IncibaseError({ code: "FORBIDDEN", message: "Invalid or expired upload URL" });
           }
+          const declared = Number(req.headers.get("content-length"));
+          if (grant.maxBytes !== undefined && declared > grant.maxBytes) {
+            throw new IncibaseError({ code: "FILE_TOO_LARGE", message: `File exceeds ${grant.maxBytes} bytes` });
+          }
           const blob = await req.blob();
-          const storageId = await engine.storage.store(blob, {
-            contentType: req.headers.get("content-type") ?? undefined,
-            visibility: grant.visibility,
-            ownerId: grant.ownerId,
-          });
+          const storageId = await engine.storage.store(blob, { ...grant, contentType: req.headers.get("content-type") ?? undefined });
           return Response.json({ storageId });
         },
       }),

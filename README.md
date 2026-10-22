@@ -6,7 +6,7 @@ Bun üzerinde çalışan, tek bir binary olarak dağıtılabilen backend-as-a-se
 - **Fonksiyonlar:** `query` (realtime, salt-okunur), `mutation` (transaction), `action` (dış dünya, `fetch`), `internal*` varyantları, HTTP route'ları.
 - **Uçtan uca tipler:** `client.query(api.messages.list, { channel })` dönüş tipini sunucu koddan çıkarır; codegen kullanıcı kodunu çalıştırmaz, sadece dosya adlarından tip dosyası üretir.
 - **Realtime:** WebSocket abonelikleri. Her sorgunun okuduğu aralık (index `eq`/aralık koşulları, `where` eşitlikleri, `get(id)`) kaydedilir; bir yazma yalnızca belgenin önceki ya da sonraki hâli o aralığa giriyorsa aboneliği yeniden çalıştırır. Yazma patlamaları 10 ms'lik pencerede birleştirilir, sonuç değişmediyse istemciye gönderilmez.
-- **Auth** (e-posta/şifre, bearer token), **dosya depolama** (yerel disk veya S3), **zamanlayıcı** (`ctx.scheduler`, cron), **otomatik migration**.
+- **Auth** (e-posta/şifre, bearer token), **dosya depolama** (yerel disk veya S3; kayda bağlı `file()` alanları, private dosyalar, yükleme kısıtları, otomatik temizlik), **zamanlayıcı** (`ctx.scheduler`, cron), **otomatik migration**.
 - **MCP:** `/mcp` endpoint'i. `mcp: true` işaretli fonksiyonlar AI ajanlarına tool olur; admin anahtarıyla bağlanan ajan şemayı, veriyi ve logları görür.
 
 ## Hızlı başlangıç
@@ -85,22 +85,40 @@ Mutation'lar sırayla, her biri ayrı bir SQLite transaction'ında çalışır; 
 
 ## Dosyalar ve erişim
 
-```ts
-// Yükleme: istemci bu URL'ye dosyayı POST eder, yanıt { storageId }.
-await ctx.storage.generateUploadUrl();                          // public, sahibi çağıran kullanıcı
-await ctx.storage.generateUploadUrl({ visibility: "private" }); // gizli
-await ctx.storage.generateUploadUrl({ visibility: "private", ownerId: employee }); // başkası adına
+Bir kayda ait dosyalar için şemada `file()` kullan (PocketBase'deki dosya alanı gibi):
 
-await ctx.storage.getUrl(id);                     // public: kalıcı link; private: sahibine 1 saatlik imzalı link
-await ctx.storage.getUrl(id, { expiresIn: 600 }); // imzalı link süresi (sn)
-await ctx.storage.setVisibility(id, "private");
+```ts
+products: defineTable({
+  name: z.string(),
+  image: file({ maxBytes: 5_000_000, contentTypes: ["image/*"] }),
+  invoice: file({ private: true, contentTypes: ["application/pdf"] }).optional(),
+  gallery: z.array(file({ contentTypes: ["image/*"] })).default([]),
+}),
 ```
 
-- **public** (varsayılan): `/api/storage/<id>` linkini bilen herkes açar.
-- **private**: yalnızca imzalı, süreli linkle açılır; düz link 403 döner. Süre bir aralığa yuvarlanır, böylece canlı sorgular her yeniden çalıştığında aynı linki üretir.
-- **Sahiplik:** Her dosyanın bir sahibi vardır (yükleme URL'sini isteyen kullanıcı ya da `ownerId`). Private dosyanın linki yalnızca sahibine verilir (başkasına `getUrl` → `null`); `setVisibility` ve `delete` yalnızca sahibine açıktır (`FORBIDDEN`). Böylece birinin id'sini öğrenip başkasının dosyasına erişmek mümkün olmaz.
-- **Asıl yetki senin verinde:** "Bu dosyayı kim görebilir?" sorusunun cevabı genellikle kendi tablolarındadır (ör. `payslips: { employee, file }`). Sorgu erişimi bu tabloya göre kontrol eder, sonra `getUrl(id, { bypassOwnerCheck: true })` ile linki verir. Örnek: `example/incibase/payslips.ts` (İK çalışan adına yükler, çalışan ve İK görür, başkası göremez).
-- Başkasının dosya id'sini kendi kaydına bağlamayı engellemek için yazarken `getMetadata(id).ownerId` kontrol et (bkz. `messages.send`).
+- **Yazarken:** dosya yazanın kendi yüklemesi olmalı (admin/zamanlanmış görevler hariç) ve başka bir kayda bağlı olmamalı (`FORBIDDEN`, `FILE_IN_USE`). Alan kısıtları (`maxBytes`, `contentTypes`) burada da denetlenir. Elle `ownerId` kontrolüne gerek yok.
+- **Okurken:** kaydı okuyabilen sorgu, kaydın dosyalarının linkini alır (`ctx.storage.getUrl`) — `private` olsa bile. Yalnızca dosya id'sini bilen başkası link alamaz. Yani **kayda erişen dosyaya erişir**; erişim kuralı sorgunun kendisidir.
+- **Görünürlük alandan gelir:** `file({ private: true })` alanındaki dosyalar yalnızca imzalı, süreli linkle açılır (varsayılan 1 saat, `getUrl(id, { expiresIn })`). Public alanlar kalıcı, önbelleğe alınabilir link verir.
+- **Temizlik:** alan değişince ya da kayıt silinince eski dosya ayrılır ve 1 saat sonra silinir; hiçbir kayda bağlanmayan yüklemeler 24 saat sonra silinir. `id("_storage")` alanlarının gösterdiği dosyalar ve bu özellikten önce yüklenmiş dosyalar silinmez. Ayar: `StorageOptions.cleanup` ya da `INCIBASE_STORAGE_CLEANUP=off`.
+- Aynı dosyayı birden çok kayıtta kullanmak için `id("_storage")` (serbest referans) kullan; o durumda erişim kurallarını sahiplik ve `bypassOwnerCheck` ile kendin kurarsın.
+
+### Yükleme ve kısıtlar
+
+```ts
+export const generateUploadUrl = mutation({
+  handler: async (ctx) => {
+    const user = await ctx.auth.requireUser();                       // kim yükleyebilir: sen karar verirsin
+    if ((await ctx.storage.usage(user._id)).bytes > 500e6) throw new IncibaseError("Kota doldu"); // kota
+    return ctx.storage.generateUploadUrl({ maxBytes: 10e6, contentTypes: ["image/*", "application/pdf"] });
+  },
+});
+```
+
+- Yükleme yalnızca bir mutation'ın ürettiği imzalı URL ile yapılabilir (1 saat geçerli); dolayısıyla **kimin** yükleyebileceğini o mutation belirler.
+- URL'ye gömülen `maxBytes` / `contentTypes` sunucu tarafından yükleme anında denetlenir (`FILE_TOO_LARGE`, `UNSUPPORTED_FILE_TYPE`). PNG, JPEG, GIF, WebP ve PDF türü istemcinin söylediğine değil dosyanın baytlarına göre belirlenir.
+- `ctx.storage.usage(userId)` kullanıcının dosya sayısını ve toplam boyutunu verir; kotayı uygulama belirler. Sunucu genelinde üst sınır `maxUploadBytes` (100 MB).
+- Dosyalar `nosniff`, script çalıştırmayan bir CSP (`sandbox`) ve tarayıcıda gösterilemeyen türlerde `Content-Disposition: attachment` ile servis edilir; yüklenen bir HTML/SVG aynı origin'deki panele veya API'ye script çalıştıramaz.
+- Sahiplik: dosyanın sahibi yükleme URL'sini isteyen kullanıcıdır (`generateUploadUrl({ ownerId })` ile başkası adına). Serbest `id("_storage")` referanslarında private dosyanın linki yalnızca sahibine verilir, `setVisibility`/`delete` yalnızca sahibine açıktır; erişimi kendin kontrol ettiysen `{ bypassOwnerCheck: true }`.
 
 ## İstemci
 

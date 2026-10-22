@@ -116,18 +116,25 @@ export interface UploadOptions {
    * employee the owner), or null for a file only server code can hand out.
    */
   ownerId?: Id<"_users"> | null;
+  /** Reject uploads larger than this many bytes. */
+  maxBytes?: number;
+  /** Accepted content types, e.g. `["image/*", "application/pdf"]`. PNG, JPEG, GIF, WebP and PDF are detected from the bytes. */
+  contentTypes?: string[];
 }
 
 export interface StorageReader {
   /**
    * URL to download a file. Public files get a plain, permanent URL. Private
    * files get a signed URL that stops working after `expiresIn` seconds
-   * (default 3600), and only for their owner unless `bypassOwnerCheck`.
+   * (default 3600), for their owner, for code that loaded the document whose
+   * `file()` field holds the file, or with `bypassOwnerCheck`.
    * Null if the file does not exist or the caller may not read it.
    */
   getUrl(id: Id<"_storage">, options?: OwnerCheckOptions & { expiresIn?: number }): Promise<string | null>;
   /** Includes `ownerId`, so code can check a file belongs to the user before storing a reference to it. */
   getMetadata(id: Id<"_storage">): Promise<SystemDataModel["_storage"]["document"] | null>;
+  /** Files and total bytes a user owns, for upload quotas. */
+  usage(userId: Id<"_users">): Promise<{ files: number; bytes: number }>;
 }
 
 export interface StorageWriter extends StorageReader {

@@ -4,6 +4,8 @@ import { IncibaseClient, IncibaseRequestError } from "incibase/client";
 import { api } from "../example/incibase/_generated/api";
 import { memoryStorage, nextValue, startTestServer } from "./helpers.ts";
 
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, 0x49, 0x48, 0x44, 0x52]);
+
 let t: Awaited<ReturnType<typeof startTestServer>>;
 let alice: IncibaseClient;
 let bob: IncibaseClient;
@@ -216,13 +218,31 @@ describe("scheduler", () => {
 describe("storage", () => {
   test("upload, attach and download a file", async () => {
     const uploadUrl = await alice.mutation(api.messages.generateUploadUrl);
-    const storageId = await alice.storage.upload(uploadUrl, new Blob(["hello file"], { type: "text/plain" }));
+    // Declared as text, but the bytes are a PNG: the detected type wins.
+    const storageId = await alice.storage.upload(uploadUrl, new Blob([PNG], { type: "text/plain" }));
     await alice.mutation(api.messages.send, { channel: general, body: "with file", attachment: storageId });
     const [latest] = await alice.query(api.messages.list, { channel: general, limit: 1 });
     expect(latest!.attachmentUrl).toBe(`${t.url}/api/storage/${storageId}`);
     const res = await fetch(latest!.attachmentUrl!);
-    expect(res.headers.get("content-type")).toContain("text/plain");
-    expect(await res.text()).toBe("hello file");
+    expect(res.headers.get("content-type")).toBe("image/png");
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(PNG);
+  });
+
+  test("upload URLs enforce their size and type limits", async () => {
+    const uploadUrl = await alice.mutation(api.messages.generateUploadUrl);
+    const html = await alice.storage.upload(uploadUrl, new Blob(["<script>alert(1)</script>"], { type: "text/html" })).catch((e) => e);
+    expect(html.data.code).toBe("UNSUPPORTED_FILE_TYPE");
+    const big = await alice.storage.upload(uploadUrl, new Blob([new Uint8Array(10 * 1024 * 1024 + 1)], { type: "image/png" })).catch((e) => e);
+    expect(big.data.code).toBe("FILE_TOO_LARGE");
+  });
+
+  test("files are served so they can never run script on this origin", async () => {
+    const id = await alice.action(api.files.storeText, { text: "<svg onload=alert(1)>", visibility: "public" });
+    await t.engine.writeTx((s) => s.conn.query(`UPDATE _storage SET data = json_set(data, '$.contentType', 'text/html') WHERE _id = ?`).run(id));
+    const res = await fetch(`${t.url}/api/storage/${id}`);
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("content-security-policy")).toContain("sandbox");
+    expect(res.headers.get("content-disposition")).toBe("attachment");
   });
 
   test("private files open only through signed, unexpired URLs", async () => {
@@ -279,6 +299,7 @@ describe("storage", () => {
     expect(await bob.query(api.files.url, { id: payslip })).toBeNull();
     const flip = await bob.mutation(api.files.setVisibility, { id: payslip, visibility: "public" }).catch((e) => e);
     expect(flip.data.code).toBe("FORBIDDEN");
+    // The attachment field only accepts the sender's own uploads.
     const attach = await bob.mutation(api.messages.send, { channel: general, body: "look", attachment: payslip }).catch((e) => e);
     expect(attach.data.code).toBe("FORBIDDEN");
     expect((await fetch(`${t.url}/api/storage/${payslip}`)).status).toBe(403);
@@ -308,35 +329,35 @@ describe("storage", () => {
     expect(meta.value.document.visibility).toBe("public");
   });
 
-  test("HR uploads a payslip on an employee's behalf; access follows the payslips table", async () => {
+  test("payslip files are readable through the payslip row, by nobody else", async () => {
     const carol = t.client();
     await carol.auth.signUp({ email: "carol@example.com", password: "password123" });
     const aliceId = (await alice.auth.me())!._id;
     const bobId = (await bob.auth.me())!._id;
 
     // Not HR yet.
-    expect((await alice.mutation(api.payslips.generateUploadUrl, { employee: bobId }).catch((e) => e)).data.code).toBe("FORBIDDEN");
+    expect((await alice.mutation(api.payslips.generateUploadUrl).catch((e) => e)).data.code).toBe("FORBIDDEN");
     await t.engine.writeTx((s) => s.insert("hr", { userId: aliceId }));
 
-    const uploadUrl = await alice.mutation(api.payslips.generateUploadUrl, { employee: bobId });
-    const file = await alice.storage.upload(uploadUrl, new Blob(["bob: 100"], { type: "application/pdf" }));
+    const pdf = new Blob(["%PDF-1.4 bob: 100"], { type: "application/pdf" });
+    const file = await alice.storage.upload(await alice.mutation(api.payslips.generateUploadUrl), pdf);
     await alice.mutation(api.payslips.add, { employee: bobId, month: "2026-09", file });
 
-    // Bob owns the file and sees his payslip; HR sees it through the table; Carol sees nothing.
+    // Bob reads it through his payslip row; HR through the employee's rows; Carol cannot.
     const [mine] = await bob.query(api.payslips.mine);
-    expect(await (await fetch(mine!.url!)).text()).toBe("bob: 100");
-    expect(await bob.query(api.files.url, { id: file })).toContain("&sig=");
+    expect(await (await fetch(mine!.url!)).text()).toBe("%PDF-1.4 bob: 100");
     const [hrView] = await alice.query(api.payslips.forEmployee, { employee: bobId });
     expect(hrView!.url).toContain("&sig=");
-    expect(await alice.query(api.files.url, { id: file })).toBeNull();
     expect(await carol.query(api.payslips.mine)).toEqual([]);
-    expect(await carol.query(api.files.url, { id: file })).toBeNull();
     expect((await carol.query(api.payslips.forEmployee, { employee: bobId }).catch((e) => e)).data.code).toBe("FORBIDDEN");
+    // Knowing the id is not enough: a query that did not load the row gets no URL.
+    expect(await bob.query(api.files.url, { id: file })).toBeNull();
+    expect(await carol.query(api.files.url, { id: file })).toBeNull();
+    expect((await fetch(`${t.url}/api/storage/${file}`)).status).toBe(403);
 
-    // A file uploaded for someone else cannot be filed as a payslip for a third person.
-    const other = await alice.storage.upload(await alice.mutation(api.payslips.generateUploadUrl, { employee: bobId }), new Blob(["x"]));
-    const misfile = await alice.mutation(api.payslips.add, { employee: (await carol.auth.me())!._id, month: "2026-09", file: other }).catch((e) => e);
-    expect(misfile.data.code).toBe("BAD_REQUEST");
+    // One file, one document.
+    const again = await alice.mutation(api.payslips.add, { employee: bobId, month: "2026-10", file }).catch((e) => e);
+    expect(again.data.code).toBe("FILE_IN_USE");
   });
 
   test("upload URLs must be signed", async () => {

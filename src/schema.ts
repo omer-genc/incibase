@@ -110,10 +110,17 @@ export type SystemDataModel = {
         visibility?: "public" | "private";
         /** The user who uploaded it; missing for admin uploads and files stored before ownership existed. */
         ownerId?: Id<"_users">;
+        /** Uploaded without a signed-in user. */
+        anonymous?: boolean;
+        /** The document whose `file()` field holds this file. */
+        attachedTo?: { table: string; id: string; field: string };
+        /** Not (or no longer) attached; deleted by cleanup unless referenced. */
+        pending?: boolean;
+        detachedAt?: number;
       }
     >;
     insert: never;
-    indexes: { by_creation_time: ["_creationTime"] };
+    indexes: { by_creation_time: ["_creationTime"]; by_owner: ["ownerId"] };
   };
   _scheduled: {
     document: Expand<

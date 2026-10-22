@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { IndexDefinition, SchemaDefinition } from "../schema.ts";
+import { storageFieldsOf } from "./files.ts";
 import { toJsonSchema } from "./jsonschema.ts";
 import { FIRST_USER_TABLE_NUMBER, quoteIdent, type DocumentRow, type Store } from "./store.ts";
 
@@ -105,7 +106,7 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined): Mig
         JSON.stringify(indexes),
         name,
       );
-      store.register({ name, number, system: false, validator: def.validator, indexes });
+      store.register({ name, number, system: false, validator: def.validator, indexes, storageFields: storageFieldsOf(def.validator) });
     }
 
     for (const row of existing.values()) {

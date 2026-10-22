@@ -1,4 +1,4 @@
-import { defineSchema, defineTable, id, z } from "incibase/server";
+import { defineSchema, defineTable, file, id, z } from "incibase/server";
 
 export default defineSchema({
   channels: defineTable({
@@ -10,7 +10,8 @@ export default defineSchema({
     channel: id("channels"),
     author: id("_users"),
     body: z.string().min(1).max(2000),
-    attachment: id("_storage").optional(),
+    // Belongs to the message: only the sender's own upload fits, and it is deleted with the message.
+    attachment: file({ maxBytes: 10 * 1024 * 1024, contentTypes: ["image/*", "application/pdf"] }).optional(),
     pinned: z.boolean().default(false),
   }).index("by_channel", ["channel"]),
 
@@ -20,7 +21,8 @@ export default defineSchema({
   payslips: defineTable({
     employee: id("_users"),
     month: z.string().regex(/^\d{4}-\d{2}$/),
-    file: id("_storage"),
+    // Private: readable by code that can read the payslip row, nobody else.
+    file: file({ private: true, contentTypes: ["application/pdf"] }),
     uploadedBy: id("_users"),
   }).index("by_employee", ["employee", "month"]),
 

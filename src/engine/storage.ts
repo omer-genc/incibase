@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { S3Client } from "bun";
 import { IncibaseError } from "../errors.ts";
 import type { DbSession } from "./database.ts";
+import { contentTypeMatches, idsAt } from "./files.ts";
+import { quoteIdent } from "./store.ts";
 import type { Engine, Identity } from "./engine.ts";
 
 const UPLOAD_URL_TTL_MS = 60 * 60 * 1000;
@@ -20,6 +22,35 @@ interface UploadOptions {
   visibility?: Visibility;
   /** Owner of the new file; defaults to the calling user. Use it to upload on someone's behalf. */
   ownerId?: string | null;
+  /** Reject larger uploads (bytes). */
+  maxBytes?: number;
+  /** Accepted content types, e.g. ["image/*", "application/pdf"]. */
+  contentTypes?: string[];
+}
+
+/** What an upload URL allows; signed into its token. */
+export interface UploadGrant {
+  visibility?: Visibility;
+  ownerId?: string | null;
+  /** Uploaded without a user; anyone may attach such a file to a document. */
+  anonymous?: boolean;
+  maxBytes?: number;
+  contentTypes?: string[];
+}
+
+/** Types a browser may show inline; everything else downloads. */
+const INLINE_TYPES = ["image/*", "video/*", "audio/*", "application/pdf", "text/plain"];
+
+/** Content type from magic bytes for common formats, else null. */
+export function sniffContentType(bytes: Uint8Array): string | null {
+  const starts = (...sig: number[]) => sig.every((b, i) => bytes[i] === b);
+  const ascii = (offset: number, text: string) => [...text].every((c, i) => bytes[offset + i] === c.charCodeAt(0));
+  if (starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return "image/png";
+  if (starts(0xff, 0xd8, 0xff)) return "image/jpeg";
+  if (ascii(0, "GIF87a") || ascii(0, "GIF89a")) return "image/gif";
+  if (ascii(0, "RIFF") && ascii(8, "WEBP")) return "image/webp";
+  if (ascii(0, "%PDF-")) return "application/pdf";
+  return null;
 }
 
 interface UrlOptions extends OwnerOptions {
@@ -45,6 +76,8 @@ export interface StorageOptions {
   bucket?: string;
   /** Max upload size in bytes. Default 100 MB. */
   maxUploadBytes?: number;
+  /** Deleting unused files (see StorageService.cleanup); false turns it off. */
+  cleanup?: { unattachedHours?: number; detachedHours?: number } | false;
 }
 
 interface Backend {
@@ -96,6 +129,7 @@ export class StorageService {
   private readonly backend: Backend;
   private readonly secret: string;
   readonly maxUploadBytes: number;
+  private readonly cleanupPolicy: { unattachedHours: number; detachedHours: number } | null;
 
   constructor(
     private readonly engine: Engine,
@@ -105,6 +139,10 @@ export class StorageService {
     this.backend =
       backend === "s3" ? new S3Backend(options.bucket) : new LocalBackend(join(engine.options.dataDir, "storage"));
     this.maxUploadBytes = options.maxUploadBytes ?? 100 * 1024 * 1024;
+    this.cleanupPolicy =
+      options.cleanup === false || process.env.INCIBASE_STORAGE_CLEANUP === "off"
+        ? null
+        : { unattachedHours: options.cleanup?.unattachedHours ?? 24, detachedHours: options.cleanup?.detachedHours ?? 1 };
     let secret = engine.store.getMeta("storage_secret");
     if (!secret) {
       secret = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
@@ -124,22 +162,35 @@ export class StorageService {
     return expected.length === actual.length && timingSafeEqual(expected, actual);
   }
 
-  /** `ownerId` is the user who asked for the URL; they will own the uploaded file. */
-  createUploadUrl(options: { visibility?: Visibility; ownerId?: string | null } = {}): string {
-    const visibility = parseVisibility(options.visibility);
+  /** Signed upload URL. The grant (owner, visibility, limits) travels inside the token. */
+  createUploadUrl(grant: UploadGrant = {}): string {
     const payload = Buffer.from(
-      JSON.stringify({ exp: Date.now() + UPLOAD_URL_TTL_MS, v: visibility, u: options.ownerId ?? null }),
+      JSON.stringify({
+        exp: Date.now() + UPLOAD_URL_TTL_MS,
+        v: parseVisibility(grant.visibility),
+        u: grant.ownerId ?? null,
+        a: grant.anonymous ? 1 : 0,
+        mb: grant.maxBytes,
+        ct: grant.contentTypes,
+      }),
     ).toString("base64url");
     return `${this.engine.options.publicUrl}/api/storage/upload?token=${payload}.${this.sign(payload)}`;
   }
 
-  /** The upload's visibility and owner when the token is valid and unexpired, else null. */
-  verifyUploadToken(token: string | null): { visibility: Visibility; ownerId: string | null } | null {
+  /** The upload grant when the token is valid and unexpired, else null. */
+  verifyUploadToken(token: string | null): UploadGrant | null {
     const [payload, signature] = token?.split(".") ?? [];
     if (!payload || !this.signatureMatches(payload, signature)) return null;
     try {
-      const data = JSON.parse(Buffer.from(payload, "base64url").toString());
-      return data.exp > Date.now() ? { visibility: parseVisibility(data.v), ownerId: typeof data.u === "string" ? data.u : null } : null;
+      const d = JSON.parse(Buffer.from(payload, "base64url").toString());
+      if (!(d.exp > Date.now())) return null;
+      return {
+        visibility: parseVisibility(d.v),
+        ownerId: typeof d.u === "string" ? d.u : null,
+        anonymous: d.a === 1,
+        maxBytes: typeof d.mb === "number" ? d.mb : undefined,
+        contentTypes: Array.isArray(d.ct) ? d.ct : undefined,
+      };
     } catch {
       return null;
     }
@@ -160,14 +211,22 @@ export class StorageService {
     return `${base}?exp=${exp}&sig=${this.sign(`${doc._id}.${exp}`)}`;
   }
 
-  async store(blob: Blob, options: { contentType?: string; visibility?: Visibility; ownerId?: string | null } = {}): Promise<string> {
-    if (blob.size > this.maxUploadBytes) throw new Error(`File exceeds ${this.maxUploadBytes} bytes`);
+  async store(blob: Blob, options: UploadGrant & { contentType?: string } = {}): Promise<string> {
+    const limit = Math.min(options.maxBytes ?? Infinity, this.maxUploadBytes);
+    if (blob.size > limit) throw new IncibaseError({ code: "FILE_TOO_LARGE", message: `File exceeds ${limit} bytes` });
     const visibility = parseVisibility(options.visibility);
-    const bytes = await blob.arrayBuffer();
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    // Trust the bytes over the declared type when they are recognisable.
+    const type = sniffContentType(bytes) ?? (options.contentType || blob.type || undefined);
+    if (options.contentTypes && !contentTypeMatches(type, options.contentTypes)) {
+      throw new IncibaseError({
+        code: "UNSUPPORTED_FILE_TYPE",
+        message: `Accepted types: ${options.contentTypes.join(", ")}; got ${type ?? "unknown"}`,
+      });
+    }
     const sha256 = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
     const table = this.engine.store.tables.get("_storage")!;
     const id = this.engine.store.newId(table);
-    const type = options.contentType || blob.type || undefined;
     await this.backend.put(id, new Blob([bytes], type ? { type } : {}), type);
     try {
       await this.engine.writeTx((session) => {
@@ -179,6 +238,9 @@ export class StorageService {
             sha256,
             visibility,
             ...(options.ownerId ? { ownerId: options.ownerId } : {}),
+            ...(options.anonymous && !options.ownerId ? { anonymous: true } : {}),
+            // Collected by cleanup() unless a document references it in time.
+            pending: true,
           }),
           id,
         );
@@ -188,6 +250,58 @@ export class StorageService {
       throw err;
     }
     return id;
+  }
+
+  /** Files and bytes owned by a user, e.g. for upload quotas. */
+  usage(userId: string): { files: number; bytes: number } {
+    const row = this.engine.store.write
+      .query(`SELECT COUNT(*) AS files, COALESCE(SUM(json_extract(data, '$.size')), 0) AS bytes FROM _storage WHERE json_extract(data, '$.ownerId') = ?`)
+      .get(userId) as { files: number; bytes: number };
+    return { files: row.files, bytes: row.bytes };
+  }
+
+  /**
+   * Deletes files nobody uses: uploads never put into a document within
+   * `unattachedHours`, and files dropped from a `file()` field more than
+   * `detachedHours` ago. Files referenced by an `id("_storage")` field are
+   * kept; files stored before this existed are never touched.
+   */
+  async cleanup(now = Date.now()): Promise<number> {
+    if (!this.cleanupPolicy) return 0;
+    const { unattachedHours, detachedHours } = this.cleanupPolicy;
+    const rows = this.engine.store.write
+      .query(`SELECT _id, _creationTime, data FROM _storage WHERE json_extract(data, '$.pending') = 1`)
+      .all() as { _id: string; _creationTime: number; data: string }[];
+    const due = rows.filter((row) => {
+      const d = JSON.parse(row.data);
+      if (d.attachedTo) return false;
+      return typeof d.detachedAt === "number"
+        ? d.detachedAt < now - detachedHours * 3600_000
+        : row._creationTime < now - unattachedHours * 3600_000;
+    });
+    if (due.length === 0) return 0;
+
+    // Keep anything a plain id("_storage") field still points to.
+    const referenced = new Set<string>();
+    for (const table of this.engine.store.tables.values()) {
+      const plain = (table.storageFields ?? []).filter((f) => !f.file);
+      if (plain.length === 0) continue;
+      for (const { data } of this.engine.store.write.query(`SELECT data FROM ${quoteIdent(table.name)}`).all() as { data: string }[]) {
+        const doc = JSON.parse(data);
+        for (const field of plain) for (const ref of idsAt(doc, field.path)) referenced.add(ref);
+      }
+    }
+
+    const doomed = due.filter((row) => !referenced.has(row._id));
+    if (doomed.length === 0) return 0;
+    await this.engine.writeTx((session) => {
+      const table = session.systemTable("_storage");
+      for (const row of doomed) {
+        session.deleteRaw(table, row._id);
+        session.onCommit(() => void this.backend.delete(row._id).catch((err) => console.error("[incibase] blob delete failed:", err)));
+      }
+    });
+    return doomed.length;
   }
 
   async get(id: string): Promise<Blob | null> {
@@ -215,12 +329,18 @@ export class StorageService {
     }
     const blob = await this.backend.get(id);
     if (!blob) return new Response("Not found", { status: 404 });
+    const type = typeof doc.contentType === "string" ? doc.contentType : "application/octet-stream";
     const headers: Record<string, string> = {
       "cache-control": isPrivate
         ? `private, max-age=${Math.max(0, Math.floor((expiresAt - Date.now()) / 1000))}`
         : "public, max-age=31536000, immutable",
+      "content-type": type,
+      // User uploads share an origin with the API and the dashboard (which keeps the admin key):
+      // never let one run script (HTML, SVG) or be sniffed into something executable.
+      "x-content-type-options": "nosniff",
+      ...(contentTypeMatches(type, ["application/pdf"]) ? {} : { "content-security-policy": "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox" }),
+      ...(contentTypeMatches(type, INLINE_TYPES) ? {} : { "content-disposition": "attachment" }),
     };
-    if (typeof doc.contentType === "string") headers["content-type"] = doc.contentType;
     return new Response(blob, { headers });
   }
 
@@ -269,6 +389,17 @@ export class StorageService {
     this.setVisibilityIn(session, id, visibility);
   }
 
+  private grantFor(identity: Identity, options: UploadOptions = {}): UploadGrant {
+    const ownerId = this.ownerFor(identity, options);
+    return {
+      visibility: options.visibility,
+      ownerId,
+      anonymous: !ownerId && !identity.admin && !identity.system,
+      maxBytes: options.maxBytes,
+      contentTypes: options.contentTypes,
+    };
+  }
+
   /** The caller owns new files unless server code names another owner (or null for none). */
   private ownerFor(identity: Identity, options?: UploadOptions): string | null {
     if (options && "ownerId" in options && options.ownerId !== undefined) {
@@ -289,21 +420,25 @@ export class StorageService {
 
   private async getUrlIn(session: DbSession, id: string, identity: Identity, options: UrlOptions = {}) {
     const doc = await session.get("_storage", id);
-    return doc && this.canRead(doc, identity, options.bypassOwnerCheck) ? this.urlFor(doc, options) : null;
+    if (!doc) return null;
+    // A file in a document's file() field is readable by code that loaded that document.
+    const attachedTo = (doc.attachedTo as { id?: string } | undefined)?.id;
+    const viaDocument = !!attachedTo && session.loadedIds.has(attachedTo);
+    return viaDocument || this.canRead(doc, identity, options.bypassOwnerCheck) ? this.urlFor(doc, options) : null;
   }
 
   reader(session: DbSession, identity: Identity) {
     return {
       getUrl: (id: string, options?: UrlOptions) => this.getUrlIn(session, id, identity, options),
       getMetadata: (id: string) => session.get("_storage", id),
+      usage: async (userId: string) => this.usage(userId),
     };
   }
 
   writer(session: DbSession, identity: Identity) {
     return {
       ...this.reader(session, identity),
-      generateUploadUrl: async (options?: UploadOptions) =>
-        this.createUploadUrl({ visibility: options?.visibility, ownerId: this.ownerFor(identity, options) }),
+      generateUploadUrl: async (options?: UploadOptions) => this.createUploadUrl(this.grantFor(identity, options)),
       setVisibility: (id: string, visibility: Visibility, options?: OwnerOptions) =>
         this.setVisibilityChecked(session, id, visibility, identity, options?.bypassOwnerCheck),
       delete: (id: string, options?: OwnerOptions) => this.deleteIn(session, id, identity, options?.bypassOwnerCheck),
@@ -315,8 +450,7 @@ export class StorageService {
     return {
       getUrl: (id: string, options?: UrlOptions) => read((s) => this.getUrlIn(s, id, identity, options)),
       getMetadata: (id: string) => read((s) => s.get("_storage", id)),
-      generateUploadUrl: async (options?: UploadOptions) =>
-        this.createUploadUrl({ visibility: options?.visibility, ownerId: this.ownerFor(identity, options) }),
+      generateUploadUrl: async (options?: UploadOptions) => this.createUploadUrl(this.grantFor(identity, options)),
       setVisibility: (id: string, visibility: Visibility, options?: OwnerOptions) =>
         this.engine.writeTx((s) => this.setVisibilityChecked(s, id, visibility, identity, options?.bypassOwnerCheck)),
       delete: (id: string, options?: OwnerOptions) =>
@@ -326,7 +460,8 @@ export class StorageService {
         return doc && this.canRead(doc, identity, options?.bypassOwnerCheck) ? this.get(id) : null;
       },
       store: (blob: Blob, options?: { contentType?: string } & UploadOptions) =>
-        this.store(blob, { contentType: options?.contentType, visibility: options?.visibility, ownerId: this.ownerFor(identity, options) }),
+        this.store(blob, { ...this.grantFor(identity, options), contentType: options?.contentType }),
+      usage: async (userId: string) => this.usage(userId),
     };
   }
 }
