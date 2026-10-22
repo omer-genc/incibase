@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { z } from "zod";
 import { IncibaseError } from "../errors.ts";
-import type { IndexDefinition } from "../schema.ts";
+import { FIELD_PATH_REGEX, type IndexDefinition } from "../schema.ts";
 import type { Identity } from "./engine.ts";
 import { syncFiles } from "./files.ts";
 import type { Change, RangeRead, ReadSet } from "./readset.ts";
@@ -126,6 +126,10 @@ export class QueryBuilder {
 
   where(fields: Record<string, unknown>) {
     for (const [field, value] of Object.entries(fields)) {
+      // Keys often come from callers (filters built from args), and they end up in SQL.
+      if (field !== "_id" && field !== "_creationTime" && !FIELD_PATH_REGEX.test(field)) {
+        throw new IncibaseError({ code: "INVALID_FIELD", message: `where(): "${field}" is not a field name or dotted field path` });
+      }
       if (value === undefined) continue;
       toSqlValue(value, field); // validate early
       this.whereOps.push({ field, value });

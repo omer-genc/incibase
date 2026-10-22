@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { z } from "zod";
-import type { IndexDefinition } from "../schema.ts";
+import { FIELD_PATH_REGEX, type IndexDefinition } from "../schema.ts";
 import type { StorageField } from "./files.ts";
 import { ID_REGEX } from "../values.ts";
 
@@ -57,9 +57,14 @@ export function tableNumberOfId(id: string): number | null {
   return ALPHABET.indexOf(id[26]!) * 32 + ALPHABET.indexOf(id[27]!);
 }
 
-/** `json_extract` expression for a (possibly dotted) field. Field names are validated by the schema. */
+/**
+ * `json_extract` expression for a (possibly dotted) field. The field is spliced
+ * into SQL, so anything that is not a plain field path is refused here, whatever
+ * the caller checked before.
+ */
 export function fieldExpr(field: string): string {
   if (field === "_id" || field === "_creationTime") return field;
+  if (!FIELD_PATH_REGEX.test(field)) throw new Error(`Invalid field path "${field}"`);
   return `json_extract(data, '$.${field}')`;
 }
 
