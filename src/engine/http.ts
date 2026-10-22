@@ -291,8 +291,16 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
     error: (err) => errorResponse(err),
     routes: routesFor(surface, refuse, notFound, {
       // `generation` tells a host's deploy gate which release this process runs (it sets INCIBASE_GENERATION per start).
+      // The admin socket also says which service keys file it uses, so a revoke checks the reload took (see ServiceKeysStatus).
       "/api/health": route({
-        GET: () => Response.json({ ok: true, version: VERSION, startedAt: engine.startedAt, generation: process.env.INCIBASE_GENERATION || null }),
+        GET: () =>
+          Response.json({
+            ok: true,
+            version: VERSION,
+            startedAt: engine.startedAt,
+            generation: process.env.INCIBASE_GENERATION || null,
+            ...(surface === "admin" && engine.options.serviceKeys ? { serviceKeys: engine.options.serviceKeys.status } : {}),
+          }),
       }),
       "/api/query": callRoute("query"),
       "/api/mutation": callRoute("mutation"),

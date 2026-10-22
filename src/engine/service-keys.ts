@@ -1,8 +1,10 @@
 // Keys other servers call a branch with: `ik_svc_<id>_<secret>`. The host
 // layer keeps only their sha256 in a JSON file (INCIBASE_SERVICE_KEYS_FILE),
 // which serve reads again on SIGHUP, so a key is added or revoked without a
-// restart. A service key is never the admin: its scopes say what it may do
-// beyond what an anonymous caller may.
+// restart. A reload that cannot use the file fails closed: no service key
+// works until a good one is read, so a revoke never silently keeps the key.
+// A service key is never the admin: its scopes say what it may do beyond what
+// an anonymous caller may.
 import { timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
@@ -35,7 +37,7 @@ const keysFile = z.array(keyEntry);
 
 type KeyEntry = z.output<typeof keyEntry>;
 
-function sha256(value: string): string {
+function sha256(value: string | Uint8Array): string {
   return new Bun.CryptoHasher("sha256").update(value).digest("hex");
 }
 
@@ -46,14 +48,15 @@ export function newServiceKey(id: string): { key: string; sha256: string } {
   return { key, sha256: sha256(key) };
 }
 
-/** Reads and checks a keys file; ConfigError when it cannot be used. */
-function readKeys(path: string): Map<string, KeyEntry> {
-  let text: string;
+/** Reads and checks a keys file, with the sha256 of the bytes read; ConfigError when it cannot be used. */
+function readKeys(path: string): { keys: Map<string, KeyEntry>; sha256: string } {
+  let bytes: Buffer;
   try {
-    text = readFileSync(path, "utf8");
+    bytes = readFileSync(path);
   } catch (err) {
     throw new ConfigError(`Cannot read the service keys file ${path}: ${(err as Error).message}`);
   }
+  const text = bytes.toString("utf8");
   let json: unknown;
   try {
     json = JSON.parse(text);
@@ -69,7 +72,7 @@ function readKeys(path: string): Map<string, KeyEntry> {
     if (keys.has(entry.id)) throw new ConfigError(`The service keys file ${path} lists the id "${entry.id}" twice`);
     keys.set(entry.id, entry);
   }
-  return keys;
+  return { keys, sha256: sha256(bytes) };
 }
 
 /** Ids whose key no longer gives what it gave: removed, revoked, replaced, or with a scope taken away. */
@@ -83,12 +86,41 @@ function narrowed(before: Map<string, KeyEntry>, after: Map<string, KeyEntry>): 
   return ids;
 }
 
+/**
+ * What the keys in use came from, for a host to check a reload against the
+ * file it wrote (the admin socket's /api/health): the sha256 of the file's
+ * bytes, or null after a reload that failed (then no key works).
+ */
+export interface ServiceKeysStatus {
+  file: string;
+  sha256: string | null;
+  /** When the file was last read, successfully or not (ms since the epoch). */
+  readAt: number;
+  /** Unrevoked keys in use. */
+  keys: number;
+  /** Why the last reload failed. */
+  error?: string;
+}
+
 export class ServiceKeys {
   private keys: Map<string, KeyEntry>;
+  private fileSha256: string | null;
+  private readAt = Date.now();
+  private error: string | undefined;
 
   /** Reads `path`; throws ConfigError (exit 64) when it is missing or malformed. */
   constructor(readonly path: string) {
-    this.keys = readKeys(path);
+    ({ keys: this.keys, sha256: this.fileSha256 } = readKeys(path));
+  }
+
+  get status(): ServiceKeysStatus {
+    return {
+      file: this.path,
+      sha256: this.fileSha256,
+      readAt: this.readAt,
+      keys: [...this.keys.values()].filter((k) => !k.revoked).length,
+      ...(this.error ? { error: this.error } : {}),
+    };
   }
 
   /** The keys in the file, revoked ones included. */
@@ -109,23 +141,31 @@ export class ServiceKeys {
   }
 
   /**
-   * Reads the file again. A file that cannot be used is logged and the
-   * previous keys stay. Returns the ids whose access narrowed (see
-   * `narrowed`), or null when the file was kept.
+   * Reads the file again. Returns the ids whose access narrowed (see
+   * `narrowed`). A file that cannot be used (unreadable, half written,
+   * invalid) fails closed: it is logged, every key stops working until a
+   * reload reads a good file, and every id that worked is returned. Keeping
+   * the old keys instead would keep a key the new file revokes.
    */
-  reload(): Set<string> | null {
+  reload(): Set<string> {
+    this.readAt = Date.now();
     let next: Map<string, KeyEntry>;
     try {
-      next = readKeys(this.path);
+      ({ keys: next, sha256: this.fileSha256 } = readKeys(this.path));
+      this.error = undefined;
     } catch (err) {
-      const msg = `${(err as Error).message}\nKeeping the service keys read before.`;
-      logEvent("error", { ev: "service_keys_reload_failed", msg, file: this.path }, [`[incibase] ${msg}`]);
-      return null;
+      const changed = narrowed(this.keys, new Map());
+      this.keys = new Map();
+      this.fileSha256 = null;
+      this.error = (err as Error).message;
+      const msg = `${this.error}\nNo service key works until the file is fixed and reloaded (SIGHUP).`;
+      logEvent("error", { ev: "service_keys_reload_failed", msg, file: this.path, revoked: [...changed] }, [`[incibase] ${msg}`]);
+      return changed;
     }
     const changed = narrowed(this.keys, next);
     this.keys = next;
     const active = [...next.values()].filter((k) => !k.revoked).length;
-    logEvent("info", { ev: "service_keys_reloaded", file: this.path, keys: active, narrowed: [...changed] }, [
+    logEvent("info", { ev: "service_keys_reloaded", file: this.path, sha256: this.fileSha256, keys: active, narrowed: [...changed] }, [
       `[incibase] reloaded ${active} service key(s) from ${this.path}`,
     ]);
     return changed;
@@ -160,7 +200,8 @@ export interface ReloadTarget {
  * while serve is still starting would otherwise end it, and systemd would not
  * restart it. Before the keys are first read there is nothing to reload; the
  * first read sees the file as it is then. Open WebSockets signed in with a
- * key whose access narrowed become anonymous.
+ * key whose access narrowed (or with any key, when the file could not be
+ * used) become anonymous.
  */
 export function handleReloads(target: ReloadTarget) {
   process.on("SIGHUP", () => {
@@ -170,6 +211,6 @@ export function handleReloads(target: ReloadTarget) {
       return;
     }
     const changed = target.keys.reload();
-    if (changed?.size) target.realtime?.revokeIdentities((identity) => !!identity.service && changed.has(identity.service.keyId));
+    if (changed.size) target.realtime?.revokeIdentities((identity) => !!identity.service && changed.has(identity.service.keyId));
   });
 }
