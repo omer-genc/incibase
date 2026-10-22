@@ -18,7 +18,7 @@ import { Engine, type AppDefinition } from "../src/engine/engine.ts";
 import { ConfigError, exitCodeOf, ExitCode } from "../src/engine/exit-codes.ts";
 import { startServer } from "../src/engine/http.ts";
 import { ConcurrencyGate, LimitError } from "../src/engine/limits.ts";
-import { migrate, MigrationError, PAGE_SIZE } from "../src/engine/migrate.ts";
+import { migrate, MigrationError, PAGE_BYTES, PAGE_SIZE } from "../src/engine/migrate.ts";
 import { Store } from "../src/engine/store.ts";
 import { memoryStorage, tempDir } from "./helpers.ts";
 
@@ -69,12 +69,12 @@ async function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T 
 const notesV1 = () => defineSchema({ notes: defineTable({ body: z.string(), n: z.number() }) });
 const notesV2 = () => defineSchema({ notes: defineTable({ body: z.string(), n: z.number(), tag: z.string().default("new") }) });
 
-/** A data dir whose `notes` table holds `count` documents (written under notesV1). */
-async function notesDb(count: number) {
+/** A data dir whose `notes` table holds `count` documents (written under notesV1), with bodies of `body(n)`. */
+async function notesDb(count: number, body = (n: number) => `note ${n}`) {
   const data = dir();
   const engine = open({ schema: notesV1(), modules: {} }, data);
   await engine.writeTx(async (s) => {
-    for (let n = 0; n < count; n++) await s.insert("notes", { body: `note ${n}`, n });
+    for (let n = 0; n < count; n++) await s.insert("notes", { body: body(n), n });
   });
   await engine.stop();
   return join(data, "data.db");
@@ -102,33 +102,50 @@ function rawUpdate(path: string, id: string, data: Record<string, unknown>) {
 
 /**
  * Runs `migrate` on the database at `path` and records the size of every
- * page the re-validation read, and any read of a whole table.
+ * page the re-validation read (rows returned by `all`, or taken from
+ * `iterate`), and any read of a whole table.
  */
 function migrateRecording(path: string, schema: ReturnType<typeof defineSchema>, options: Parameters<typeof migrate>[2] = {}) {
   const store = new Store(path);
   const pages: number[] = [];
   const wholeTableReads: string[] = [];
-  const query = store.write.query.bind(store.write);
-  const spy = spyOn(store.write, "query").mockImplementation(((sql: string) => {
-    const statement = query(sql);
-    if (/FROM "notes"/.test(sql) && /^SELECT/.test(sql.trim())) {
-      if (!/LIMIT/.test(sql)) wholeTableReads.push(sql);
-      const all = statement.all.bind(statement);
-      (statement as { all: unknown }).all = (...args: unknown[]) => {
-        const rows = (all as (...a: unknown[]) => unknown[])(...args);
-        pages.push(rows.length);
-        return rows;
-      };
-    }
+  type Statement = ReturnType<typeof store.write.query>;
+  const record = (sql: string, statement: Statement) => {
+    if (!/FROM "notes"/.test(sql) || !/^SELECT/.test(sql.trim())) return statement;
+    if (!/LIMIT/.test(sql)) wholeTableReads.push(sql);
+    const all = statement.all.bind(statement);
+    (statement as { all: unknown }).all = (...args: unknown[]) => {
+      const rows = (all as (...a: unknown[]) => unknown[])(...args);
+      pages.push(rows.length);
+      return rows;
+    };
+    const iterate = statement.iterate.bind(statement) as (...a: unknown[]) => Iterable<unknown>;
+    (statement as { iterate: unknown }).iterate = function* (...args: unknown[]) {
+      let taken = 0;
+      try {
+        for (const row of iterate(...args)) {
+          taken++;
+          yield row;
+        }
+      } finally {
+        pages.push(taken);
+      }
+    };
     return statement;
-  }) as typeof store.write.query);
+  };
+  const query = store.write.query.bind(store.write);
+  const prepare = store.write.prepare.bind(store.write);
+  const spies = [
+    spyOn(store.write, "query").mockImplementation(((sql: string) => record(sql, query(sql))) as typeof store.write.query),
+    spyOn(store.write, "prepare").mockImplementation(((sql: string) => record(sql, prepare(sql) as Statement)) as typeof store.write.prepare),
+  ];
   let result: { report?: ReturnType<typeof migrate>; err?: unknown };
   try {
     result = { report: migrate(store, schema, options) };
   } catch (err) {
     result = { err };
   } finally {
-    spy.mockRestore();
+    for (const spy of spies) spy.mockRestore();
     store.close();
   }
   return { result, pages, wholeTableReads };
@@ -199,6 +216,99 @@ describe("paged revalidation", () => {
     expect(err.message).toContain("Schema does not match 1500 existing document(s)");
     expect(err.message).toContain("...and 1480 more");
   });
+
+  test(`a page also ends once it holds ${PAGE_BYTES} bytes, so large documents make smaller pages`, async () => {
+    const big = "x".repeat(50_000);
+    const path = await notesDb(400, () => big);
+    const length = notesOf(path)[0]!.data.length;
+    const perPage = Math.ceil(PAGE_BYTES / length);
+    const { result, pages } = migrateRecording(path, notesV2());
+    expect(result.report!.rewrittenDocuments).toBe(400);
+    expect(pages).toEqual([perPage, perPage, 400 - 2 * perPage]);
+    expect(notesOf(path).every((d) => JSON.parse(d.data).tag === "new")).toBe(true);
+  });
+
+  test("byte-bounded pages give the same report and data as one page; a document over the budget ends its page", async () => {
+    // Bodies of 10..1009 characters, one of them over the whole budget.
+    const body = (n: number) => "y".repeat(n === 300 ? 20_000 : 10 + (n % 1000));
+    const a = await notesDb(1000, body);
+    const b = join(dir(), "data.db");
+    const db = new Database(a, { readonly: true });
+    db.run(`VACUUM INTO '${b}'`);
+    db.close();
+    const id = notesOf(a)[617]!._id;
+    for (const path of [a, b]) rawUpdate(path, id, { body: "x", n: 617, old: true });
+    const stored = notesOf(b).map((d) => d.data.length);
+    const one = migrateRecording(a, notesV2(), { allowFieldRemoval: true });
+    const many = migrateRecording(b, notesV2(), { pageBytes: 10_000, allowFieldRemoval: true });
+    expect(one.pages).toEqual([1000]);
+    expect(many.pages.reduce((x, y) => x + y, 0)).toBe(1000);
+    expect(many.pages.length).toBeGreaterThan(50);
+    expect(many.result.report).toEqual(one.result.report!);
+    expect(notesOf(b)).toEqual(notesOf(a));
+    // Every page but the last ends at the first document that brings it to the budget.
+    const pageEnds: number[] = [];
+    let at = 0;
+    for (const size of many.pages.slice(0, -1)) {
+      const page = stored.slice(at, at + size);
+      const sum = page.reduce((x, y) => x + y, 0);
+      expect(sum).toBeGreaterThanOrEqual(10_000);
+      expect(sum - page.at(-1)!).toBeLessThan(10_000);
+      at += size;
+      pageEnds.push(at - 1);
+    }
+    expect(stored.slice(at).reduce((x, y) => x + y, 0)).toBeLessThan(10_000);
+    const bigAt = notesOf(b).findIndex((d) => JSON.parse(d.data).n === 300);
+    expect(stored[bigAt]).toBeGreaterThan(10_000);
+    expect(pageEnds).toContain(bigAt);
+  });
+
+  test("peak memory stays under the 192 MiB a host gives a branch, for small documents and large ones", async () => {
+    // 40k documents of 2 KB and 1500 of 50 KB (about 155 MB of JSON); loading
+    // them at once, or 5000 large ones per page, would need several times that.
+    const data = dir();
+    const engine = open({ schema: notesV1(), modules: {} }, data);
+    await engine.stop();
+    const path = join(data, "data.db");
+    const db = new Database(path);
+    try {
+      const insert = db.query(`INSERT INTO notes (_id, _creationTime, data) VALUES (?, ?, ?)`);
+      const small = "s".repeat(2000);
+      const large = "L".repeat(50_000);
+      db.transaction(() => {
+        for (let n = 0; n < 41_500; n++) {
+          const body = n >= 20_000 && n < 21_500 ? large : small;
+          insert.run(`m${String(n).padStart(8, "0")}`, n, JSON.stringify({ body, n }));
+        }
+      })();
+    } finally {
+      db.close();
+    }
+    const script = join(dir(), "migrate-child.ts");
+    writeFileSync(
+      script,
+      `import { Store } from ${JSON.stringify(join(import.meta.dir, "..", "src", "engine", "store.ts"))};
+import { migrate } from ${JSON.stringify(join(import.meta.dir, "..", "src", "engine", "migrate.ts"))};
+import { defineSchema, defineTable, z } from "incibase/server";
+const store = new Store(${JSON.stringify(path)});
+const report = migrate(store, defineSchema({ notes: defineTable({ body: z.string(), n: z.number(), tag: z.string().default("new") }) }));
+store.close();
+console.log(JSON.stringify({ rewritten: report.rewrittenDocuments, maxRssKiB: process.resourceUsage().maxRSS }));
+`,
+    );
+    const proc = Bun.spawn([process.execPath, script], { cwd: join(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe", timeout: 60_000 });
+    const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+    const { rewritten, maxRssKiB } = JSON.parse(stdout.trim()) as { rewritten: number; maxRssKiB: number };
+    expect(rewritten).toBe(41_500);
+    expect(maxRssKiB / 1024).toBeLessThan(192);
+    const migrated = new Database(path, { readonly: true });
+    try {
+      expect(migrated.query(`SELECT count(*) AS n FROM notes WHERE json_extract(data, '$.tag') = 'new'`).get()).toEqual({ n: 41_500 });
+    } finally {
+      migrated.close();
+    }
+  }, 120_000);
 
   test("an unchanged schema reads nothing", async () => {
     const path = await notesDb(10);
@@ -588,6 +698,116 @@ describe("auth semaphore", () => {
   });
 });
 
+describe("auth checks while waiting for a slot", () => {
+  const sessionsOf = (engine: Engine, userId: string) =>
+    (engine.store.write.query(`SELECT count(*) AS n FROM _sessions WHERE user_id = ?`).get(userId) as { n: number }).n;
+  const codeOf = (err: unknown) => (err instanceof IncibaseError ? (err.data as { code: string }).code : err);
+
+  test("a sign-in with the old password queued behind a password change fails and leaves no session", async () => {
+    const engine = open({ modules: {} }, dir(), { auth: { concurrency: 1 } });
+    const { user } = await engine.auth.signUp({ email: "victim@example.com", password: "oldpassword1" });
+    const pw = gatePasswords();
+    try {
+      const change = engine.auth.changePassword(user._id, { currentPassword: "oldpassword1", newPassword: "newpassword1" });
+      await until(() => pw.running === 1);
+      const attacker = engine.auth.signIn({ email: "victim@example.com", password: "oldpassword1" }).catch((e) => e);
+      await until(() => engine.auth.hashing.queued === 1);
+      pw.release();
+      const changed = await change;
+      expect(codeOf(await attacker)).toBe("INVALID_CREDENTIALS");
+      // Only the session the change handed out is left, and it works.
+      expect(sessionsOf(engine, user._id)).toBe(1);
+      expect(engine.auth.identify(changed.token).userId).toBe(user._id);
+      expect((await engine.auth.signIn({ email: "victim@example.com", password: "newpassword1" })).user._id).toBe(user._id);
+    } finally {
+      pw.restore();
+    }
+  });
+
+  test("a sign-in queued while the user is deleted fails and leaves no session", async () => {
+    const engine = open({ modules: {} }, dir(), { auth: { concurrency: 1 } });
+    const { user } = await engine.auth.signUp({ email: "victim@example.com", password: "password123" });
+    const pw = gatePasswords();
+    try {
+      const burst = engine.auth.signIn({ email: "other@example.com", password: "password123" }).catch(() => {});
+      await until(() => pw.running === 1);
+      const queued = engine.auth.signIn({ email: "victim@example.com", password: "password123" }).catch((e) => e);
+      await until(() => engine.auth.hashing.queued === 1);
+      await adminTools(engine).admin_delete_user!.run({ id: user._id });
+      pw.release();
+      await burst;
+      expect(codeOf(await queued)).toBe("INVALID_CREDENTIALS");
+      expect(sessionsOf(engine, user._id)).toBe(0);
+    } finally {
+      pw.restore();
+    }
+  });
+
+  test("a change, deletion or disable that commits during the password check wins over the sign-in", async () => {
+    const engine = open({ modules: {} }, dir(), { auth: { concurrency: 1 } });
+    const users = await Promise.all(
+      ["changed", "deleted", "disabled"].map((name) => engine.auth.signUp({ email: `${name}@example.com`, password: "password123" })),
+    );
+    const [changed, deleted, disabled] = users.map((r) => r.user._id) as [string, string, string];
+    const midway: [name: string, userId: string, act: () => Promise<unknown>][] = [
+      [
+        "changed",
+        changed,
+        () => engine.writeTx((s) => void s.conn.query(`UPDATE _passwords SET hash = ? WHERE user_id = ?`).run("$replaced", changed)),
+      ],
+      ["deleted", deleted, () => engine.auth.deleteUser(deleted)],
+      ["disabled", disabled, () => engine.auth.setDisabled(disabled, true)],
+    ];
+    for (const [name, userId, act] of midway) {
+      const pw = gatePasswords();
+      try {
+        const signIn = engine.auth.signIn({ email: `${name}@example.com`, password: "password123" }).catch((e) => e);
+        // The hash is read and being checked: the write commits before the check ends.
+        await until(() => pw.running === 1);
+        await act();
+        const before = sessionsOf(engine, userId);
+        pw.release();
+        expect(codeOf(await signIn)).toBe("INVALID_CREDENTIALS");
+        expect(sessionsOf(engine, userId)).toBe(before);
+      } finally {
+        pw.restore();
+      }
+    }
+    // The sign-up's own session is left only where nothing revoked it.
+    expect([changed, deleted, disabled].map((id) => sessionsOf(engine, id))).toEqual([1, 0, 0]);
+  });
+
+  test("of two password changes from the same current password, only the first succeeds", async () => {
+    for (const concurrency of [1, 2]) {
+      const engine = open({ modules: {} }, dir(), { auth: { concurrency } });
+      const { user } = await engine.auth.signUp({ email: "a@example.com", password: "password123" });
+      const pw = gatePasswords();
+      try {
+        const changes = ["first-pass1", "second-pass2"].map((newPassword) =>
+          engine.auth.changePassword(user._id, { currentPassword: "password123", newPassword }).then(
+            (r) => ({ ok: true, newPassword, token: r.token }),
+            (e) => ({ ok: false, newPassword, code: codeOf(e) }),
+          ),
+        );
+        await until(() => pw.running + engine.auth.hashing.queued === 2);
+        pw.release();
+        const results = await Promise.all(changes);
+        const won = results.filter((r) => r.ok);
+        expect(won.length).toBe(1);
+        expect(results.find((r) => !r.ok)).toMatchObject({ code: "INVALID_CREDENTIALS" });
+        expect(sessionsOf(engine, user._id)).toBe(1);
+        const winner = won[0] as { newPassword: string; token: string };
+        expect(engine.auth.identify(winner.token).userId).toBe(user._id);
+        expect((await engine.auth.signIn({ email: "a@example.com", password: winner.newPassword })).user._id).toBe(user._id);
+        const loser = results.find((r) => !r.ok)!.newPassword;
+        expect(codeOf(await engine.auth.signIn({ email: "a@example.com", password: loser }).catch((e) => e))).toBe("INVALID_CREDENTIALS");
+      } finally {
+        pw.restore();
+      }
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Client
 
@@ -608,6 +828,18 @@ async function withLocalStorage<T>(fn: (store: Map<string, string>) => T | Promi
   } finally {
     if (previous) Object.defineProperty(globalThis, "localStorage", previous);
     else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+}
+
+/** `location` on globalThis pointing at `href` for the length of `fn`. */
+async function withLocation<T>(href: string, fn: () => T | Promise<T>): Promise<T> {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "location");
+  Object.defineProperty(globalThis, "location", { configurable: true, value: { href } });
+  try {
+    return await fn();
+  } finally {
+    if (previous) Object.defineProperty(globalThis, "location", previous);
+    else delete (globalThis as { location?: unknown }).location;
   }
 }
 
@@ -674,6 +906,36 @@ describe("client tokens", () => {
       new IncibaseClient("https://b.example.com").setToken("ik_b");
       expect(store.has("incibase:token")).toBe(false);
       expect(new IncibaseClient("https://c.example.com").getToken()).toBeNull();
+    });
+  });
+
+  test("a same-origin base URL keys the token by the page's origin, not its route", async () => {
+    const keys = await Promise.all(
+      ["https://app.example.com/settings/profile?tab=1", "https://app.example.com/orders/42#x", "https://app.example.com/"].map((href) =>
+        withLocation(href, () => [tokenKeyFor(""), tokenKeyFor("/"), tokenKeyFor("/incibase/"), tokenKeyFor("incibase")]),
+      ),
+    );
+    for (const k of keys) {
+      expect(k).toEqual([
+        "incibase:token:https://app.example.com",
+        "incibase:token:https://app.example.com",
+        "incibase:token:https://app.example.com/incibase",
+        "incibase:token:https://app.example.com/incibase",
+      ]);
+    }
+    await withLocalStorage(async (store) => {
+      store.set("incibase:token", "ik_legacy");
+      await withLocation("https://app.example.com/settings/profile", () => {
+        const client = new IncibaseClient("/");
+        expect(client.getToken()).toBe("ik_legacy");
+        client.setToken("ik_signed_in");
+      });
+      // Reloading on another route finds the same session.
+      await withLocation("https://app.example.com/orders/42", () => {
+        expect(new IncibaseClient("/").getToken()).toBe("ik_signed_in");
+        expect(new IncibaseClient("").getToken()).toBe("ik_signed_in");
+      });
+      expect([...store.keys()]).toEqual(["incibase:token:https://app.example.com"]);
     });
   });
 

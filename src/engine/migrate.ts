@@ -20,10 +20,19 @@ export interface MigrationOptions {
   allowFieldRemoval?: boolean;
   /** Documents re-validated per page (default PAGE_SIZE); only tests change it. */
   pageSize?: number;
+  /** Stored JSON (in characters) re-validated per page (default PAGE_BYTES); only tests change it. */
+  pageBytes?: number;
 }
 
-/** Documents a re-validation holds in memory at once: it reads each table in pages of this many. */
+/** Documents a re-validation holds in memory at once: it reads each table in pages of at most this many. */
 export const PAGE_SIZE = 5000;
+/**
+ * Stored JSON a re-validation page holds (in characters): a page ends at
+ * PAGE_SIZE documents or once it holds this much, whichever comes first, so
+ * large documents make smaller pages. A page takes at least one document,
+ * however large.
+ */
+export const PAGE_BYTES = 8 * 1024 * 1024;
 
 export interface MigrationReport {
   createdTables: string[];
@@ -165,7 +174,10 @@ export function migrate(store: Store, schema: SchemaDefinition | undefined, opti
             (db.query(`SELECT _id FROM _storage WHERE json_extract(data, '$.pending') = 1`).all() as { _id: string }[]).map((r) => r._id),
           );
           const removed = new Map<string, number>();
-          report.rewrittenDocuments += revalidate(store, name, def.validator, { problems, problemCount, removed, pendingFiles }, options.pageSize ?? PAGE_SIZE);
+          report.rewrittenDocuments += revalidate(store, name, def.validator, { problems, problemCount, removed, pendingFiles }, {
+            size: options.pageSize ?? PAGE_SIZE,
+            bytes: options.pageBytes ?? PAGE_BYTES,
+          });
           for (const [field, documents] of removed) removedFields.push({ table: name, field, documents });
         }
       }
@@ -237,9 +249,11 @@ interface Findings {
 
 /**
  * Re-parses every document and rewrites those whose stored form changed,
- * reading `pageSize` documents at a time in `_id` order. The pages are keyset
- * pages read inside the migration's transaction, so a rewrite (which keeps
- * the `_id`) never moves a document into a page still to come.
+ * a page at a time in `_id` order (at most `page.size` documents, and no more
+ * once they hold `page.bytes`). The pages are keyset pages read inside the
+ * migration's transaction, so a rewrite (which keeps the `_id`) never moves a
+ * document into a page still to come; each page's cursor is closed before its
+ * rewrites run.
  * Stored keys the rewrite would drop are counted per field in `removed`.
  * (Values a `.catch()` replaces are rewritten without being counted.)
  * Pending files a document holds (from `pendingFiles`) are marked not pending
@@ -250,15 +264,27 @@ function revalidate(
   table: string,
   validator: z.ZodObject<any, any>,
   { problems, problemCount, removed, pendingFiles }: Findings,
-  pageSize: number,
+  page: { size: number; bytes: number },
 ): number {
   let rewritten = 0;
   const held = new Set<string>();
   const update = store.write.query(`UPDATE ${quoteIdent(table)} SET data = ? WHERE _id = ?`);
-  const page = store.write.query(`SELECT _id, _creationTime, data FROM ${quoteIdent(table)} WHERE _id > ? ORDER BY _id LIMIT ?`);
+  const pageSql = `SELECT _id, _creationTime, data FROM ${quoteIdent(table)} WHERE _id > ? ORDER BY _id LIMIT ?`;
   let after = "";
   while (true) {
-    const rows = page.all(after, pageSize) as DocumentRow[];
+    const rows: DocumentRow[] = [];
+    let bytes = 0;
+    // A statement of its own per page: one left mid-iteration (by the break) cannot be run again, only finalized.
+    const read = store.write.prepare(pageSql);
+    try {
+      for (const row of read.iterate(after, page.size) as IterableIterator<DocumentRow>) {
+        rows.push(row);
+        bytes += row.data.length;
+        if (bytes >= page.bytes) break;
+      }
+    } finally {
+      read.finalize();
+    }
     for (const row of rows) {
       const stored = JSON.parse(row.data);
       if (pendingFiles.size) collectHeldIds(stored, pendingFiles, held);
@@ -276,8 +302,13 @@ function revalidate(
         rewritten++;
       }
     }
-    if (rows.length < pageSize) break;
+    if (rows.length < page.size && bytes < page.bytes) break;
     after = rows[rows.length - 1]!._id;
+    // The loop never yields, so the page just done (its rows, parses and
+    // rewrites) is only freed if collected here; a large table would
+    // otherwise pile up garbage until it ends.
+    rows.length = 0;
+    Bun.gc(true);
   }
   const release = store.write.query(`UPDATE _storage SET data = json_remove(data, '$.pending', '$.detachedAt') WHERE _id = ?`);
   for (const fileId of held) {

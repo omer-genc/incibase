@@ -88,25 +88,24 @@ export class AuthService {
       session.conn.query(`INSERT INTO _passwords (user_id, hash) VALUES (?, ?)`).run(id, hash);
       return id;
     });
-    return this.createSession(userId);
+    return this.createSession(userId, hash);
   }
 
   async signIn(input: unknown): Promise<AuthResult> {
     const { email, password } = this.parse(credentials, input);
-    const userId = this.findUserId(email);
-    const row = userId
-      ? (this.engine.store.write.query(`SELECT hash FROM _passwords WHERE user_id = ?`).get(userId) as { hash: string } | null)
-      : null;
-    // Verify against a dummy hash when the user is unknown so timing does not reveal it.
-    const ok = await this.hashing.run(async () =>
-      Bun.password.verify(password, row?.hash ?? (await (dummyHash ??= Bun.password.hash("incibase-dummy-password")))),
-    );
+    // The user and hash are read once the slot is ours, not before the wait: a password
+    // change or deletion that commits while this sign-in waits must count.
+    const checked = await this.hashing.run(async () => {
+      const userId = this.findUserId(email);
+      const hash = userId ? this.passwordHash(userId) : null;
+      // Verify against a dummy hash when the user is unknown so timing does not reveal it.
+      const ok = await Bun.password.verify(password, hash ?? (await (dummyHash ??= Bun.password.hash("incibase-dummy-password"))));
+      return ok && userId && hash ? { userId, hash } : null;
+    });
     // A disabled account answers like a wrong password, whatever the password: an account is often
     // disabled because it is under attack, and a distinct answer would confirm the right guess.
-    if (!userId || !row || !ok || this.isDisabled(userId)) {
-      throw new IncibaseError({ code: "INVALID_CREDENTIALS", message: "Invalid email or password" });
-    }
-    return this.createSession(userId);
+    if (!checked || this.isDisabled(checked.userId)) throw invalidCredentials();
+    return this.createSession(checked.userId, checked.hash);
   }
 
   async signOut(token: string) {
@@ -178,21 +177,32 @@ export class AuthService {
       z.object({ currentPassword: z.string(), newPassword: credentials.shape.password }),
       input,
     );
+    const wrong = () => new IncibaseError({ code: "INVALID_CREDENTIALS", message: "Current password is wrong" });
+    // One slot for the check and the new hash: they run one after the other, so they never need two.
+    // The current hash is read in the slot, so a change that committed during the wait counts.
+    const { current, hash } = await this.hashing.run(async () => {
+      const current = this.passwordHash(userId);
+      if (!current || !(await Bun.password.verify(currentPassword, current))) throw wrong();
+      return { current, hash: await Bun.password.hash(newPassword) };
+    });
+    // Replaces only the hash that was checked: when another change committed meanwhile,
+    // the current password given here is no longer the current one.
+    const token = await this.engine.writeTx((session) => {
+      const { changes } = session.conn
+        .query(`UPDATE _passwords SET hash = ? WHERE user_id = ? AND hash = ?`)
+        .run(hash, userId, current);
+      if (!changes) throw wrong();
+      this.revokeIn(session, userId);
+      return this.insertSession(session, userId);
+    });
+    return this.sessionResult(userId, token);
+  }
+
+  private passwordHash(userId: string): string | null {
     const row = this.engine.store.write.query(`SELECT hash FROM _passwords WHERE user_id = ?`).get(userId) as {
       hash: string;
     } | null;
-    // One slot for the check and the new hash: they run one after the other, so they never need two.
-    const hash = await this.hashing.run(async () => {
-      if (!row || !(await Bun.password.verify(currentPassword, row.hash))) {
-        throw new IncibaseError({ code: "INVALID_CREDENTIALS", message: "Current password is wrong" });
-      }
-      return Bun.password.hash(newPassword);
-    });
-    await this.engine.writeTx((session) => {
-      session.conn.query(`UPDATE _passwords SET hash = ? WHERE user_id = ?`).run(hash, userId);
-      this.revokeIn(session, userId);
-    });
-    return this.createSession(userId);
+    return row?.hash ?? null;
   }
 
   async getUser(userId: string) {
@@ -207,15 +217,33 @@ export class AuthService {
     return row?._id ?? null;
   }
 
-  private async createSession(userId: string): Promise<AuthResult> {
+  /**
+   * Opens a session for a user whose password matched `checkedHash`. The
+   * password check awaits (and may have waited for a slot), so the session is
+   * only written if that hash is still the user's and the user is not
+   * disabled: a password change, deletion or disable that committed meanwhile
+   * wins, and the sign-in fails as with a wrong password.
+   */
+  private async createSession(userId: string, checkedHash: string): Promise<AuthResult> {
+    const token = await this.engine.writeTx((session) => {
+      if (this.passwordHash(userId) !== checkedHash || this.isDisabled(userId)) throw invalidCredentials();
+      return this.insertSession(session, userId);
+    });
+    return this.sessionResult(userId, token);
+  }
+
+  /** Inserts a new session for `userId` in `session`'s transaction; returns its token. */
+  private insertSession(session: DbSession, userId: string): string {
     const token = `ik_${Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url")}`;
     const now = Date.now();
-    await this.engine.writeTx((session) => {
-      session.conn.query(`DELETE FROM _sessions WHERE expires_at < ?`).run(now);
-      session.conn
-        .query(`INSERT INTO _sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`)
-        .run(sha256(token), userId, now, now + SESSION_TTL_MS);
-    });
+    session.conn.query(`DELETE FROM _sessions WHERE expires_at < ?`).run(now);
+    session.conn
+      .query(`INSERT INTO _sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`)
+      .run(sha256(token), userId, now, now + SESSION_TTL_MS);
+    return token;
+  }
+
+  private async sessionResult(userId: string, token: string): Promise<AuthResult> {
     const user = (await this.getUser(userId)) as AuthResult["user"];
     return { token, user };
   }
@@ -298,3 +326,5 @@ export class AuthService {
 }
 
 let dummyHash: Promise<string> | null = null;
+
+const invalidCredentials = () => new IncibaseError({ code: "INVALID_CREDENTIALS", message: "Invalid email or password" });

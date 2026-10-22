@@ -80,11 +80,16 @@ export function fullJitter(capMs: number, random = Math.random): number {
   return Math.floor(random() * capMs);
 }
 
-/** The base URL a token belongs to: origin and path, without a trailing slash (relative URLs resolve against the page). */
+/**
+ * The base URL a token belongs to: origin and path, without a trailing slash.
+ * A relative URL ("" or "/" for a same-origin server) resolves against the
+ * page's origin, never its path: the key must not change from route to route.
+ */
 export function normalizeBaseUrl(url: string): string {
   try {
-    const base = (globalThis as { location?: { href?: string } }).location?.href;
-    const parsed = new URL(url, base);
+    const href = (globalThis as { location?: { href?: string } }).location?.href;
+    const base = href ? new URL("/", href).href : undefined;
+    const parsed = new URL(url || "/", base);
     return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
   } catch {
     return url.replace(/\/+$/, "");
