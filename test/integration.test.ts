@@ -3,7 +3,7 @@
 // database cap, uploads and the quota, and serve's start order.
 import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { IncibaseClient } from "incibase/client";
 import { action, defineSchema, defineTable, mutation, query, z } from "incibase/server";
@@ -385,6 +385,174 @@ describe("serve's start order", () => {
     } finally {
       db.close();
     }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Uploads: a crash on the way, the stop, and the defaults of a plain app
+
+const STORAGE_ADMIN = "ik_admin_integration_storage_key";
+
+describe("uploads and crashes", () => {
+  const app: AppDefinition = {
+    schema: defineSchema({ notes: defineTable({ body: z.string() }) }),
+    modules: {
+      app: {
+        /** Holds the write lock for `ms`. */
+        slowAdd: mutation({
+          args: { ms: z.number() },
+          handler: async (ctx: any, { ms }: { ms: number }) => {
+            await Bun.sleep(ms);
+            await ctx.db.insert("notes", { body: "slow" });
+          },
+        }),
+        remove: mutation({ args: { id: z.string() }, handler: (ctx: any, { id }: { id: string }) => ctx.storage.delete(id) }),
+      },
+    },
+  };
+  const start = (dataDir = dir(), options: Partial<ConstructorParameters<typeof Engine>[1]> = {}) => {
+    const engine = open(app, dataDir, { adminKey: STORAGE_ADMIN, ...options });
+    engine.start();
+    return { engine, url: serve(engine), dataDir };
+  };
+  const upload = (url: string, body: BodyInit) =>
+    fetch(`${url}/api/storage/upload`, { method: "POST", headers: { authorization: `Bearer ${STORAGE_ADMIN}` }, body });
+  const files = (dataDir: string) => readdirSync(join(dataDir, "storage")).sort();
+  const rows = (engine: Engine) => engine.store.write.query(`SELECT _id, data FROM _storage`).all() as { _id: string; data: string }[];
+
+  test("a file is stored only once its row counts it, so a crash never leaves a stored file nothing counts", async () => {
+    const { engine, url, dataDir } = start(dir(), { storage: { maxStorageBytes: 10 * 1024 * 1024 } });
+    // A long mutation holds the write lock while the upload arrives.
+    const slow = fetch(`${url}/api/mutation`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: "app:slowAdd", args: { ms: 400 } }),
+    });
+    await until(() => engine.runningCalls().includes("app:slowAdd"), "the mutation to start");
+    const pending = upload(url, new Uint8Array(300_000).fill(7));
+    await until(() => files(dataDir).some((f) => f.startsWith(".tmp-")), "the upload to be received");
+    await Bun.sleep(100);
+    // Received, waiting for the lock: only the temp file, which a start removes.
+    expect(files(dataDir).filter((f) => !f.startsWith(".tmp-"))).toEqual([]);
+    expect(rows(engine)).toEqual([]);
+    expect((await slow).status).toBe(200);
+    const { storageId } = (await (await pending).json()) as { storageId: string };
+    expect(files(dataDir)).toEqual([storageId]);
+    const [row] = rows(engine);
+    expect(JSON.parse(row!.data)).toMatchObject({ size: 300_000, pending: true });
+    expect(JSON.parse(row!.data).storing).toBeUndefined();
+    expect(engine.storage.storedBytes()).toBe(300_000);
+  });
+
+  test("a row a stopped process left marked storing is removed on start, with its file and its bytes", async () => {
+    const dataDir = dir();
+    const first = open(app, dataDir, { adminKey: STORAGE_ADMIN });
+    // The process dies after the row and the file, before the mark is cleared.
+    const put = spyOn((first.storage as any).backend, "putFile").mockImplementation(async () => {
+      await new Promise(() => {});
+    });
+    const half = first.storage.store(new Blob(["half stored"])).catch(() => {});
+    await until(() => rows(first).length === 1, "the row");
+    const id = rows(first)[0]!._id;
+    expect(JSON.parse(rows(first)[0]!.data)).toMatchObject({ storing: true, size: 11 });
+    expect(first.storage.storedBytes()).toBe(11);
+    writeFileSync(join(dataDir, "storage", id), "half stored");
+    put.mockRestore();
+    await first.stop();
+    void half;
+
+    // A preflight on a copy (no start) leaves it: it shares the S3 bucket with the live process.
+    const preflight = open(app, dataDir, { adminKey: STORAGE_ADMIN });
+    expect(rows(preflight)).toHaveLength(1);
+    await preflight.stop();
+    expect(files(dataDir)).toEqual([id]);
+
+    const next = open(app, dataDir, { adminKey: STORAGE_ADMIN });
+    next.start();
+    await until(() => rows(next).length === 0, "the recovery");
+    await until(() => files(dataDir).length === 0, "the file to go");
+    expect(next.storage.storedBytes()).toBe(0);
+  });
+
+  test("a failed store removes its row and its bytes", async () => {
+    const { engine } = start();
+    const put = spyOn((engine.storage as any).backend, "putFile").mockImplementation(async () => {
+      throw new Error("bucket unreachable");
+    });
+    try {
+      await expect(engine.storage.store(new Blob(["x"]))).rejects.toThrow("bucket unreachable");
+    } finally {
+      put.mockRestore();
+    }
+    expect(rows(engine)).toEqual([]);
+    expect(engine.storage.storedBytes()).toBe(0);
+  });
+
+  test("a stop waits for the file deletes that follow a commit", async () => {
+    const { engine, url, dataDir } = start();
+    const { storageId } = (await (await upload(url, "to delete")).json()) as { storageId: string };
+    const backend = (engine.storage as any).backend;
+    const realDelete = backend.delete.bind(backend);
+    const del = spyOn(backend, "delete").mockImplementation(async (id: unknown) => {
+      await Bun.sleep(300);
+      await realDelete(id);
+    });
+    try {
+      await engine.call("app:remove", { id: storageId }, { userId: null, admin: true });
+      await engine.stop();
+      expect(files(dataDir)).toEqual([]);
+    } finally {
+      del.mockRestore();
+    }
+  });
+});
+
+describe("a plain app's limits", () => {
+  test("uploads and password hashing are not limited unless a limit is set", async () => {
+    const engine = open({ modules: {} });
+    expect(engine.storage.uploads.limit).toBe(Infinity);
+    expect(engine.auth.hashing.limit).toBe(Infinity);
+    // 16 sign-ups at once all run at once.
+    const results = await Promise.all(
+      Array.from({ length: 16 }, (_, i) => engine.auth.signUp({ email: `u${i}@example.com`, password: "password123" })),
+    );
+    expect(results).toHaveLength(16);
+    expect(engine.auth.hashing.queued).toBe(0);
+  });
+
+  test("over TCP, an upload queued for a slot longer than Bun's idle timeout is not reset", async () => {
+    const engine = open({ modules: {} }, dir(), { adminKey: STORAGE_ADMIN, storage: { uploadConcurrency: 1, uploadQueueTimeoutMs: 20_000 } });
+    const url = serve(engine);
+    const total = 70 * 4096;
+    // The first upload holds the slot for about 14 s, sending a little every 200 ms.
+    let sent = 0;
+    const slow = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (sent >= total) return controller.close();
+        if (sent > 0) await Bun.sleep(200);
+        controller.enqueue(new Uint8Array(4096).fill(1));
+        sent += 4096;
+      },
+    });
+    const headers = { authorization: `Bearer ${STORAGE_ADMIN}` };
+    const first = fetch(`${url}/api/storage/upload`, { method: "POST", headers, body: slow, duplex: "half" } as RequestInit);
+    await until(() => engine.storage.uploads.active === 1, "the first upload to take the slot");
+    // The second, from another process, is larger than the socket buffers: it waits, unread, past 10 s.
+    const started = performance.now();
+    const client = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        `const res = await fetch(${JSON.stringify(`${url}/api/storage/upload`)}, { method: "POST", headers: ${JSON.stringify(headers)}, body: new Uint8Array(8 * 1024 * 1024) })
+          .then((r) => r.status, (e) => String(e.code ?? e));
+        console.log(res);`,
+      ],
+      { stdout: "pipe", stderr: "pipe", timeout: 25_000 },
+    );
+    const second = (await new Response(client.stdout).text()).trim();
+    expect(performance.now() - started).toBeGreaterThan(10_000);
+    expect(second).toBe("200");
+    expect((await first).status).toBe(200);
   }, 30_000);
 });
 

@@ -36,7 +36,7 @@ export class ConcurrencyGate {
 
   constructor(
     readonly limit: number,
-    private readonly maxWaitMs: number,
+    readonly maxWaitMs: number,
     options: { busy: () => Error; aborted?: string; maxQueued?: number },
   ) {
     this.busy = options.busy;
@@ -50,6 +50,11 @@ export class ConcurrencyGate {
 
   get queued() {
     return this.waiting.length;
+  }
+
+  /** Whether an `acquire` now would have to wait. */
+  get full() {
+    return this.running >= this.limit || this.waiting.length > 0;
   }
 
   /** Waits for a free slot; the returned function frees it. A request that is aborted while waiting leaves the queue. */

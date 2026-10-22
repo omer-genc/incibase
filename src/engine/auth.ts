@@ -40,14 +40,15 @@ export interface SessionRef {
 
 export interface AuthOptions {
   /**
-   * Password hashes and checks run at once (default 4); `INCIBASE_AUTH_CONCURRENCY`
-   * wins when set. Each takes about 64 MiB (argon2id), so this bounds what a
-   * burst of sign-ins can allocate.
+   * Password hashes and checks run at once; `INCIBASE_AUTH_CONCURRENCY` wins
+   * when set. Each takes about 64 MiB (argon2id), so this bounds what a burst
+   * of sign-ins can allocate. Default: no limit, as in 0.2.0 (a host sets one
+   * from its memory budget).
    */
   concurrency?: number;
   /** How long a sign-in, sign-up or password change waits for a slot before AUTH_BUSY (default 10 s). */
   queueTimeoutMs?: number;
-  /** How many may wait at once (default 256); the next one gets AUTH_BUSY without waiting. */
+  /** How many may wait at once (default 256 when there is a limit); the next one gets AUTH_BUSY without waiting. */
   maxQueued?: number;
 }
 
@@ -60,7 +61,8 @@ export class AuthService {
     private readonly engine: Engine,
     options: AuthOptions = {},
   ) {
-    const limit = positiveIntFromEnv("INCIBASE_AUTH_CONCURRENCY") ?? checkPositiveInt(options.concurrency, "auth.concurrency") ?? 4;
+    // Unlimited unless a limit is set: a plain app keeps 0.2.0's throughput.
+    const limit = positiveIntFromEnv("INCIBASE_AUTH_CONCURRENCY") ?? checkPositiveInt(options.concurrency, "auth.concurrency") ?? Infinity;
     this.hashing = new ConcurrencyGate(limit, checkPositiveInt(options.queueTimeoutMs, "auth.queueTimeoutMs") ?? 10_000, {
       busy: () =>
         new LimitError(

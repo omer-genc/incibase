@@ -120,6 +120,9 @@ export async function listenError(err: unknown, hostname: string, port: number):
   return real && PERMANENT_BIND_ERRORS[real] ? fail(PERMANENT_BIND_ERRORS[real](port)) : err;
 }
 
+/** Bun's default idle timeout, kept for TCP listeners (and restored after an upload's wait for a slot). */
+const TCP_IDLE_TIMEOUT_S = 10;
+
 type Handler = (req: Request & { params: Record<string, string> }, server: Server<SocketData>) => Response | Promise<Response | undefined> | undefined;
 
 export function startServer(engine: Engine, options: ServeOptions): Server<SocketData> {
@@ -288,7 +291,7 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
       ? // The front proxy owns the timeouts: Bun's default (10 s) would cut requests it still waits for.
         // Bun's types leave idleTimeout out for unix sockets, but it applies there too.
         ({ unix: options.unix, idleTimeout: 0 } as { unix: string })
-      : { port: options.port, hostname: options.hostname }),
+      : { port: options.port, hostname: options.hostname, idleTimeout: TCP_IDLE_TIMEOUT_S }),
     // Bun's debug error pages show messages and source; keep them to dev.
     development: dev,
     // Routes read their bodies with their own limits; this caps everything else (HTTP actions).
@@ -334,7 +337,7 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
       }),
 
       "/api/storage/upload": route({
-        POST: async (req) => {
+        POST: async (req, server) => {
           const url = new URL(req.url);
           const identity = engine.auth.identifyRequest(req);
           // The signed upload URL decides visibility; an admin (or the upload scope) may pass ?visibility= directly.
@@ -350,7 +353,17 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
             throw new IncibaseError({ code: "FORBIDDEN", message: "Invalid or expired upload URL" });
           }
           // Streamed to disk and counted as it arrives, so a chunked body without Content-Length cannot skip the limit.
-          const storageId = await engine.storage.receive(req, grant);
+          // While it waits for a slot its body is not read: over TCP, Bun's idle timeout would reset the connection
+          // before the wait ends, so it is extended for the wait (a unix socket has none; the proxy owns the timeouts).
+          const queueSeconds = Math.ceil(engine.storage.uploads.maxWaitMs / 1000);
+          const storageId = await engine.storage.receive(req, grant, (queued) => {
+            if (options.unix) return;
+            try {
+              server.timeout(req, queued ? queueSeconds + TCP_IDLE_TIMEOUT_S : TCP_IDLE_TIMEOUT_S);
+            } catch {
+              // The client is gone; the wait ends with its abort.
+            }
+          });
           return Response.json({ storageId });
         },
       }),

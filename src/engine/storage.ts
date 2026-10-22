@@ -6,7 +6,7 @@ import { IncibaseError } from "../errors.ts";
 import type { DbSession } from "./database.ts";
 import { collectHeldIds, contentTypeMatches } from "./files.ts";
 import { ensurePrivateDir, quoteIdent } from "./store.ts";
-import type { Engine, Identity } from "./engine.ts";
+import type { Engine, Identity, WriteTxOptions } from "./engine.ts";
 import { logEvent } from "./log.ts";
 import { bytesFromEnv, checkBytes, checkPositiveInt, LimitError, positiveIntFromEnv, s3Key, s3PrefixFrom } from "./limits.ts";
 import { receiveToFile, removeTempFiles, tempPathFor, UploadGate } from "./upload.ts";
@@ -16,7 +16,7 @@ const DEFAULT_SIGNED_URL_SECONDS = 60 * 60;
 
 export type Visibility = "public" | "private";
 
-/** The row is gone; only the stored bytes are left behind, for the next cleanup to find. */
+/** The row is gone (and its bytes no longer count toward the quota); its stored file is left behind and nothing collects it. */
 function blobDeleteFailed(storageId: string, err: unknown) {
   logEvent("error", { ev: "storage_error", what: "blob delete", storageId, err }, ["[incibase] blob delete failed:", err]);
 }
@@ -88,7 +88,7 @@ export interface StorageOptions {
   maxUploadBytes?: number;
   /** Max bytes of all stored files together; uploads past it fail with STORAGE_QUOTA. Default none. `INCIBASE_MAX_STORAGE_BYTES` wins when set. */
   maxStorageBytes?: number;
-  /** Uploads processed at once (default 2); `INCIBASE_UPLOAD_CONCURRENCY` wins when set. */
+  /** Uploads processed at once (default: no limit, as in 0.2.0); `INCIBASE_UPLOAD_CONCURRENCY` wins when set. */
   uploadConcurrency?: number;
   /** How long an upload waits for a free slot before UPLOADS_BUSY (default 30 s). */
   uploadQueueTimeoutMs?: number;
@@ -171,6 +171,8 @@ export class StorageService {
   readonly uploads: UploadGate;
   /** Where uploads are received before they are stored: the local storage dir, so storing one locally is a rename. */
   private readonly tempDir: string;
+  /** File deletes running now (after a commit), which a stop waits for. */
+  private readonly deleting = new Set<Promise<void>>();
   private readonly cleanupPolicy: { unattachedHours: number; detachedHours: number } | null;
 
   constructor(
@@ -180,8 +182,9 @@ export class StorageService {
     const backend = options.backend ?? (process.env.INCIBASE_STORAGE === "s3" ? "s3" : "local");
     this.maxUploadBytes = bytesFromEnv("INCIBASE_MAX_UPLOAD_BYTES") ?? checkBytes(options.maxUploadBytes, "maxUploadBytes") ?? 100 * 1024 * 1024;
     this.maxStorageBytes = bytesFromEnv("INCIBASE_MAX_STORAGE_BYTES") ?? checkBytes(options.maxStorageBytes, "maxStorageBytes");
+    // Unlimited unless a limit is set: the host sets one from its memory budget; a plain app keeps 0.2.0's behaviour.
     this.uploads = new UploadGate(
-      positiveIntFromEnv("INCIBASE_UPLOAD_CONCURRENCY") ?? checkPositiveInt(options.uploadConcurrency, "uploadConcurrency") ?? 2,
+      positiveIntFromEnv("INCIBASE_UPLOAD_CONCURRENCY") ?? checkPositiveInt(options.uploadConcurrency, "uploadConcurrency") ?? Infinity,
       checkPositiveInt(options.uploadQueueTimeoutMs, "uploadQueueTimeoutMs") ?? 30_000,
     );
     this.tempDir = join(engine.options.dataDir, "storage");
@@ -270,13 +273,19 @@ export class StorageService {
 
   /**
    * Stores an upload's body (`POST /api/storage/upload`) under `grant`.
-   * At most `uploads.limit` run at once; the rest wait their turn (see UploadGate).
+   * At most `uploads.limit` run at once; the rest wait their turn (see
+   * UploadGate). `waiting` is called with true when this one has to wait
+   * (its body is not read meanwhile), and with false once it may go on.
    */
-  async receive(req: Request, grant: UploadGrant): Promise<string> {
+  async receive(req: Request, grant: UploadGrant, waiting?: (queued: boolean) => void): Promise<string> {
     const declared = Number(req.headers.get("content-length") ?? NaN);
     // Refused before waiting for a slot, when the declared size already says no.
     this.checkUploadSize(declared, this.uploadLimit(grant.maxBytes), this.quotaLeft());
-    const release = await this.uploads.acquire(req.signal);
+    const queued = this.uploads.full;
+    if (queued) waiting?.(true);
+    const release = await this.uploads.acquire(req.signal).finally(() => {
+      if (queued) waiting?.(false);
+    });
     try {
       return await this.storeStream(req.body, declared, { ...grant, contentType: req.headers.get("content-type") ?? undefined });
     } finally {
@@ -321,9 +330,14 @@ export class StorageService {
 
   /**
    * Streams `body` into a temp file (counted, hashed, its type checked from
-   * the first bytes), stores it with the backend, then adds the `_storage`
-   * row and its bytes to the total in one transaction, checking the quota.
-   * The file is never in memory whole, and nothing is left behind on failure.
+   * the first bytes), adds the `_storage` row (marked `storing`) and its bytes
+   * to the total in one transaction, checking the quota, then stores the file
+   * with the backend and clears the mark. The file is never in memory whole,
+   * and nothing is left behind on failure. A process that dies on the way
+   * leaves a temp file (removed on start) or a row marked `storing`, whose
+   * bytes still count toward the quota and which the next start removes with
+   * its stored file (see `recoverInterrupted`): never a stored file without
+   * a row.
    */
   private async storeStream(
     body: ReadableStream<Uint8Array> | null,
@@ -350,38 +364,99 @@ export class StorageService {
         }
       },
     });
+    const doc = {
+      ...(type ? { contentType: type } : {}),
+      size: file.size,
+      sha256: file.sha256,
+      visibility,
+      ...(options.ownerId ? { ownerId: options.ownerId } : {}),
+      ...(options.anonymous && !options.ownerId ? { anonymous: true } : {}),
+      ...(options.serviceKeyId && !options.ownerId ? { serviceKeyId: options.serviceKeyId } : {}),
+      // Collected by cleanup() unless a document references it in time.
+      pending: true,
+    };
+    let stored = false;
     try {
       // Other uploads may have finished meanwhile; checked again in the transaction.
       if (file.size > this.quotaLeft()) throw this.quotaError();
+      // The row (and its bytes) first, so a crash never leaves a stored file nothing counts or collects.
+      await this.engine.writeTx((session) => {
+        if (this.maxStorageBytes !== undefined && this.storedBytes() + file.size > this.maxStorageBytes) throw this.quotaError();
+        session.insertRaw(table, JSON.stringify({ ...doc, storing: true }), id);
+        addStoredBytes(session, file.size);
+      });
+      stored = true;
       await this.backend.putFile(id, file.path, type);
+      await this.engine.writeTx((session) => session.updateRaw(table, id, JSON.stringify(doc)));
+    } catch (err) {
+      if (stored) await this.discardStoring(id, file.size);
+      throw err;
     } finally {
       rmSync(file.path, { force: true });
     }
+    return id;
+  }
+
+  /** Removes an upload that failed after its row was added: the row, its bytes and whatever the backend got. */
+  private async discardStoring(id: string, size: number) {
     try {
       await this.engine.writeTx((session) => {
-        if (this.maxStorageBytes !== undefined && this.storedBytes() + file.size > this.maxStorageBytes) throw this.quotaError();
-        session.insertRaw(
-          table,
-          JSON.stringify({
-            ...(type ? { contentType: type } : {}),
-            size: file.size,
-            sha256: file.sha256,
-            visibility,
-            ...(options.ownerId ? { ownerId: options.ownerId } : {}),
-            ...(options.anonymous && !options.ownerId ? { anonymous: true } : {}),
-            ...(options.serviceKeyId && !options.ownerId ? { serviceKeyId: options.serviceKeyId } : {}),
-            // Collected by cleanup() unless a document references it in time.
-            pending: true,
-          }),
-          id,
-        );
-        addStoredBytes(session, file.size);
+        if (!session.conn.query(`SELECT 1 FROM _storage WHERE _id = ?`).get(id)) return;
+        session.deleteRaw(session.systemTable("_storage"), id);
+        addStoredBytes(session, -size);
       });
     } catch (err) {
-      await this.backend.delete(id);
-      throw err;
+      // The row stays marked `storing`; the next start removes it.
+      logEvent("error", { ev: "storage_error", what: "discard upload", storageId: id, err }, ["[incibase] could not discard a failed upload:", err]);
+      return;
     }
-    return id;
+    await this.deleteBlob(id);
+  }
+
+  /**
+   * Removes uploads a previous process left half done: rows still marked
+   * `storing`, with their bytes and whatever the backend stored for them.
+   * Run by the scheduler's start (never by a `--migrate-only` preflight,
+   * whose copy of the data shares the S3 bucket with the live process); rows
+   * this process added are left alone.
+   */
+  async recoverInterrupted(options: WriteTxOptions = {}): Promise<number> {
+    const startedAt = this.engine.startedAt;
+    // Read first, on the read connection: almost always there is nothing, and then no write lock is needed.
+    const any = this.engine.store.read
+      .query(`SELECT 1 FROM _storage WHERE json_extract(data, '$.storing') = 1 AND _creationTime < ? LIMIT 1`)
+      .get(startedAt);
+    if (!any) return 0;
+    const ids = await this.engine.writeTx((session) => {
+      const rows = session.conn
+        .query(`SELECT _id, data FROM _storage WHERE json_extract(data, '$.storing') = 1 AND _creationTime < ?`)
+        .all(startedAt) as { _id: string; data: string }[];
+      const table = session.systemTable("_storage");
+      for (const row of rows) {
+        session.deleteRaw(table, row._id);
+        addStoredBytes(session, -sizeOf(JSON.parse(row.data)));
+      }
+      return rows.map((r) => r._id);
+    }, undefined, options);
+    if (ids.length) logEvent("warn", { ev: "uploads_recovered", msg: "removed uploads a stopped process left half stored", storageIds: ids });
+    await Promise.all(ids.map((id) => this.deleteBlob(id)));
+    return ids.length;
+  }
+
+  /** Deletes a stored file, logging a failure; `settled` waits for the deletes still running. */
+  private deleteBlob(id: string): Promise<void> {
+    const deleting = this.backend.delete(id).catch((err) => blobDeleteFailed(id, err));
+    this.deleting.add(deleting);
+    void deleting.finally(() => this.deleting.delete(deleting));
+    return deleting;
+  }
+
+  /** Resolves once the file deletes started so far have finished, or after `timeoutMs`: for a stop, so they are not cut. */
+  async settled(timeoutMs = 5000): Promise<void> {
+    if (!this.deleting.size) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([Promise.all(this.deleting), new Promise<void>((resolve) => (timer = setTimeout(resolve, timeoutMs)))]);
+    clearTimeout(timer);
   }
 
   /** Files and bytes owned by a user, e.g. for upload quotas. */
@@ -426,7 +501,7 @@ export class StorageService {
         if (referenced.has(row._id)) continue;
         session.deleteRaw(table, row._id);
         addStoredBytes(session, -sizeOf(JSON.parse(row.data)));
-        session.onCommit(() => void this.backend.delete(row._id).catch((err) => blobDeleteFailed(row._id, err)));
+        session.onCommit(() => void this.deleteBlob(row._id));
         deleted++;
       }
       return deleted;
@@ -524,7 +599,7 @@ export class StorageService {
     const doc = await this.loadOwned(session, id, identity, bypass, "delete");
     session.deleteRaw(this.storageTable(session, id), id);
     addStoredBytes(session, -sizeOf(doc));
-    session.onCommit(() => void this.backend.delete(id).catch((err) => blobDeleteFailed(id, err)));
+    session.onCommit(() => void this.deleteBlob(id));
   }
 
   /** Unchecked; callers decide who may change visibility (see `setVisibility` in contexts). */

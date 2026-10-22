@@ -249,6 +249,8 @@ export class Engine {
     this.realtime.stop();
     await this.writeLock.run(() => {});
     await this.readLock.run(() => {});
+    // Files deleted after a commit: their rows are gone, so a delete cut here would leave the file for good.
+    await this.storage.settled();
     this.store.close();
   }
 
