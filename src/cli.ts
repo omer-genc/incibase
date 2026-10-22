@@ -11,7 +11,7 @@ import { Engine, type AppDefinition } from "./engine/engine.ts";
 import { startServer } from "./engine/http.ts";
 import { loadAppFromDir } from "./engine/loader.ts";
 import { MigrationError } from "./engine/migrate.ts";
-import { Store } from "./engine/store.ts";
+import { DataDirLockedError, readMeta } from "./engine/store.ts";
 import { VERSION } from "./engine/version.ts";
 
 const HELP = `incibase ${VERSION} — Zod-typed backend in one binary
@@ -105,9 +105,13 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
         console.error(`No database at ${db}; start the server once first.`);
         process.exit(1);
       }
-      const store = new Store(db);
-      console.log(process.env.INCIBASE_ADMIN_KEY ?? store.getMeta("admin_key"));
-      store.close();
+      // Read-only and without the data dir lock: works while the server runs, and never changes the database.
+      const key = process.env.INCIBASE_ADMIN_KEY ?? readMeta(db, "admin_key");
+      if (!key) {
+        console.error(`No admin key in ${db}; start the server once first.`);
+        process.exit(1);
+      }
+      console.log(key);
       return;
     }
     default:
@@ -131,6 +135,8 @@ async function serve(values: Values, embedded?: AppDefinition) {
   } catch (err) {
     if (err instanceof MigrationError) {
       console.error(`\x1b[31m${err.message}\x1b[0m\nFix the schema (or the data) and save again.`);
+    } else if (err instanceof DataDirLockedError) {
+      console.error(`\x1b[31m${err.message}\x1b[0m`);
     } else {
       console.error(err);
     }
@@ -151,6 +157,8 @@ async function serve(values: Values, embedded?: AppDefinition) {
   engine.start();
   const dashboard = !values["no-dashboard"];
   const server = startServer(engine, { port, hostname: values.host ?? (dev ? "localhost" : "0.0.0.0"), dashboard });
+  // Only once serving: a startup error must still exit instead of leaving a process that serves nothing.
+  installCrashHandlers();
 
   const mcpUrl = `${publicUrl}/mcp`;
   const tableCount = [...engine.store.tables.values()].filter((t) => !t.system).length;
@@ -179,12 +187,35 @@ async function serve(values: Values, embedded?: AppDefinition) {
   const shutdown = async () => {
     if (stopping) return;
     stopping = true;
-    server.stop(true);
-    await engine.stop();
-    process.exit(0);
+    // A failure here must still exit: the crash handlers would otherwise keep the process up.
+    let code = 0;
+    try {
+      server.stop(true);
+      await engine.stop();
+    } catch (err) {
+      console.error("[incibase] shutdown failed:", err);
+      code = 1;
+    }
+    process.exit(code);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+/**
+ * Logs errors that escape every handler and keeps serving, for `serve` and the
+ * server process of `dev`. Bun exits on them by default, so one deployed
+ * function that forgets an `await` (say on ctx.runMutation) would take every
+ * client down, and nothing restarts the server. Carrying on is safe: all state
+ * is in SQLite, and a write that failed was rolled back with its transaction.
+ */
+export function installCrashHandlers() {
+  process.on("unhandledRejection", (reason) => {
+    console.error("[incibase] unhandled promise rejection (a missing await?); still serving:", reason);
+  });
+  process.on("uncaughtException", (err, origin) => {
+    console.error(`[incibase] uncaught exception (${origin}); still serving:`, err);
+  });
 }
 
 function selfCommand(): string[] {

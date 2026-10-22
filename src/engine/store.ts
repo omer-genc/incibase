@@ -1,4 +1,6 @@
 import { Database } from "bun:sqlite";
+import { chmodSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import type { z } from "zod";
 import { FIELD_PATH_REGEX, type IndexDefinition } from "../schema.ts";
 import type { StorageField } from "./files.ts";
@@ -76,30 +78,191 @@ export function rowToDoc(row: DocumentRow): Document {
   return { _id: row._id, _creationTime: row._creationTime, ...JSON.parse(row.data) };
 }
 
+// Owner-only access: other users on the host must not read the database or file blobs.
+const PRIVATE_DIR_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+
+/** Drops the permission bits of an existing `path` that `mode` does not allow. */
+function restrictMode(path: string, mode: number) {
+  if (process.platform === "win32") return;
+  let current: number;
+  try {
+    current = statSync(path).mode & 0o777;
+  } catch {
+    return;
+  }
+  if ((current & ~mode) === 0) return;
+  try {
+    chmodSync(path, current & mode);
+  } catch (err) {
+    console.warn(`[incibase] could not restrict ${path} to mode ${mode.toString(8)}: ${(err as Error).message}`);
+  }
+}
+
+/** Creates `dir` (mode 0700), or tightens it if it already exists. */
+export function ensurePrivateDir(dir: string) {
+  mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
+  restrictMode(dir, PRIVATE_DIR_MODE);
+}
+
+/**
+ * Creates an empty `path` (mode 0600), or tightens it, and says whether it
+ * created it. SQLite gives -wal and -shm files the mode of their database.
+ */
+function ensurePrivateFile(path: string): boolean {
+  let created = false;
+  // Only open the file when it is missing: closing another descriptor of a
+  // file drops this process's SQLite (POSIX) locks on it.
+  if (!existsSync(path)) {
+    try {
+      writeFileSync(path, "", { flag: "wx", mode: PRIVATE_FILE_MODE });
+      created = true;
+    } catch (err) {
+      if ((err as { code?: string }).code !== "EEXIST") throw err;
+    }
+  }
+  restrictMode(path, PRIVATE_FILE_MODE);
+  return created;
+}
+
+/**
+ * Whether another connection (in any process) has the database at `path`
+ * open: a connection that has used a WAL database holds a shared lock on it
+ * until it closes, which an exclusive-mode transaction cannot get past.
+ */
+function openElsewhere(path: string): boolean {
+  if (!existsSync(path)) return false;
+  const db = new Database(path, { readwrite: true });
+  try {
+    db.run("PRAGMA locking_mode = EXCLUSIVE");
+    db.run("BEGIN EXCLUSIVE");
+    db.run("COMMIT");
+    return false;
+  } catch (err) {
+    if ((err as { code?: string }).code === "SQLITE_BUSY") return true;
+    throw err;
+  } finally {
+    db.close();
+  }
+}
+
+export class DataDirLockedError extends Error {
+  constructor(readonly dataDir: string) {
+    super(`Data directory ${dataDir} is in use by another incibase process. Stop it first, or use a different data directory.`);
+    this.name = "DataDirLockedError";
+  }
+}
+
+/**
+ * One process serves a data dir at a time: a second one would run every cron
+ * again and fail the first one's running jobs on start. The lock is an open
+ * EXCLUSIVE transaction on `<dir>/LOCK`; the OS drops it when the process
+ * exits or crashes, so it never goes stale. Never delete LOCK: the lock is on
+ * the file, so a process that creates a new one gets a lock of its own.
+ *
+ * As a backstop, a process that has to create LOCK (first start, a deleted
+ * LOCK, or a data dir of an incibase without the lock) first checks that no
+ * other process has `database` open. If one does, it removes the LOCK it
+ * created, so the next start checks again.
+ */
+export class DataDirLock {
+  private db: Database | null;
+
+  constructor(dir: string, database?: string) {
+    const path = join(dir, "LOCK");
+    const created = ensurePrivateFile(path);
+    const db = new Database(path, { create: true });
+    try {
+      db.run("PRAGMA locking_mode = EXCLUSIVE");
+      db.run("PRAGMA journal_mode = MEMORY"); // no LOCK-journal file
+      db.run("BEGIN EXCLUSIVE");
+    } catch (err) {
+      db.close();
+      const code = (err as { code?: string }).code;
+      if (code === "SQLITE_BUSY") throw new DataDirLockedError(resolve(dir));
+      if (code === "SQLITE_NOTADB") {
+        throw new Error(
+          `${resolve(path)} is not an incibase lock file (incibase keeps an empty SQLite database there). ` +
+            `If another tool wrote it, move it away; then start again.`,
+        );
+      }
+      throw err;
+    }
+    try {
+      if (created && database && openElsewhere(database)) throw new DataDirLockedError(resolve(dir));
+    } catch (err) {
+      // Removed while still held, so the next start finds no LOCK and checks again.
+      try {
+        rmSync(path, { force: true });
+      } catch {
+        // best effort: Windows cannot remove an open file
+      }
+      db.close();
+      throw err;
+    }
+    this.db = db;
+  }
+
+  release() {
+    this.db?.close();
+    this.db = null;
+  }
+}
+
+/**
+ * Reads one `_incibase_meta` value over a read-only connection: no lock, no
+ * DDL and no writes, so it is safe while a server runs on the database.
+ */
+export function readMeta(path: string, key: string): string | null {
+  const db = new Database(path, { readonly: true, strict: true });
+  try {
+    db.run("PRAGMA busy_timeout = 5000");
+    if (!db.query(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_incibase_meta'`).get()) return null;
+    const row = db.query(`SELECT value FROM _incibase_meta WHERE key = ?`).get(key) as { value: string } | null;
+    return row?.value ?? null;
+  } finally {
+    db.close();
+  }
+}
+
 /**
  * Two SQLite connections on one WAL database: `write` runs mutations one at a
- * time, `read` runs queries against the last committed state.
+ * time, `read` runs queries against the last committed state. A Store holds
+ * the lock of the database's directory until it is closed.
  */
 export class Store {
   readonly write: Database;
   readonly read: Database;
   readonly tables = new Map<string, TableInfo>();
   private readonly byNumber = new Map<number, TableInfo>();
+  private readonly lock: DataDirLock;
   private lastCreationTime = 0;
 
   constructor(readonly path: string) {
-    this.write = new Database(path, { create: true, strict: true });
-    this.write.run("PRAGMA journal_mode = WAL");
-    this.write.run("PRAGMA synchronous = NORMAL");
-    this.write.run("PRAGMA busy_timeout = 5000");
-    this.initSystem();
-    this.read = new Database(path, { readonly: true, strict: true });
-    this.read.run("PRAGMA busy_timeout = 5000");
+    this.lock = new DataDirLock(dirname(path), path);
+    let write: Database | undefined;
+    try {
+      ensurePrivateFile(path);
+      restrictMode(`${path}-wal`, PRIVATE_FILE_MODE);
+      restrictMode(`${path}-shm`, PRIVATE_FILE_MODE);
+      this.write = write = new Database(path, { create: true, strict: true });
+      this.write.run("PRAGMA journal_mode = WAL");
+      this.write.run("PRAGMA synchronous = NORMAL");
+      this.write.run("PRAGMA busy_timeout = 5000");
+      this.initSystem();
+      this.read = new Database(path, { readonly: true, strict: true });
+      this.read.run("PRAGMA busy_timeout = 5000");
+    } catch (err) {
+      write?.close();
+      this.lock.release();
+      throw err;
+    }
   }
 
   close() {
     this.read.close();
     this.write.close();
+    this.lock.release();
   }
 
   private initSystem() {

@@ -2,13 +2,26 @@ import { getFunctionPath } from "../api.ts";
 import { IncibaseError } from "../errors.ts";
 import type { CronJob } from "../server.ts";
 import type { DbSession } from "./database.ts";
-import type { Engine, Identity } from "./engine.ts";
+import type { Engine, Identity, WriteTxOptions } from "./engine.ts";
 import { quoteIdent, rowToDoc, type DocumentRow } from "./store.ts";
 
 const SYSTEM_IDENTITY: Identity = { userId: null, admin: false, system: true };
 const MAX_TIMEOUT = 2 ** 31 - 1;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_CONCURRENT = 8;
+/** Waits between attempts after a background write fails (e.g. SQLITE_BUSY): doubles from MIN up to MAX. */
+const RETRY_MIN_MS = 100;
+const RETRY_MAX_MS = 5_000;
+/**
+ * Background writes wait this long for another process's write lock, not the
+ * 5s busy_timeout: bun:sqlite waits synchronously, so a long wait would freeze
+ * reads, HTTP and WebSockets. The retry backoff does the rest of the waiting.
+ */
+const BACKGROUND: WriteTxOptions = { busyTimeoutMs: 50 };
+
+function backoff(failures: number) {
+  return Math.min(RETRY_MIN_MS * 2 ** failures, RETRY_MAX_MS);
+}
 
 interface ScheduledDoc {
   _id: string;
@@ -21,12 +34,21 @@ interface ScheduledDoc {
 /**
  * Runs `_scheduled` jobs (from ctx.scheduler) and cron jobs (from crons.ts).
  * Scheduling inside a mutation is part of its transaction.
+ *
+ * Background work never rejects: a failure is logged and retried later, so a
+ * busy or failing database cannot crash the process or stall the scheduler.
  */
 export class Scheduler {
   private timer: Timer | null = null;
   private cronTimers: Timer[] = [];
   private pruneTimer: Timer | null = null;
-  private running = 0;
+  /** Ids of the claimed jobs this process is running; each holds one of MAX_CONCURRENT slots. */
+  private readonly active = new Set<string>();
+  private claiming = false;
+  /** Consecutive failed claims or pokes, for the backoff. */
+  private failures = 0;
+  /** Wakes pending retry waits on stop. */
+  private readonly wakers = new Set<() => void>();
   private stopped = true;
 
   constructor(private readonly engine: Engine) {}
@@ -34,15 +56,19 @@ export class Scheduler {
   start() {
     this.stopped = false;
     // Jobs left "running" by a crash never finished; mark them failed rather than run twice.
-    void this.engine.writeTx((session) => {
-      for (const job of this.jobsInState(session, "running", 10_000)) {
-        this.update(session, job, { state: "failed", completedAt: Date.now(), error: "Interrupted by server restart" });
-      }
-    });
+    // A retry can land after this process claimed jobs of its own, so those are skipped.
+    void this.persist("restart recovery", () =>
+      this.backgroundTx((session) => {
+        for (const job of this.jobsInState(session, "running", 10_000)) {
+          if (this.active.has(job._id)) continue;
+          this.update(session, job, { state: "failed", completedAt: Date.now(), error: "Interrupted by server restart" });
+        }
+      }),
+    );
     for (const job of this.engine.crons?.jobs ?? []) this.startCron(job);
     this.pruneTimer = setInterval(() => {
-      void this.prune();
-      void this.engine.storage.cleanup().catch((err) => console.error("[incibase] storage cleanup failed:", err));
+      void this.prune().catch((err) => this.report("prune", err));
+      void this.engine.storage.cleanup().catch((err) => this.report("storage cleanup", err));
     }, 60 * 60 * 1000);
     this.poke();
   }
@@ -53,6 +79,46 @@ export class Scheduler {
     if (this.pruneTimer) clearInterval(this.pruneTimer);
     for (const t of this.cronTimers) clearTimeout(t);
     this.cronTimers = [];
+    for (const wake of this.wakers) wake();
+  }
+
+  /** Logs a background failure to the engine log (and stderr outside dev); never throws. */
+  private report(what: string, err: unknown) {
+    const error = (err as Error)?.message ?? String(err);
+    this.engine.log({ type: "scheduled", path: `scheduler: ${what}`, durationMs: 0, ok: false, error });
+    if (!this.engine.options.dev && !this.engine.options.quiet) console.error(`[incibase] scheduler ${what} failed:`, err);
+  }
+
+  /** A timer wait that stop() cuts short. */
+  private sleep(ms: number) {
+    return new Promise<void>((resolve) => {
+      const wake = () => {
+        clearTimeout(timer);
+        this.wakers.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, ms);
+      this.wakers.add(wake);
+    });
+  }
+
+  /** A write transaction for background work, which must not block the event loop on a busy database. */
+  private backgroundTx<T>(fn: (session: DbSession) => T) {
+    return this.engine.writeTx(fn, undefined, BACKGROUND);
+  }
+
+  /** Retries a background write with backoff until it succeeds or the scheduler stops. */
+  private async persist(what: string, write: () => Promise<unknown>) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await write();
+        return;
+      } catch (err) {
+        if (this.stopped) return; // shutting down; the store may already be closed
+        this.report(what, err);
+        await this.sleep(backoff(attempt));
+      }
+    }
   }
 
   private table() {
@@ -122,28 +188,66 @@ export class Scheduler {
   poke() {
     if (this.stopped) return;
     if (this.timer) clearTimeout(this.timer);
-    const row = this.engine.store.write
-      .query(
-        `SELECT json_extract(data, '$.runAt') AS runAt FROM _scheduled WHERE json_extract(data, '$.state') = 'pending'
-         ORDER BY json_extract(data, '$.state'), json_extract(data, '$.runAt') LIMIT 1`,
-      )
-      .get() as { runAt: number } | null;
+    let row: { runAt: number } | null;
+    try {
+      row = this.engine.store.write
+        .query(
+          `SELECT json_extract(data, '$.runAt') AS runAt FROM _scheduled WHERE json_extract(data, '$.state') = 'pending'
+           ORDER BY json_extract(data, '$.state'), json_extract(data, '$.runAt') LIMIT 1`,
+        )
+        .get() as { runAt: number } | null;
+    } catch (err) {
+      // Also runs as a commit hook, where throwing would fail a mutation that already committed.
+      return this.retryLater("poke", err);
+    }
     if (!row) return;
     const delay = Math.max(0, Math.min(row.runAt - Date.now(), MAX_TIMEOUT));
-    this.timer = setTimeout(() => void this.tick(), delay);
+    this.timer = setTimeout(() => this.tick().catch((err) => this.retryLater("tick", err)), delay);
   }
 
+  /** Logs a failed claim or poke and pokes again after a backoff. */
+  private retryLater(what: string, err: unknown) {
+    this.report(what, err);
+    if (this.stopped) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.poke(), backoff(this.failures++));
+  }
+
+  /**
+   * Claims due jobs for the free slots and starts them without waiting: each
+   * job frees its slot and pokes when it ends, so a slow job never holds back
+   * jobs that come due after it.
+   */
   private async tick() {
-    if (this.stopped || this.running >= MAX_CONCURRENT) return;
-    const claimed = await this.engine.writeTx((session) => {
-      const jobs = this.jobsInState(session, "pending", MAX_CONCURRENT - this.running, Date.now());
-      for (const job of jobs) this.update(session, job, { state: "running", startedAt: Date.now() });
-      return jobs;
-    });
-    this.running += claimed.length;
-    await Promise.all(claimed.map((job) => this.execute(job)));
-    this.running -= claimed.length;
+    if (this.stopped || this.claiming || this.active.size >= MAX_CONCURRENT) return;
+    this.claiming = true;
+    let claimed: ScheduledDoc[];
+    try {
+      claimed = await this.backgroundTx((session) => {
+        const jobs = this.jobsInState(session, "pending", MAX_CONCURRENT - this.active.size, Date.now());
+        for (const job of jobs) this.update(session, job, { state: "running", startedAt: Date.now() });
+        return jobs;
+      });
+      for (const job of claimed) this.active.add(job._id);
+      this.failures = 0;
+    } catch (err) {
+      return this.retryLater("tick", err);
+    } finally {
+      this.claiming = false;
+    }
+    for (const job of claimed) void this.run(job);
     this.poke();
+  }
+
+  private async run(job: ScheduledDoc) {
+    try {
+      await this.execute(job);
+    } catch (err) {
+      this.report(`job ${job.name} (${job._id})`, err);
+    } finally {
+      this.active.delete(job._id);
+      this.poke();
+    }
   }
 
   private async execute(job: ScheduledDoc) {
@@ -155,32 +259,50 @@ export class Scheduler {
       error = (err as Error)?.message ?? String(err);
     }
     this.engine.log({ type: "scheduled", path: job.name, durationMs: performance.now() - started, ok: !error, error });
-    await this.engine.writeTx((session) => {
-      const row = session.conn.query(`SELECT _id, _creationTime, data FROM _scheduled WHERE _id = ?`).get(job._id) as DocumentRow | null;
-      if (row) {
-        this.update(session, rowToDoc(row) as unknown as ScheduledDoc, {
-          state: error ? "failed" : "success",
-          completedAt: Date.now(),
-          ...(error ? { error } : {}),
-        });
-      }
-    });
+    // The job ran: keep its slot until the outcome is stored, or a restart would report it as interrupted.
+    await this.persist(`saving status of ${job.name} (${job._id})`, () =>
+      this.backgroundTx((session) => {
+        const row = session.conn.query(`SELECT _id, _creationTime, data FROM _scheduled WHERE _id = ?`).get(job._id) as DocumentRow | null;
+        if (row) {
+          this.update(session, rowToDoc(row) as unknown as ScheduledDoc, {
+            state: error ? "failed" : "success",
+            completedAt: Date.now(),
+            ...(error ? { error } : {}),
+          });
+        }
+      }),
+    );
   }
 
   private startCron(job: CronJob) {
     let busy = false;
+    let failures = 0;
     const next = (): number => {
       if (job.schedule.kind === "interval") return Date.now() + job.schedule.ms;
       const date = Bun.cron.parse(job.schedule.expression, Date.now() + 1000, job.schedule.tz ? { tz: job.schedule.tz } : undefined);
       if (!date) throw new Error(`Cron "${job.name}" never fires: ${job.schedule.expression}`);
       return date.getTime();
     };
+    /** Re-arms from a timer: a schedule that cannot be computed now is logged and tried again later. */
+    const rearm = () => {
+      try {
+        arm();
+        failures = 0;
+      } catch (err) {
+        this.report(`cron ${job.name}`, err);
+        const timer = setTimeout(() => {
+          this.cronTimers = this.cronTimers.filter((t) => t !== timer);
+          rearm();
+        }, backoff(failures++));
+        this.cronTimers.push(timer);
+      }
+    };
     const arm = () => {
       if (this.stopped) return;
       const timer = setTimeout(
         async () => {
           this.cronTimers = this.cronTimers.filter((t) => t !== timer);
-          arm();
+          rearm();
           if (busy) return; // previous run still going; skip this tick
           busy = true;
           const started = performance.now();
@@ -209,7 +331,7 @@ export class Scheduler {
 
   private async prune() {
     const cutoff = Date.now() - RETENTION_MS;
-    await this.engine.writeTx((session) => {
+    await this.backgroundTx((session) => {
       const result = session.conn
         .query(
           `DELETE FROM ${quoteIdent("_scheduled")} WHERE json_extract(data, '$.state') IN ('success', 'failed', 'canceled')
