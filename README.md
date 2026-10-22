@@ -46,7 +46,13 @@ export default defineSchema({
 
 Her doküman `_id` ve `_creationTime` alır. `id("tablo")` yalnızca o tablonun id'lerini kabul eder (hem tip seviyesinde hem çalışma anında). Sistem tabloları: `_users`, `_storage`, `_scheduled` (salt-okunur).
 
-**Migration** her başlangıçta tek transaction içinde çalışır: yeni tablo/index oluşturulur, kaldırılan index silinir, bir tablonun şeması değiştiyse tüm dokümanlar yeniden doğrulanır (`.default()` ile eklenen alanlar yazılır). Mevcut veriyle uyuşmayan bir şema reddedilir ve veritabanına dokunulmaz. Şemadan kaldırılan tabloların verisi silinmez.
+**Migration** her başlangıçta tek transaction içinde çalışır: yeni tablo/index oluşturulur, kaldırılan index silinir, bir tablonun şeması değiştiyse tüm dokümanlar yeniden doğrulanır (`.default()` ile eklenen alanlar yazılır). Şu durumlarda başlangıç reddedilir ve veritabanına dokunulmaz:
+
+- Şema mevcut veriyle uyuşmuyor.
+- Şema, dokümanlarda değeri olan bir alanı siliyor: alanı kaldırmak, yeniden adlandırmak (yeni ada `.default()` verilse bile) ya da iç içe bir nesneden veya dizideki nesnelerden anahtar çıkarmak. Hata tabloyu, alanı ve doküman sayısını listeler. Bu veriyi gerçekten silmek için `--allow-field-removal` ile başlat (`serve`, `dev`; kodda `EngineOptions.allowFieldRemoval`); silinen alanlar başlangıç çıktısında listelenir. Hiçbir dokümanda değeri olmayan bir alan bayraksız kaldırılabilir.
+- Hiç şema yüklenmedi (ör. `schema.ts` eksik) ama veritabanında tablo var. Bütün tabloları bilerek kaldırmak için `export default defineSchema({})` yaz.
+
+Şemadan kaldırılan tabloların verisi ve bu tabloların gösterdiği dosyalar silinmez. Dikkat: `.catch()` kullanan bir alanda, yeni şemaya uymayan kayıtlı değer uyarısız olarak `.catch()` değeriyle değiştirilir.
 
 ## Fonksiyonlar
 

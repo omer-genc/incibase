@@ -35,6 +35,9 @@ Options:
   --outfile <path>  Output for build (default: ./app)
   --target <t>      Build target, e.g. bun-linux-x64 (default: this machine)
   --no-dashboard    Do not serve the admin dashboard at /_/
+  --allow-field-removal
+                    Let a migration delete the stored data of fields removed
+                    from the schema (serve, dev); otherwise it is refused
 `;
 
 interface CliOptions {
@@ -56,6 +59,7 @@ function parse(argv: string[]) {
       outfile: { type: "string", default: "./app" },
       target: { type: "string" },
       "no-dashboard": { type: "boolean", default: false },
+      "allow-field-removal": { type: "boolean", default: false },
       dev: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -122,7 +126,7 @@ async function serve(values: Values, embedded?: AppDefinition) {
   let engine: Engine;
   try {
     const app = embedded ?? (await loadAppFromDir(values.dir));
-    engine = new Engine(app, { dataDir: values.data, dev, publicUrl });
+    engine = new Engine(app, { dataDir: values.data, dev, publicUrl, allowFieldRemoval: values["allow-field-removal"] });
   } catch (err) {
     if (err instanceof MigrationError) {
       console.error(`\x1b[31m${err.message}\x1b[0m\nFix the schema (or the data) and save again.`);
@@ -140,6 +144,7 @@ async function serve(values: Values, embedded?: AppDefinition) {
   for (const i of m.addedIndexes) console.log(`+ index ${i}`);
   for (const i of m.droppedIndexes) console.log(`- index ${i}`);
   for (const t of m.deactivatedTables) console.log(`- table ${t} (removed from schema; data kept)`);
+  for (const f of m.removedFields) console.log(`- field ${f.table}.${f.field} (data deleted from ${f.documents} document(s))`);
   if (m.rewrittenDocuments) console.log(`~ ${m.rewrittenDocuments} document(s) updated to the new schema`);
 
   engine.start();
