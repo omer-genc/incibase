@@ -7,6 +7,7 @@ import { bundleApp, loadAppFromBundle } from "./engine/bundle.ts";
 import { codegen, writeIfChanged } from "./engine/codegen.ts";
 import { setEmbeddedDashboard } from "./engine/dashboard.ts";
 import { describeApp } from "./engine/describe.ts";
+import { drain, parseDrainTimeout, stopSignals } from "./engine/drain.ts";
 import { embeddedRuntime } from "./engine/embedded.ts";
 import { Engine, type AppDefinition } from "./engine/engine.ts";
 import { ConfigError, DefinitionError, describeExit, exitCodeOf, ExitCode } from "./engine/exit-codes.ts";
@@ -65,6 +66,11 @@ Options:
                     s, m). A call past its deadline is rolled back and gets
                     504 FUNCTION_TIMEOUT (serve, dev; default:
                     $INCIBASE_TIMEOUTS, otherwise none)
+  --drain-timeout <s>
+                    On SIGTERM or SIGINT, how long to wait for running calls
+                    and jobs before cutting them (rolled back); seconds or a
+                    duration such as 500ms. A second signal cuts at once
+                    (serve, dev; default: 10, dev 1)
 `;
 
 /** The app a built binary carries. */
@@ -102,6 +108,7 @@ function parse(argv: string[]) {
       "log-format": { type: "string" },
       "allow-field-removal": { type: "boolean", default: false },
       timeouts: { type: "string" },
+      "drain-timeout": { type: "string" },
       dev: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -262,9 +269,11 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
   let publicUrl: string;
   let engine: Engine;
   let timeouts: Timeouts;
+  let drainMs: number;
   try {
     port = portOf(values.port ?? process.env.PORT ?? "3210");
     timeouts = parseTimeouts(values.timeouts);
+    drainMs = parseDrainTimeout(values["drain-timeout"], dev);
     publicUrl = (values.url ?? process.env.INCIBASE_URL ?? `http://localhost:${port}`).replace(/\/+$/, "");
     checkListenFlags({
       socket: values.socket,
@@ -379,15 +388,20 @@ ${color.bold(`incibase ${VERSION}`)}${dev ? " (dev)" : ""}  ${engine.functions.s
     }
   }
 
-  let stopping = false;
+  const nextSignal = stopSignals();
+  let forceDrain = () => {};
+  const forced = new Promise<void>((resolve) => (forceDrain = resolve));
   const shutdown = async (signal: string) => {
-    if (stopping) return;
-    stopping = true;
-    logEvent("info", { ev: "stopping", signal });
+    const next = nextSignal();
+    // The same Ctrl-C twice (from the terminal and from a wrapper such as `bun run`): one stop.
+    if (next === "repeat") return;
+    // A second signal: stop waiting for the drain.
+    if (next === "force") return forceDrain();
     // A failure here must still exit: the crash handlers would otherwise keep the process up.
     let code = 0;
     try {
-      server.stop(true);
+      await drain(engine, server, { signal, timeoutMs: drainMs, force: forced });
+      logEvent("info", { ev: "stopping", signal });
       await engine.stop();
       logEvent("info", { ev: "stopped" });
     } catch (err) {
@@ -433,6 +447,8 @@ async function dev(argv: string[], values: Values) {
   let allowFieldRemoval = values["allow-field-removal"];
   let child: ReturnType<typeof Bun.spawn> | null = null;
   let restarting: Promise<void> | null = null;
+  /** Set once dev stops: the server it was running then, if any. */
+  let stopping: ReturnType<typeof Bun.spawn> | null | undefined;
 
   let restarts = 0;
   const start = () => {
@@ -452,6 +468,7 @@ async function dev(argv: string[], values: Values) {
   };
 
   const restart = async () => {
+    if (stopping !== undefined) return;
     const old = child;
     child = null;
     if (old) {
@@ -464,12 +481,14 @@ async function dev(argv: string[], values: Values) {
       old.kill("SIGTERM");
       await old.exited;
     }
-    start();
+    // Stopped meanwhile: no new server.
+    if (stopping === undefined) start();
   };
 
   let timer: Timer | null = null;
   watch(dir, { recursive: true }, (_event, filename) => {
     const name = String(filename ?? "");
+    if (stopping !== undefined) return;
     if (name.startsWith("_generated") || name.split(/[\\/]/).some((s) => s.startsWith("."))) return;
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
@@ -479,13 +498,23 @@ async function dev(argv: string[], values: Values) {
     }, 120);
   });
 
-  const stop = async () => {
-    const current = child;
+  const nextSignal = stopSignals();
+  const stop = async (signal: NodeJS.Signals) => {
+    const next = nextSignal();
+    // The same Ctrl-C twice (from the terminal and from a wrapper such as `bun run`): one stop.
+    if (next === "repeat") return;
+    // A second signal is passed on: it cuts the server's drain short.
+    if (next === "force") return void stopping?.kill("SIGTERM");
+    if (timer) clearTimeout(timer);
+    const current = (stopping = child);
     child = null;
     if (current) {
-      current.kill("SIGTERM");
+      // Passed on at once. When Ctrl-C reached the server too (one process group), it takes this one as a repeat.
+      current.kill(signal);
       await current.exited;
     }
+    // A restart under way stops its old server and starts none.
+    await restarting;
     process.exit(0);
   };
   process.on("SIGINT", stop);

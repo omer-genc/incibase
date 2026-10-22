@@ -6,6 +6,7 @@ import type { Engine, Identity, WriteTxOptions } from "./engine.ts";
 import { DefinitionError } from "./exit-codes.ts";
 import { isJson, logEvent, newRid, withRid } from "./log.ts";
 import { quoteIdent, rowToDoc, type DocumentRow } from "./store.ts";
+import { ServerStoppingError } from "./timeouts.ts";
 
 const SYSTEM_IDENTITY: Identity = { userId: null, admin: false, system: true };
 const MAX_TIMEOUT = 2 ** 31 - 1;
@@ -20,9 +21,38 @@ const RETRY_MAX_MS = 5_000;
  * reads, HTTP and WebSockets. The retry backoff does the rest of the waiting.
  */
 const BACKGROUND: WriteTxOptions = { busyTimeoutMs: 50 };
+/** The error of a job that was running when the server stopped or crashed. */
+const INTERRUPTED = "Interrupted by server restart";
+/**
+ * Times a job of a `retryOnInterrupt` function is queued again after an
+ * interruption. Bounded: a job that crashes the process every time it runs
+ * must not crash it forever.
+ */
+export const INTERRUPT_RETRIES = 1;
+/** Missed runs a `cron_skipped` line counts up to. */
+const MAX_MISSED = 100_000;
 
 function backoff(failures: number) {
   return Math.min(RETRY_MIN_MS * 2 ** failures, RETRY_MAX_MS);
+}
+
+/** Where a cron's next run is kept, so the next start can tell the runs it missed. */
+const cronKey = (job: CronJob) => `cron_next:${job.name}`;
+
+/** A cron's schedule as text: runs saved under another schedule are not counted as missed. */
+function scheduleOf(job: CronJob): string {
+  return job.schedule.kind === "interval" ? `every ${job.schedule.ms}ms` : `${job.schedule.expression}${job.schedule.tz ? ` ${job.schedule.tz}` : ""}`;
+}
+
+/** How many runs of `job` came due from `from` (one that was due) to `now`. */
+function missedRuns(job: CronJob, from: number, now: number): number {
+  const schedule = job.schedule;
+  if (schedule.kind === "interval") return Math.min(Math.floor((now - from) / schedule.ms) + 1, MAX_MISSED);
+  let missed = 0;
+  for (let at: number | undefined = from; at !== undefined && at <= now && missed < MAX_MISSED; missed++) {
+    at = Bun.cron.parse(schedule.expression, at + 1000, schedule.tz ? { tz: schedule.tz } : undefined)?.getTime();
+  }
+  return missed;
 }
 
 /**
@@ -51,6 +81,8 @@ interface ScheduledDoc {
   args: Record<string, unknown>;
   runAt: number;
   state: string;
+  /** Times it was claimed to run; missing on jobs from before it was counted. */
+  attempts?: number;
 }
 
 /**
@@ -66,6 +98,8 @@ export class Scheduler {
   private pruneTimer: Timer | null = null;
   /** Ids of the claimed jobs this process is running; each holds one of MAX_CONCURRENT slots. */
   private readonly active = new Set<string>();
+  /** The runs of those jobs, up to their stored outcome, for `idle`. */
+  private readonly runs = new Set<Promise<void>>();
   private claiming = false;
   /** Consecutive failed claims or pokes, for the backoff. */
   private failures = 0;
@@ -77,17 +111,33 @@ export class Scheduler {
 
   start() {
     this.stopped = false;
-    // Jobs left "running" by a crash never finished; mark them failed rather than run twice.
+    // Jobs left "running" when the server stopped or crashed may or may not have done their work: mark them
+    // interrupted rather than run them twice, unless their function opted in to running again (a bounded number of times).
     // A retry can land after this process claimed jobs of its own, so those are skipped.
-    void this.persist("restart recovery", () =>
-      this.backgroundTx((session) => {
+    void this.persist("restart recovery", async () => {
+      const recovered = await this.backgroundTx((session) => {
+        const jobs: { job: ScheduledDoc; requeue: boolean }[] = [];
         for (const job of this.jobsInState(session, "running", 10_000)) {
           if (this.active.has(job._id)) continue;
-          this.update(session, job, { state: "failed", completedAt: Date.now(), error: "Interrupted by server restart" });
+          // A job claimed before attempts were counted ran once.
+          job.attempts ??= 1;
+          const requeue = !!this.engine.functions.get(job.name)?.retryOnInterrupt && job.attempts <= INTERRUPT_RETRIES;
+          if (requeue) this.update(session, job, { state: "pending", startedAt: undefined, error: undefined });
+          else this.update(session, job, { state: "interrupted", completedAt: Date.now(), error: INTERRUPTED });
+          jobs.push({ job, requeue });
         }
-      }),
-    );
-    for (const job of this.engine.crons?.jobs ?? []) this.startCron(job);
+        return jobs;
+      });
+      for (const { job, requeue } of recovered) {
+        const fields = { id: job._id, name: job.name, attempts: job.attempts };
+        if (requeue) logEvent("warn", { ev: "job_requeued", ...fields });
+        else logEvent("warn", { ev: "job_interrupted", ...fields });
+      }
+      if (recovered.some((r) => r.requeue)) this.poke();
+    });
+    const crons = this.engine.crons?.jobs ?? [];
+    this.reportSkippedCrons(crons);
+    for (const job of crons) this.startCron(job);
     this.pruneTimer = setInterval(() => {
       void this.prune().catch((err) => this.report("prune", err));
       void this.engine.storage.cleanup().catch((err) => this.report("storage cleanup", err));
@@ -102,6 +152,46 @@ export class Scheduler {
     for (const t of this.cronTimers) clearTimeout(t);
     this.cronTimers = [];
     for (const wake of this.wakers) wake();
+  }
+
+  /** No claimed job is running or saving its outcome. */
+  get isIdle() {
+    return this.runs.size === 0;
+  }
+
+  /** Resolves once the jobs running now (and any they lead to before stop) have stored their outcome. */
+  async idle() {
+    while (this.runs.size) await Promise.all(this.runs);
+  }
+
+  /**
+   * Crons are not run late: a run that came due while the server was down is
+   * skipped, and logged once per cron with how many runs it missed.
+   */
+  private reportSkippedCrons(jobs: CronJob[]) {
+    const now = Date.now();
+    for (const job of jobs) {
+      let saved: { schedule?: unknown; next?: unknown } | null = null;
+      try {
+        saved = JSON.parse(this.engine.store.getMeta(cronKey(job)) ?? "null");
+      } catch {
+        continue;
+      }
+      if (saved?.schedule !== scheduleOf(job) || typeof saved.next !== "number" || saved.next > now) continue;
+      const missed = missedRuns(job, saved.next, now);
+      const text = this.engine.options.quiet
+        ? undefined
+        : [`[incibase] cron "${job.name}" missed ${missed} run(s) while the server was down; they are skipped, not run late`];
+      logEvent("warn", { ev: "cron_skipped", name: job.name, missed, since: new Date(saved.next).toISOString() }, text);
+    }
+  }
+
+  /** Keeps when `job` runs next, for `reportSkippedCrons` on the next start. Best effort: a failure is only logged. */
+  private saveCronNext(job: CronJob, next: number) {
+    const value = JSON.stringify({ schedule: scheduleOf(job), next });
+    void this.backgroundTx(() => this.engine.store.setMeta(cronKey(job), value)).catch((err) => {
+      if (!this.stopped) this.report(`saving next run of cron ${job.name}`, err);
+    });
   }
 
   /** Logs a background failure to the engine log (and stderr outside dev, or as json); never throws. */
@@ -164,6 +254,16 @@ export class Scheduler {
   private update(session: DbSession, job: ScheduledDoc, patch: Record<string, unknown>) {
     const { _id, _creationTime, ...data } = job as unknown as Record<string, unknown>;
     session.updateRaw(this.table(), job._id, JSON.stringify({ ...data, ...patch }));
+  }
+
+  /** Puts a claimed job back to pending, taking back the attempt its claim counted. */
+  private unclaim(session: DbSession, id: string) {
+    const row = session.conn.query(`SELECT _id, _creationTime, data FROM _scheduled WHERE _id = ?`).get(id) as DocumentRow | null;
+    if (!row) return;
+    const job = rowToDoc(row) as unknown as ScheduledDoc;
+    if (job.state !== "running") return;
+    const attempts = (job.attempts ?? 1) - 1;
+    this.update(session, job, { state: "pending", startedAt: undefined, attempts: attempts > 0 ? attempts : undefined });
   }
 
   private schedule(session: DbSession, runAt: number | Date, ref: unknown, args: unknown): string {
@@ -249,8 +349,13 @@ export class Scheduler {
     let claimed: ScheduledDoc[];
     try {
       claimed = await this.backgroundTx((session) => {
+        // Stopped while this waited for the lock: a stopping server claims nothing new.
+        if (this.stopped) return [];
         const jobs = this.jobsInState(session, "pending", MAX_CONCURRENT - this.active.size, Date.now());
-        for (const job of jobs) this.update(session, job, { state: "running", startedAt: Date.now() });
+        for (const job of jobs) {
+          job.attempts = (job.attempts ?? 0) + 1;
+          this.update(session, job, { state: "running", startedAt: Date.now() });
+        }
         return jobs;
       });
       for (const job of claimed) this.active.add(job._id);
@@ -261,7 +366,11 @@ export class Scheduler {
       this.claiming = false;
     }
     // Each job is a request of its own in the log.
-    for (const job of claimed) void withRid(newRid(), () => this.run(job));
+    for (const job of claimed) {
+      const run = withRid(newRid(), () => this.run(job));
+      this.runs.add(run);
+      void run.finally(() => this.runs.delete(run));
+    }
     this.poke();
   }
 
@@ -279,12 +388,22 @@ export class Scheduler {
   private async execute(job: ScheduledDoc) {
     const started = performance.now();
     let error: string | undefined;
+    let cut: ServerStoppingError | undefined;
     try {
       await this.engine.call(job.name, job.args, SYSTEM_IDENTITY, { allowInternal: true, deadlineAtLock: true });
     } catch (err) {
       error = (err as Error)?.message ?? String(err);
+      if (err instanceof ServerStoppingError) cut = err;
     }
     this.engine.log({ type: "scheduled", path: job.name, durationMs: performance.now() - started, ok: !error, error });
+    if (cut?.unprocessed) {
+      // Cut by a stopping server before it did anything (a mutation rolled back, or a job that never started):
+      // pending again, as if never claimed, so the next start runs it. A background write is not cut.
+      await this.persist(`requeueing ${job.name} (${job._id})`, () => this.backgroundTx((session) => this.unclaim(session, job._id)));
+      return;
+    }
+    // An action cut part way may have done some of its work: left "running", the next start marks it interrupted (or runs it again).
+    if (cut) return;
     // The job ran: keep its slot until the outcome is stored, or a restart would report it as interrupted.
     await this.persist(`saving status of ${job.name} (${job._id})`, () =>
       this.backgroundTx((session) => {
@@ -325,6 +444,8 @@ export class Scheduler {
     };
     const arm = () => {
       if (this.stopped) return;
+      const at = next();
+      this.saveCronNext(job, at);
       const timer = setTimeout(
         // Each run is a request of its own in the log.
         () => withRid(newRid(), async () => {
@@ -348,7 +469,7 @@ export class Scheduler {
             busy = false;
           }
         }),
-        Math.max(0, Math.min(next() - Date.now(), MAX_TIMEOUT)),
+        Math.max(0, Math.min(at - Date.now(), MAX_TIMEOUT)),
       );
       this.cronTimers.push(timer);
     };
@@ -360,7 +481,7 @@ export class Scheduler {
     await this.backgroundTx((session) => {
       const result = session.conn
         .query(
-          `DELETE FROM ${quoteIdent("_scheduled")} WHERE json_extract(data, '$.state') IN ('success', 'failed', 'canceled')
+          `DELETE FROM ${quoteIdent("_scheduled")} WHERE json_extract(data, '$.state') IN ('success', 'failed', 'canceled', 'interrupted')
            AND json_extract(data, '$.completedAt') < ?`,
         )
         .run(cutoff);

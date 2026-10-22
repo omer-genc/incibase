@@ -215,6 +215,14 @@ interface FunctionDefinition<Ctx, A extends ArgsValidator | undefined, R> {
   description?: string;
   /** Expose as an MCP tool on `/mcp`. Only public functions can be exposed. */
   mcp?: boolean | McpToolOptions;
+  /**
+   * Mutations and actions: when a scheduled job of this function was running
+   * as the server stopped or crashed, queue it again once on the next start
+   * instead of marking it `interrupted`. Only for work that is safe to run
+   * twice: the first run may have finished just before the stop. A job
+   * interrupted again (say, one that crashes the process) stays interrupted.
+   */
+  retryOnInterrupt?: boolean;
   handler: (ctx: Ctx, args: ArgsOutput<A>) => R | Promise<R>;
 }
 
@@ -229,6 +237,7 @@ function builder(type: FunctionType, visibility: FunctionVisibility): any {
   return (definition: FunctionDefinition<any, any, any>) => {
     if (typeof definition?.handler !== "function") throw new DefinitionError(`${type} definition needs a handler`);
     if (visibility === "internal" && definition.mcp) throw new DefinitionError("Internal functions cannot be MCP tools");
+    if (type === "query" && definition.retryOnInterrupt) throw new DefinitionError("retryOnInterrupt is for mutations and actions: queries cannot be scheduled");
     return { __incibase: "function", type, visibility, ...definition };
   };
 }

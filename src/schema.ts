@@ -93,7 +93,8 @@ export interface TableTypes {
 
 export type GenericDataModel = Record<string, TableTypes>;
 
-export type ScheduledJobState = "pending" | "running" | "success" | "failed" | "canceled";
+/** `interrupted`: it was running when the server stopped or crashed, so it may or may not have done its work. */
+export type ScheduledJobState = "pending" | "running" | "success" | "failed" | "canceled" | "interrupted";
 
 export type SystemDataModel = {
   _users: {
@@ -133,6 +134,8 @@ export type SystemDataModel = {
         startedAt?: number;
         completedAt?: number;
         error?: string;
+        /** Times it was started; above 1 after `retryOnInterrupt` queued it again. */
+        attempts?: number;
       }
     >;
     insert: never;

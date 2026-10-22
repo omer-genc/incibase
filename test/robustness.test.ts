@@ -291,7 +291,7 @@ describe("scheduler", () => {
 
     other.run("COMMIT");
     other.close();
-    await until(() => job(engine, due)?.state === "success" && job(engine, stale)?.state === "failed");
+    await until(() => job(engine, due)?.state === "success" && job(engine, stale)?.state === "interrupted");
     expect(job(engine, stale)!.error).toBe("Interrupted by server restart");
     expect(job(engine, due)!.error).toBeUndefined();
     expect(ran).toEqual(["work"]);
