@@ -11,7 +11,7 @@ import { Engine, type AppDefinition } from "./engine/engine.ts";
 import { startServer } from "./engine/http.ts";
 import { loadAppFromDir } from "./engine/loader.ts";
 import { MigrationError } from "./engine/migrate.ts";
-import { Store } from "./engine/store.ts";
+import { DataDirLockedError, readMeta } from "./engine/store.ts";
 import { VERSION } from "./engine/version.ts";
 
 const HELP = `incibase ${VERSION} — Zod-typed backend in one binary
@@ -100,9 +100,13 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
         console.error(`No database at ${db}; start the server once first.`);
         process.exit(1);
       }
-      const store = new Store(db);
-      console.log(process.env.INCIBASE_ADMIN_KEY ?? store.getMeta("admin_key"));
-      store.close();
+      // Read-only and without the data dir lock: works while the server runs, and never changes the database.
+      const key = process.env.INCIBASE_ADMIN_KEY ?? readMeta(db, "admin_key");
+      if (!key) {
+        console.error(`No admin key in ${db}; start the server once first.`);
+        process.exit(1);
+      }
+      console.log(key);
       return;
     }
     default:
@@ -126,6 +130,8 @@ async function serve(values: Values, embedded?: AppDefinition) {
   } catch (err) {
     if (err instanceof MigrationError) {
       console.error(`\x1b[31m${err.message}\x1b[0m\nFix the schema (or the data) and save again.`);
+    } else if (err instanceof DataDirLockedError) {
+      console.error(`\x1b[31m${err.message}\x1b[0m`);
     } else {
       console.error(err);
     }

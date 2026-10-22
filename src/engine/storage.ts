@@ -1,11 +1,11 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { mkdirSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { S3Client } from "bun";
 import { IncibaseError } from "../errors.ts";
 import type { DbSession } from "./database.ts";
 import { contentTypeMatches, idsAt } from "./files.ts";
-import { quoteIdent } from "./store.ts";
+import { ensurePrivateDir, quoteIdent } from "./store.ts";
 import type { Engine, Identity } from "./engine.ts";
 
 const UPLOAD_URL_TTL_MS = 60 * 60 * 1000;
@@ -90,7 +90,7 @@ interface Backend {
 
 class LocalBackend implements Backend {
   constructor(private readonly dir: string) {
-    mkdirSync(dir, { recursive: true });
+    ensurePrivateDir(dir);
   }
   async put(key: string, data: Blob) {
     await Bun.write(join(this.dir, key), data);

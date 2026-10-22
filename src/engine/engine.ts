@@ -1,4 +1,3 @@
-import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { getFunctionPath, type FunctionType, type RegisteredFunction } from "../api.ts";
@@ -14,7 +13,7 @@ import type { ReadSet } from "./readset.ts";
 import { Realtime } from "./realtime.ts";
 import { Scheduler } from "./scheduler.ts";
 import { StorageService, type StorageOptions } from "./storage.ts";
-import { Store } from "./store.ts";
+import { ensurePrivateDir, Store } from "./store.ts";
 
 export interface AppDefinition {
   schema?: SchemaDefinition;
@@ -101,7 +100,7 @@ export class Engine {
     readonly app: AppDefinition,
     readonly options: EngineOptions,
   ) {
-    mkdirSync(options.dataDir, { recursive: true });
+    ensurePrivateDir(options.dataDir);
     this.store = new Store(join(options.dataDir, "data.db"));
     try {
       this.migration = migrate(this.store, app.schema);
