@@ -1,21 +1,31 @@
 import type { ServerWebSocket } from "bun";
+import { z } from "zod";
+import type { SessionRef } from "./auth.ts";
 import type { Engine, Identity } from "./engine.ts";
 import { ANONYMOUS, toErrorPayload } from "./engine.ts";
 import { affects, type Change, type ReadSet } from "./readset.ts";
 
 /** Commits within this window are coalesced into one rerun per affected subscription. */
 const BATCH_MS = 10;
+/** Live subscriptions one socket may hold. */
+export const MAX_SUBSCRIPTIONS_PER_SOCKET = 256;
+/** How often sockets' sessions are rechecked against the database (expiry, revocation elsewhere). */
+const SESSION_SWEEP_MS = 60_000;
 
 export interface SocketData {
   identity: Identity;
+  /** The session `identity` came from; revoking or expiring it downgrades the socket to anonymous. */
+  session?: SessionRef | null;
   /** Client subscription id → shared subscription key. */
   subs: Map<string, string>;
 }
 
-type ClientMessage =
-  | { type: "auth"; token?: string | null }
-  | { type: "sub"; id: string; path: string; args?: unknown }
-  | { type: "unsub"; id: string };
+const clientId = z.string().max(256);
+const clientMessage = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("auth"), token: z.string().nullish() }),
+  z.object({ type: z.literal("sub"), id: clientId, path: z.string().max(512), args: z.unknown().optional() }),
+  z.object({ type: z.literal("unsub"), id: clientId }),
+]);
 
 interface SharedSubscription {
   key: string;
@@ -43,13 +53,19 @@ interface SharedSubscription {
  */
 export class Realtime {
   private readonly subs = new Map<string, SharedSubscription>();
+  private readonly sockets = new Set<ServerWebSocket<SocketData>>();
+  private readonly sweep: Timer;
   private flushScheduled = false;
   private stopped = false;
 
-  constructor(private readonly engine: Engine) {}
+  constructor(private readonly engine: Engine) {
+    this.sweep = setInterval(() => this.sweepSessions(), SESSION_SWEEP_MS);
+    this.sweep.unref();
+  }
 
   stop() {
     this.stopped = true;
+    clearInterval(this.sweep);
   }
 
   get subscriptionCount() {
@@ -59,34 +75,48 @@ export class Realtime {
   open(ws: ServerWebSocket<SocketData>) {
     ws.data.subs ??= new Map();
     ws.data.identity ??= ANONYMOUS;
+    this.sockets.add(ws);
   }
 
   close(ws: ServerWebSocket<SocketData>) {
+    this.sockets.delete(ws);
     for (const [clientId, key] of ws.data.subs) this.detach(ws, clientId, key);
     ws.data.subs.clear();
   }
 
+  /** Handles one client message. Never throws: a bad message gets an error reply, not a crash. */
   message(ws: ServerWebSocket<SocketData>, raw: string | Buffer) {
-    let msg: ClientMessage;
     try {
-      msg = JSON.parse(String(raw));
+      this.handle(ws, raw);
+    } catch (err) {
+      const { error } = toErrorPayload(err, !!this.engine.options.dev);
+      ws.send(JSON.stringify({ type: "error", error }));
+    }
+  }
+
+  private handle(ws: ServerWebSocket<SocketData>, raw: string | Buffer) {
+    let json: unknown;
+    try {
+      json = JSON.parse(String(raw));
     } catch {
       ws.send(JSON.stringify({ type: "error", error: { code: "BAD_MESSAGE", message: "Invalid JSON" } }));
       return;
     }
+    const parsed = clientMessage.safeParse(json);
+    if (!parsed.success) {
+      const message = `Expected {type:"auth",token}, {type:"sub",id,path,args} or {type:"unsub",id}`;
+      ws.send(JSON.stringify({ type: "error", error: { code: "BAD_MESSAGE", message } }));
+      return;
+    }
+    const msg = parsed.data;
     switch (msg.type) {
       case "auth": {
-        ws.data.identity = this.engine.auth.identify(msg.token ?? null);
-        ws.send(JSON.stringify({ type: "auth", userId: ws.data.identity.userId }));
-        // Re-key every subscription of this socket under the new identity.
-        const current = [...ws.data.subs.entries()].map(([id, key]) => ({ id, sub: this.subs.get(key) }));
-        for (const { id, sub } of current) {
-          if (sub) this.subscribe(ws, id, sub.path, sub.args);
-        }
+        const { identity, session } = this.engine.auth.authenticate(msg.token ?? null);
+        this.setIdentity(ws, identity, session);
         break;
       }
       case "sub":
-        if (typeof msg.id !== "string" || typeof msg.path !== "string") return;
+        this.dropExpired([ws]);
         this.subscribe(ws, msg.id, msg.path, msg.args ?? {});
         break;
       case "unsub": {
@@ -98,11 +128,53 @@ export class Realtime {
     }
   }
 
+  /** Switches a socket to another identity and re-keys its subscriptions, which rerun as that identity. */
+  private setIdentity(ws: ServerWebSocket<SocketData>, identity: Identity, session: SessionRef | null) {
+    ws.data.identity = identity;
+    ws.data.session = session;
+    ws.send(JSON.stringify({ type: "auth", userId: identity.userId }));
+    const current = [...ws.data.subs.entries()].map(([id, key]) => ({ id, sub: this.subs.get(key) }));
+    for (const { id, sub } of current) {
+      if (sub) this.subscribe(ws, id, sub.path, sub.args);
+    }
+  }
+
+  /** Signs out sockets whose session matches, e.g. after sign-out, revocation or a password change. */
+  revokeSessions(match: (session: SessionRef) => boolean) {
+    for (const ws of [...this.sockets]) {
+      if (ws.data.session && match(ws.data.session)) this.setIdentity(ws, ANONYMOUS, null);
+    }
+  }
+
+  /** Signs out sockets whose session expired since they authenticated. */
+  private dropExpired(sockets: Iterable<ServerWebSocket<SocketData>>, now = Date.now()) {
+    for (const ws of [...sockets]) {
+      if (ws.data.session && ws.data.session.expiresAt < now) this.setIdentity(ws, ANONYMOUS, null);
+    }
+  }
+
+  /** Rechecks every socket's session in the database: expired, deleted or disabled users are signed out. */
+  sweepSessions(now = Date.now()) {
+    try {
+      for (const ws of [...this.sockets]) {
+        const session = ws.data.session;
+        if (session && !this.engine.auth.activeSession(session.tokenHash, now)) this.setIdentity(ws, ANONYMOUS, null);
+      }
+    } catch (err) {
+      console.error("[incibase] session sweep failed:", err);
+    }
+  }
+
   private subscribe(ws: ServerWebSocket<SocketData>, clientId: string, path: string, args: unknown) {
     const identity = ws.data.identity;
     const key = JSON.stringify([path, args, identity.userId, identity.admin]);
     const previous = ws.data.subs.get(clientId);
     if (previous === key) return;
+    if (!previous && ws.data.subs.size >= MAX_SUBSCRIPTIONS_PER_SOCKET) {
+      const message = `A connection can hold at most ${MAX_SUBSCRIPTIONS_PER_SOCKET} subscriptions`;
+      ws.send(JSON.stringify({ id: clientId, type: "error", error: { code: "TOO_MANY_SUBSCRIPTIONS", message } }));
+      return;
+    }
     if (previous) this.detach(ws, clientId, previous);
     ws.data.subs.set(clientId, key);
 
@@ -142,6 +214,9 @@ export class Realtime {
     sub.running = true;
     try {
       do {
+        // Sockets whose session expired leave for an anonymous subscription before this reruns.
+        if (sub.identity.userId && !sub.identity.admin) this.dropExpired(sub.clients.keys());
+        if (this.stopped || !this.subs.has(sub.key)) return;
         sub.dirty = false;
         sub.pending = [];
         let body: string;

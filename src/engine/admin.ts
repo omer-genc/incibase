@@ -185,5 +185,32 @@ export function adminTools(engine: Engine): Record<string, AdminTool> {
       readOnly: false,
       run: async (a) => engine.auth.signUp(a),
     },
+    // _users is read-only to the document tools above; these change it on purpose.
+    admin_delete_user: {
+      description:
+        "Delete a user (_users id) with their password and sessions; open connections are signed out. Documents in app tables and stored files that reference the user are NOT deleted: clean those up separately.",
+      input: z.object({ id: z.string() }),
+      readOnly: false,
+      run: async (a) => {
+        await engine.auth.deleteUser(a.id);
+        return { deleted: a.id };
+      },
+    },
+    admin_set_user_disabled: {
+      description:
+        "Disable or re-enable a user (_users id). A disabled user cannot sign in, and all their sessions are revoked, signing out open connections. Returns the user.",
+      input: z.object({ id: z.string(), disabled: z.boolean() }),
+      readOnly: false,
+      run: async (a) => {
+        await engine.auth.setDisabled(a.id, a.disabled);
+        return (await engine.readTx((s) => s.get("_users", a.id))).result;
+      },
+    },
+    admin_revoke_sessions: {
+      description: "Sign a user (_users id) out everywhere: deletes all their sessions and signs out open connections. Returns how many were revoked.",
+      input: z.object({ id: z.string() }),
+      readOnly: false,
+      run: async (a) => ({ revoked: await engine.auth.revokeAll(a.id) }),
+    },
   };
 }

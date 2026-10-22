@@ -3,6 +3,7 @@
 // callers also get tools to inspect and edit data.
 import { z } from "zod";
 import { adminTools } from "./admin.ts";
+import { ValidationError } from "./database.ts";
 import { mcpToolName } from "./describe.ts";
 import { toErrorPayload, type Engine, type Identity } from "./engine.ts";
 import { argsSchemaOf, toJsonSchema, type JsonSchema } from "./jsonschema.ts";
@@ -48,7 +49,7 @@ function toolsFor(engine: Engine, identity: Identity): Map<string, Tool> {
         annotations: { readOnlyHint: def.readOnly, destructiveHint: !def.readOnly },
         run: async (args) => {
           const parsed = def.input.safeParse(args);
-          if (!parsed.success) throw new Error(`Invalid arguments:\n${z.prettifyError(parsed.error)}`);
+          if (!parsed.success) throw new ValidationError(`Invalid arguments:\n${z.prettifyError(parsed.error)}`, parsed.error.issues);
           return def.run(parsed.data);
         },
       });
@@ -70,7 +71,7 @@ function rpcError(id: JsonRpcRequest["id"], code: number, message: string) {
 }
 
 async function handleMessage(engine: Engine, identity: Identity, msg: JsonRpcRequest) {
-  const isRequest = msg.id !== undefined && msg.id !== null;
+  const isRequest = msg?.id !== undefined && msg?.id !== null;
   if (msg?.jsonrpc !== "2.0" || typeof msg.method !== "string") {
     return rpcError(msg?.id, -32600, "Invalid request");
   }
@@ -105,7 +106,8 @@ async function handleMessage(engine: Engine, identity: Identity, msg: JsonRpcReq
           ...(plainObject ? { structuredContent: value } : {}),
         });
       } catch (err) {
-        const { error } = toErrorPayload(err, true);
+        // Internal errors carry messages and stack traces; callers see them only in dev.
+        const { error } = toErrorPayload(err, !!engine.options.dev);
         return rpcResult(msg.id, { content: [{ type: "text", text: `${error.code}: ${error.message}` }], isError: true });
       }
     }
@@ -114,7 +116,8 @@ async function handleMessage(engine: Engine, identity: Identity, msg: JsonRpcReq
   }
 }
 
-export async function handleMcp(engine: Engine, req: Request): Promise<Response> {
+/** `readBody` reads the POST body; the HTTP server passes one that enforces its size limit. */
+export async function handleMcp(engine: Engine, req: Request, readBody = () => req.text()): Promise<Response> {
   if (req.method === "GET") return new Response("SSE stream not supported; POST JSON-RPC messages", { status: 405, headers: { allow: "POST" } });
   if (req.method === "DELETE") return new Response(null, { status: 204 });
 
@@ -124,9 +127,10 @@ export async function handleMcp(engine: Engine, req: Request): Promise<Response>
     return Response.json(rpcError(null, -32001, "Invalid or expired token"), { status: 401 });
   }
 
+  const text = await readBody();
   let body: unknown;
   try {
-    body = await req.json();
+    body = JSON.parse(text);
   } catch {
     return Response.json(rpcError(null, -32700, "Parse error"), { status: 400 });
   }

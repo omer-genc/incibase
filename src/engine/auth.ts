@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { IncibaseError } from "../errors.ts";
-import { ValidationError } from "./database.ts";
+import { ValidationError, type DbSession } from "./database.ts";
 import type { Engine, Identity } from "./engine.ts";
 import { ANONYMOUS } from "./engine.ts";
 
@@ -26,6 +26,13 @@ function safeEqual(a: string, b: string): boolean {
 export interface AuthResult {
   token: string;
   user: { _id: string; _creationTime: number; email: string; name?: string; emailVerified: boolean };
+}
+
+/** The session behind a user identity. Live sockets keep it so revoking or expiring it signs them out. */
+export interface SessionRef {
+  tokenHash: string;
+  userId: string;
+  expiresAt: number;
 }
 
 /** Email/password accounts in `_users`, opaque bearer session tokens stored hashed in `_sessions`. */
@@ -62,20 +69,73 @@ export class AuthService {
     if (!userId || !row || !ok) {
       throw new IncibaseError({ code: "INVALID_CREDENTIALS", message: "Invalid email or password" });
     }
+    // Checked only after the password, so it does not reveal which accounts exist.
+    if (this.isDisabled(userId)) throw new IncibaseError({ code: "USER_DISABLED", message: "This account is disabled" });
     return this.createSession(userId);
   }
 
   async signOut(token: string) {
+    const tokenHash = sha256(token);
     await this.engine.writeTx((session) => {
-      session.conn.query(`DELETE FROM _sessions WHERE token_hash = ?`).run(sha256(token));
+      session.conn.query(`DELETE FROM _sessions WHERE token_hash = ?`).run(tokenHash);
+      session.onCommit(() => this.engine.realtime.revokeSessions((s) => s.tokenHash === tokenHash));
     });
   }
 
-  /** Revokes all sessions of a user, e.g. after a password change. */
-  async revokeAll(userId: string) {
-    await this.engine.writeTx((session) => {
-      session.conn.query(`DELETE FROM _sessions WHERE user_id = ?`).run(userId);
+  /** Revokes all sessions of a user, e.g. after a password change. Returns how many there were. */
+  async revokeAll(userId: string): Promise<number> {
+    this.assertUserId(userId);
+    return this.engine.writeTx((session) => this.revokeIn(session, userId));
+  }
+
+  /**
+   * Disables or re-enables a user. A disabled user cannot sign in, and all
+   * their sessions are revoked. Writes `_users` directly: it is read-only to
+   * function code and the generic admin tools.
+   */
+  async setDisabled(userId: string, disabled: boolean) {
+    this.assertUserId(userId);
+    await this.engine.writeTx(async (session) => {
+      const users = session.systemTable("_users");
+      const user = await session.get("_users", userId);
+      if (!user) throw new IncibaseError({ code: "NOT_FOUND", message: `User "${userId}" not found` });
+      const { _id, _creationTime, disabled: _, ...fields } = user;
+      session.updateRaw(users, userId, JSON.stringify(disabled ? { ...fields, disabled: true } : fields));
+      if (disabled) this.revokeIn(session, userId);
     });
+  }
+
+  /**
+   * Deletes a user with their password and sessions. Documents in app tables
+   * and stored files that reference the user are kept.
+   */
+  async deleteUser(userId: string) {
+    this.assertUserId(userId);
+    await this.engine.writeTx((session) => {
+      session.deleteRaw(session.systemTable("_users"), userId);
+      session.conn.query(`DELETE FROM _passwords WHERE user_id = ?`).run(userId);
+      this.revokeIn(session, userId);
+    });
+  }
+
+  private assertUserId(userId: string) {
+    if (this.engine.store.tableOfId(userId)?.name !== "_users") {
+      throw new IncibaseError({ code: "NOT_FOUND", message: `"${userId}" is not a _users id` });
+    }
+  }
+
+  /** Deletes a user's sessions and, once committed, downgrades sockets signed in with them. */
+  private revokeIn(session: DbSession, userId: string): number {
+    const { changes } = session.conn.query(`DELETE FROM _sessions WHERE user_id = ?`).run(userId);
+    session.onCommit(() => this.engine.realtime.revokeSessions((s) => s.userId === userId));
+    return changes;
+  }
+
+  private isDisabled(userId: string): boolean {
+    const row = this.engine.store.write
+      .query(`SELECT json_extract(data, '$.disabled') AS disabled FROM _users WHERE _id = ?`)
+      .get(userId) as { disabled: unknown } | null;
+    return !!row?.disabled;
   }
 
   async changePassword(userId: string, input: unknown) {
@@ -92,7 +152,7 @@ export class AuthService {
     const hash = await Bun.password.hash(newPassword);
     await this.engine.writeTx((session) => {
       session.conn.query(`UPDATE _passwords SET hash = ? WHERE user_id = ?`).run(hash, userId);
-      session.conn.query(`DELETE FROM _sessions WHERE user_id = ?`).run(userId);
+      this.revokeIn(session, userId);
     });
     return this.createSession(userId);
   }
@@ -126,23 +186,42 @@ export class AuthService {
    * Resolves an `Authorization: Bearer <token>` value. The admin key yields an
    * admin identity; `asUser` lets an admin act as a given user.
    */
-  identify(token: string | null | undefined, asUser?: string | null): Identity {
-    if (!token) return ANONYMOUS;
-    if (safeEqual(token, this.engine.adminKey)) {
-      const userId = asUser && this.engine.store.tableOfId(asUser)?.name === "_users" ? asUser : null;
-      return { userId, admin: true };
-    }
-    const row = this.engine.store.write
-      .query(`SELECT user_id, expires_at FROM _sessions WHERE token_hash = ?`)
-      .get(sha256(token)) as { user_id: string; expires_at: number } | null;
-    if (!row || row.expires_at < Date.now()) return ANONYMOUS;
-    return { userId: row.user_id, admin: false };
+  identify(token: unknown, asUser?: string | null): Identity {
+    return this.authenticate(token, asUser).identity;
   }
 
   identifyRequest(req: Request): Identity {
+    return this.authenticateRequest(req).identity;
+  }
+
+  /** Like `identify`, plus the session a user identity came from (null for anonymous and admin). */
+  authenticate(token: unknown, asUser?: string | null): { identity: Identity; session: SessionRef | null } {
+    // Tokens arrive from untrusted JSON too (WebSocket auth); anything but a string is anonymous.
+    if (typeof token !== "string" || !token) return { identity: ANONYMOUS, session: null };
+    if (safeEqual(token, this.engine.adminKey)) {
+      const userId = asUser && this.engine.store.tableOfId(asUser)?.name === "_users" ? asUser : null;
+      return { identity: { userId, admin: true }, session: null };
+    }
+    const session = this.activeSession(sha256(token));
+    return session ? { identity: { userId: session.userId, admin: false }, session } : { identity: ANONYMOUS, session: null };
+  }
+
+  authenticateRequest(req: Request) {
     const header = req.headers.get("authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
-    return this.identify(token, req.headers.get("x-incibase-as-user"));
+    return this.authenticate(token, req.headers.get("x-incibase-as-user"));
+  }
+
+  /** The session for a token hash if it is unexpired and its user exists and is not disabled. */
+  activeSession(tokenHash: string, now = Date.now()): SessionRef | null {
+    const row = this.engine.store.write
+      .query(
+        `SELECT s.user_id, s.expires_at, json_extract(u.data, '$.disabled') AS disabled
+         FROM _sessions s JOIN _users u ON u._id = s.user_id WHERE s.token_hash = ?`,
+      )
+      .get(tokenHash) as { user_id: string; expires_at: number; disabled: unknown } | null;
+    if (!row || row.expires_at < now || row.disabled) return null;
+    return { tokenHash, userId: row.user_id, expiresAt: row.expires_at };
   }
 }
 

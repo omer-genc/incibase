@@ -18,6 +18,38 @@ export interface ServeOptions {
   corsOrigins?: string[] | "*";
   /** Serve the admin dashboard at `/_/`. Default true. */
   dashboard?: boolean;
+  /** Largest JSON body (API routes, MCP) and WebSocket message accepted, in bytes. Default 1 MiB. Uploads use the storage limit. */
+  maxJsonBytes?: number;
+}
+
+const DEFAULT_MAX_JSON_BYTES = 1024 * 1024;
+
+/** A body over its route's limit; answered with 413. */
+class BodyTooLargeError extends IncibaseError<{ code: string; message: string }> {}
+
+/**
+ * Reads a body up to `limit` bytes. A larger declared Content-Length is
+ * refused before reading; a chunked body is counted as it streams in and
+ * refused as soon as it passes the limit.
+ */
+async function readBody(req: Request, limit: number, error: { code: string; message: string }): Promise<Blob> {
+  const tooLarge = () => new BodyTooLargeError(error);
+  if (Number(req.headers.get("content-length")) > limit) throw tooLarge();
+  if (!req.body) return new Blob([]);
+  const chunks: BlobPart[] = [];
+  let size = 0;
+  const reader = req.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      reader.cancel().catch(() => {});
+      throw tooLarge();
+    }
+    chunks.push(value as Uint8Array<ArrayBuffer>);
+  }
+  return new Blob(chunks);
 }
 
 type Handler = (req: Request & { params: Record<string, string> }, server: Server<SocketData>) => Response | Promise<Response | undefined> | undefined;
@@ -25,6 +57,7 @@ type Handler = (req: Request & { params: Record<string, string> }, server: Serve
 export function startServer(engine: Engine, options: ServeOptions): Server<SocketData> {
   const dev = !!engine.options.dev;
   const origins = options.corsOrigins ?? "*";
+  const maxJsonBytes = options.maxJsonBytes ?? DEFAULT_MAX_JSON_BYTES;
 
   const cors = (req: Request): Record<string, string> => {
     const origin = req.headers.get("origin");
@@ -46,12 +79,16 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
 
   const errorResponse = (err: unknown) => {
     const { status, error } = toErrorPayload(err, dev);
-    return Response.json({ error }, { status });
+    return Response.json({ error }, { status: err instanceof BodyTooLargeError ? 413 : status });
   };
 
+  const jsonTooLarge = { code: "PAYLOAD_TOO_LARGE", message: `Body exceeds ${maxJsonBytes} bytes` };
+  const readText = async (req: Request) => (await readBody(req, maxJsonBytes, jsonTooLarge)).text();
+
   const readJson = async (req: Request): Promise<any> => {
+    const text = await readText(req);
     try {
-      return await req.json();
+      return JSON.parse(text);
     } catch {
       throw new IncibaseError({ code: "BAD_REQUEST", message: "Body must be JSON" });
     }
@@ -100,12 +137,20 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
 
   const bearer = (req: Request) => req.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? null;
 
-  const mcp = route({ GET: (req) => handleMcp(engine, req), POST: (req) => handleMcp(engine, req), DELETE: (req) => handleMcp(engine, req) });
+  const mcp = route({
+    GET: (req) => handleMcp(engine, req),
+    POST: (req) => handleMcp(engine, req, () => readText(req)),
+    DELETE: (req) => handleMcp(engine, req),
+  });
 
   return Bun.serve<SocketData>({
     port: options.port,
     hostname: options.hostname,
-    maxRequestBodySize: engine.storage.maxUploadBytes + 1024 * 1024,
+    // Bun's debug error pages show messages and source; keep them to dev.
+    development: dev,
+    // Routes read their bodies with their own limits; this caps everything else (HTTP actions).
+    maxRequestBodySize: Math.max(engine.storage.maxUploadBytes, maxJsonBytes) + 1024 * 1024,
+    error: (err) => errorResponse(err),
     routes: {
       "/api/health": route({ GET: () => Response.json({ ok: true, version: VERSION, startedAt: engine.startedAt }) }),
       "/api/query": callRoute("query"),
@@ -145,11 +190,9 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
           if (!grant) {
             throw new IncibaseError({ code: "FORBIDDEN", message: "Invalid or expired upload URL" });
           }
-          const declared = Number(req.headers.get("content-length"));
-          if (grant.maxBytes !== undefined && declared > grant.maxBytes) {
-            throw new IncibaseError({ code: "FILE_TOO_LARGE", message: `File exceeds ${grant.maxBytes} bytes` });
-          }
-          const blob = await req.blob();
+          // Counted as it streams, so a chunked body without Content-Length cannot skip the limit.
+          const limit = Math.min(grant.maxBytes ?? Infinity, engine.storage.maxUploadBytes);
+          const blob = await readBody(req, limit, { code: "FILE_TOO_LARGE", message: `File exceeds ${limit} bytes` });
           const storageId = await engine.storage.store(blob, { ...grant, contentType: req.headers.get("content-type") ?? undefined });
           return Response.json({ storageId });
         },
@@ -178,20 +221,30 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
         ? {}
         : {
             "/_": () => Response.redirect("/_/", 302),
-            "/_/": async () =>
-              new Response(await dashboardHtml(), {
-                headers: {
-                  "content-type": "text/html; charset=utf-8",
-                  "cache-control": "no-cache",
-                  "x-frame-options": "DENY",
-                  "referrer-policy": "no-referrer",
-                },
-              }),
+            "/_/": async () => {
+              try {
+                return new Response(await dashboardHtml(), {
+                  headers: {
+                    "content-type": "text/html; charset=utf-8",
+                    "cache-control": "no-cache",
+                    "x-frame-options": "DENY",
+                    "referrer-policy": "no-referrer",
+                  },
+                });
+              } catch (err) {
+                return errorResponse(err);
+              }
+            },
           }),
 
       "/api/ws": (req: Request, server: Server<SocketData>) => {
-        if (server.upgrade(req, { data: { identity: engine.auth.identifyRequest(req), subs: new Map() } })) return undefined;
-        return new Response("Expected a WebSocket upgrade", { status: 426 });
+        try {
+          const { identity, session } = engine.auth.authenticateRequest(req);
+          if (server.upgrade(req, { data: { identity, session, subs: new Map() } })) return undefined;
+          return new Response("Expected a WebSocket upgrade", { status: 426 });
+        } catch (err) {
+          return errorResponse(err);
+        }
       },
 
       "/mcp": mcp,
@@ -222,6 +275,8 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
     websocket: {
       idleTimeout: 120,
       sendPings: true,
+      // Larger messages close the connection.
+      maxPayloadLength: maxJsonBytes,
       open: (ws) => engine.realtime.open(ws),
       message: (ws, msg) => engine.realtime.message(ws, msg),
       close: (ws) => engine.realtime.close(ws),
