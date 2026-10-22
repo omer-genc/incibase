@@ -37,7 +37,8 @@ Options:
   --no-dashboard    Do not serve the admin dashboard at /_/
   --allow-field-removal
                     Let a migration delete the stored data of fields removed
-                    from the schema (serve, dev); otherwise it is refused
+                    from the schema (serve, dev); otherwise it is refused.
+                    dev drops it once a server has started
 `;
 
 interface CliOptions {
@@ -196,7 +197,10 @@ async function dev(argv: string[], values: Values) {
     console.error(`No ${values.dir}/ directory. Create one with: incibase init`);
     process.exit(1);
   }
-  const childArgs = ["serve", "--dev", ...argv.filter((a) => a !== "dev")];
+  const childArgs = ["serve", "--dev", ...argv.filter((a) => a !== "dev" && a !== "--allow-field-removal")];
+  // Only for the removal the developer started with: once a server has run
+  // with it, a restart (e.g. a half-edited schema.ts) is refused again.
+  let allowFieldRemoval = values["allow-field-removal"];
   let child: ReturnType<typeof Bun.spawn> | null = null;
   let restarting: Promise<void> | null = null;
 
@@ -204,7 +208,7 @@ async function dev(argv: string[], values: Values) {
   const start = () => {
     const { changed } = codegen(dir);
     if (changed.length) console.log(`\x1b[2mgenerated ${changed.join(", ")}\x1b[0m`);
-    child = Bun.spawn([...selfCommand(), ...childArgs], {
+    child = Bun.spawn([...selfCommand(), ...childArgs, ...(allowFieldRemoval ? ["--allow-field-removal"] : [])], {
       stdio: ["inherit", "inherit", "inherit"],
       env: { ...process.env, ...(restarts++ ? { INCIBASE_RESTART: "1" } : {}) },
     });
@@ -218,6 +222,11 @@ async function dev(argv: string[], values: Values) {
     const old = child;
     child = null;
     if (old) {
+      // Still running means it migrated (or stops before committing); a refused one has exited.
+      if (old.exitCode === null && allowFieldRemoval) {
+        allowFieldRemoval = false;
+        console.log(`\x1b[2m--allow-field-removal applied to the first start only\x1b[0m`);
+      }
       old.kill("SIGTERM");
       await old.exited;
     }

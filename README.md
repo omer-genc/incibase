@@ -49,7 +49,7 @@ Her doküman `_id` ve `_creationTime` alır. `id("tablo")` yalnızca o tablonun 
 **Migration** her başlangıçta tek transaction içinde çalışır: yeni tablo/index oluşturulur, kaldırılan index silinir, bir tablonun şeması değiştiyse tüm dokümanlar yeniden doğrulanır (`.default()` ile eklenen alanlar yazılır). Şu durumlarda başlangıç reddedilir ve veritabanına dokunulmaz:
 
 - Şema mevcut veriyle uyuşmuyor.
-- Şema, dokümanlarda değeri olan bir alanı siliyor: alanı kaldırmak, yeniden adlandırmak (yeni ada `.default()` verilse bile) ya da iç içe bir nesneden veya dizideki nesnelerden anahtar çıkarmak. Hata tabloyu, alanı ve doküman sayısını listeler. Bu veriyi gerçekten silmek için `--allow-field-removal` ile başlat (`serve`, `dev`; kodda `EngineOptions.allowFieldRemoval`); silinen alanlar başlangıç çıktısında listelenir. Hiçbir dokümanda değeri olmayan bir alan bayraksız kaldırılabilir.
+- Şema, dokümanlarda değeri olan bir alanı siliyor: alanı kaldırmak, yeniden adlandırmak (yeni ada `.default()` verilse bile) ya da iç içe bir nesneden (`.transform()` uygulananlar dahil) veya dizideki nesnelerden anahtar çıkarmak. Hata tabloyu, alanı ve doküman sayısını listeler. Bu veriyi gerçekten silmek için `--allow-field-removal` ile başlat (`serve`, `dev`; kodda `EngineOptions.allowFieldRemoval`); silinen alanlar başlangıç çıktısında listelenir. `dev` bu bayrağı yalnızca sunucu bir kez başlayana kadar uygular; kaydetmeyle gelen sonraki yeniden başlatmalar yine reddedilir. Hiçbir dokümanda değeri olmayan bir alan bayraksız kaldırılabilir.
 - Hiç şema yüklenmedi (ör. `schema.ts` eksik) ama veritabanında tablo var. Bütün tabloları bilerek kaldırmak için `export default defineSchema({})` yaz.
 
 Şemadan kaldırılan tabloların verisi ve bu tabloların gösterdiği dosyalar silinmez. Dikkat: `.catch()` kullanan bir alanda, yeni şemaya uymayan kayıtlı değer uyarısız olarak `.catch()` değeriyle değiştirilir.
@@ -105,7 +105,7 @@ products: defineTable({
 - **Yazarken:** dosya yazanın kendi yüklemesi olmalı (admin/zamanlanmış görevler hariç) ve başka bir kayda bağlı olmamalı (`FORBIDDEN`, `FILE_IN_USE`). Alan kısıtları (`maxBytes`, `contentTypes`) burada da denetlenir. Elle `ownerId` kontrolüne gerek yok.
 - **Okurken:** kaydı okuyabilen sorgu, kaydın dosyalarının linkini alır (`ctx.storage.getUrl`) — `private` olsa bile. Yalnızca dosya id'sini bilen başkası link alamaz. Yani **kayda erişen dosyaya erişir**; erişim kuralı sorgunun kendisidir.
 - **Görünürlük alandan gelir:** `file({ private: true })` alanındaki dosyalar yalnızca imzalı, süreli linkle açılır (varsayılan 1 saat, `getUrl(id, { expiresIn })`). Public alanlar kalıcı, önbelleğe alınabilir link verir.
-- **Temizlik:** alan değişince ya da kayıt silinince eski dosya ayrılır ve 1 saat sonra silinir; hiçbir kayda bağlanmayan yüklemeler 24 saat sonra silinir. Id'si herhangi bir dokümanda (şemadan kaldırılmış tablolar dahil) geçen dosya silinmez. `id("_storage")` alanına yazılan dosyalar da, kayıt sonradan silinse, tablo şemadan kaldırılsa ya da alanın tipi değişse bile otomatik silinmez (sonradan bir `file()` alanından ayrılmadıkça); gerekmeyenleri `ctx.storage.delete` ile sil. Bu özellikten önce yüklenmiş dosyalara dokunulmaz. Adaylar silme transaction'ının içinde seçilip denetlenir; dosyayı o sırada bir kayda bağlayan mutation dosyayı korur. Ayar: `StorageOptions.cleanup` ya da `INCIBASE_STORAGE_CLEANUP=off`.
+- **Temizlik:** alan değişince ya da kayıt silinince eski dosya ayrılır ve 1 saat sonra silinir; hiçbir kayda bağlanmayan yüklemeler 24 saat sonra silinir. `id("_storage")` alanına (ya da `z.record(id("_storage"), ...)` anahtarına) yazılan dosyalar, kayıt sonradan silinse, tablo şemadan kaldırılsa ya da alanın tipi değişse bile otomatik silinmez (sonradan bir `file()` alanından ayrılmadıkça); gerekmeyenleri `ctx.storage.delete` ile sil. Şemadan kaldırılmış tabloların dokümanlarında duran dosyalar da silinmez. Id'yi başka tipte bir alanda (ör. `z.string()`) ya da bir metnin içinde (ör. kaydedilmiş bir URL) tutmak dosyayı korumaz. Bu özellikten önce yüklenmiş dosyalara dokunulmaz. Adaylar silme transaction'ının içinde seçilip denetlenir; dosyayı o sırada bir kayda bağlayan mutation dosyayı korur. Ayar: `StorageOptions.cleanup` ya da `INCIBASE_STORAGE_CLEANUP=off`.
 - Aynı dosyayı birden çok kayıtta kullanmak için `id("_storage")` (serbest referans) kullan; o durumda erişim kurallarını sahiplik ve `bypassOwnerCheck` ile kendin kurarsın.
 
 ### Yükleme ve kısıtlar
@@ -228,7 +228,7 @@ Standalone `incibase` binary'sinin kendisi: `bun run build:binary` → `dist/inc
 | `init` | Başlangıç dosyaları |
 | `admin-key` | Admin anahtarını yazdırır |
 
-Bayraklar: `--dir` (incibase), `--data` (incibase_data), `--port` (3210 / `$PORT`), `--host`, `--url` (dışarıdan erişilen adres; dosya URL'leri için), `--outfile`, `--target`, `--no-dashboard`.
+Bayraklar: `--dir` (incibase), `--data` (incibase_data), `--port` (3210 / `$PORT`), `--host`, `--url` (dışarıdan erişilen adres; dosya URL'leri için), `--outfile`, `--target`, `--no-dashboard`, `--allow-field-removal` (`serve`, `dev`; bkz. Migration).
 
 Ortam değişkenleri: `INCIBASE_ADMIN_KEY`, `INCIBASE_URL`, `INCIBASE_STORAGE=s3` (+ Bun'ın `S3_*` değişkenleri).
 

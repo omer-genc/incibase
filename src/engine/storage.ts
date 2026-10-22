@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { S3Client } from "bun";
 import { IncibaseError } from "../errors.ts";
 import type { DbSession } from "./database.ts";
-import { contentTypeMatches } from "./files.ts";
+import { collectHeldIds, contentTypeMatches } from "./files.ts";
 import { quoteIdent } from "./store.ts";
 import type { Engine, Identity } from "./engine.ts";
 
@@ -263,11 +263,13 @@ export class StorageService {
   /**
    * Deletes files nobody uses: uploads never put into a document within
    * `unattachedHours`, and files dropped from a `file()` field more than
-   * `detachedHours` ago. Files whose id a document still holds (in any table,
-   * removed ones included) stay; files put into an `id("_storage")` field or
-   * stored before this existed are not pending, so they are never collected.
-   * Candidates are picked and checked inside the deleting transaction, so a
-   * write that uses a file first keeps it.
+   * `detachedHours` ago. Files put into an `id("_storage")` field, held by a
+   * document when its table's schema changed, or stored before this existed
+   * are not pending, so they are never collected. Pending files a document
+   * of a table with `id("_storage")` fields, or of a table removed from the
+   * schema, holds (as a whole value or a key) stay too. Candidates are picked
+   * and checked inside the deleting transaction, so a write that uses a file
+   * first keeps it.
    */
   async cleanup(now = Date.now()): Promise<number> {
     if (!this.cleanupPolicy) return 0;
@@ -299,25 +301,21 @@ export class StorageService {
   }
 
   /**
-   * The `candidates` some user document still holds anywhere (whatever its
-   * field's type now), including tables removed from the schema.
+   * The `candidates` a document holds anywhere, in tables with plain
+   * `id("_storage")` fields and in tables removed from the schema. Other
+   * tables are not read: a change to their schema has released the files
+   * their documents held (see migrate).
    */
   private referencedIds(session: DbSession, candidates: Set<string>): Set<string> {
     const found = new Set<string>();
-    const walk = (value: unknown) => {
-      if (typeof value === "string") {
-        if (candidates.has(value)) found.add(value);
-      } else if (typeof value === "object" && value !== null) {
-        for (const child of Object.values(value)) walk(child);
-      }
-    };
     // Ids end with their table's two-character code: a document without that
     // code before a closing quote holds no file id and is not parsed.
     const marker = `${[...candidates][0]!.slice(-2)}"`;
-    const tables = session.conn.query(`SELECT name FROM _incibase_tables`).all() as { name: string }[];
-    for (const { name } of tables) {
+    const removed = session.conn.query(`SELECT name FROM _incibase_tables WHERE active = 0`).all() as { name: string }[];
+    const withIds = [...this.engine.store.tables.values()].filter((t) => t.storageFields?.some((f) => !f.file));
+    for (const { name } of [...removed, ...withIds]) {
       const rows = session.conn.query(`SELECT data FROM ${quoteIdent(name)} WHERE instr(data, ?) > 0`).all(marker) as { data: string }[];
-      for (const { data } of rows) walk(JSON.parse(data));
+      for (const { data } of rows) collectHeldIds(JSON.parse(data), candidates, found);
       if (found.size === candidates.size) break;
     }
     return found;

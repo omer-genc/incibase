@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defineSchema, defineTable, file, id, z, type SchemaDefinition } from "incibase";
 import { Engine, type EngineOptions } from "../src/engine/engine.ts";
+import { toJsonSchema } from "../src/engine/jsonschema.ts";
 import { MigrationError } from "../src/engine/migrate.ts";
 import { tempDir } from "./helpers.ts";
 
@@ -148,6 +149,68 @@ describe("removing fields", () => {
     // Without the flag the field counts too, for the documents that still validate.
     expect(openError(v2, data)!.removedFields).toEqual([{ table: "customers", field: "taxNumber", documents: 2 }]);
   });
+
+  test("a key removed inside a transformed object is refused (its output schema does not change)", async () => {
+    const data = dir();
+    const address = (shape: z.ZodRawShape) => z.object(shape).transform((a) => a);
+    const v1 = defineSchema({ customers: defineTable({ name: z.string(), address: address({ city: z.string(), zip: z.string() }) }) });
+    const first = open(v1, data);
+    await first.writeTx((s) => s.insert("customers", { name: "Acme", address: { city: "Ist", zip: "34000" } }));
+    await first.stop();
+
+    const v2 = defineSchema({ customers: defineTable({ name: z.string(), address: address({ city: z.string() }) }) });
+    const err = openError(v2, data);
+    expect(err).toBeInstanceOf(MigrationError);
+    expect(err!.removedFields).toEqual([{ table: "customers", field: "address.zip", documents: 1 }]);
+    expect(rawDocs(open(v1, data), "customers")).toEqual([{ name: "Acme", address: { city: "Ist", zip: "34000" } }]);
+  });
+
+  test("a table fingerprinted before input schemas counted is re-checked once on upgrade, unchanged", async () => {
+    const data = dir();
+    const v1 = defineSchema({ customers: defineTable({ name: z.string(), tags: z.array(z.string()).default([]) }) });
+    const first = open(v1, data);
+    await first.writeTx((s) => s.insert("customers", { name: "Acme" }));
+    first.store.write.run(`UPDATE _incibase_tables SET json_schema = ? WHERE name = 'customers'`, [
+      JSON.stringify(toJsonSchema(v1.tables.customers!.validator)),
+    ]);
+    await first.stop();
+
+    const second = open(v1, data);
+    expect(second.migration.rewrittenDocuments).toBe(0);
+    expect(rawDocs(second, "customers")).toEqual([{ name: "Acme", tags: [] }]);
+    const { json_schema } = second.store.write.query(`SELECT json_schema FROM _incibase_tables WHERE name = 'customers'`).get() as {
+      json_schema: string;
+    };
+    expect(Object.keys(JSON.parse(json_schema))).toEqual(["output", "input"]);
+  });
+
+  test("the keys of a record count as one field, and long lists are cut", async () => {
+    const data = dir();
+    const price = { amount: z.number() };
+    const extra = Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`f${i}`, z.number().optional()]));
+    const v1 = defineSchema({
+      products: defineTable({ prices: z.record(z.string(), z.object({ ...price, old: z.number().optional() })) }),
+      wide: defineTable(extra),
+    });
+    const first = open(v1, data);
+    await first.writeTx(async (s) => {
+      for (let d = 0; d < 3; d++) {
+        await s.insert("products", { prices: { [`user_${d}_a`]: { amount: 1, old: 2 }, [`user_${d}_b`]: { amount: 3, old: 4 } } });
+      }
+      await s.insert("wide", Object.fromEntries(Object.keys(extra).map((k, i) => [k, i])));
+    });
+    await first.stop();
+
+    const v2 = defineSchema({ products: defineTable({ prices: z.record(z.string(), z.object(price)) }), wide: defineTable({}) });
+    const err = openError(v2, data);
+    expect(err).toBeInstanceOf(MigrationError);
+    expect(err!.removedFields.find((f) => f.table === "products")).toEqual({ table: "products", field: "prices.*.old", documents: 3 });
+    expect(err!.removedFields).toHaveLength(26);
+    expect(err!.message).not.toContain("user_");
+    expect(err!.message).toContain("26 field(s)");
+    expect(err!.message).toContain("...and 6 more");
+    expect(err!.message.split("\n").filter((line) => line.endsWith("document(s)"))).toHaveLength(20);
+  });
 });
 
 describe("missing schema", () => {
@@ -251,6 +314,57 @@ describe("files behind plain id(\"_storage\") fields", () => {
     expect(await second.storage.get(pdf)).not.toBeNull();
     expect(await second.storage.get(scan)).not.toBeNull();
   });
+
+  test("ids used as record keys or tuple items are references too", async () => {
+    const galleries = defineSchema({
+      galleries: defineTable({ captions: z.record(id("_storage"), z.string()), pair: z.tuple([id("_storage"), z.string()]) }),
+    });
+    const engine = open(galleries, dir());
+    const cover = await engine.storage.store(blob("cover"));
+    const paired = await engine.storage.store(blob("paired"));
+    const galleryId = await engine.writeTx((s) => s.insert("galleries", { captions: { [cover]: "Cover" }, pair: [paired, "x"] }));
+    expect(JSON.parse(meta(engine, cover)!.data).pending).toBeUndefined();
+    expect(JSON.parse(meta(engine, paired)!.data).pending).toBeUndefined();
+
+    // A record key left pending (as written before) is still found by cleanup.
+    engine.store.write.run(`UPDATE _storage SET data = json_set(data, '$.pending', json('true'))`);
+    expect(await engine.storage.cleanup(Date.now() + 25 * HOUR)).toBe(0);
+    expect(await engine.storage.get(cover)).not.toBeNull();
+    expect(Object.keys((await engine.readTx((s) => s.get(galleryId))).result!.captions as object)).toEqual([cover]);
+  });
+
+  test("a schema change releases the pending files its documents hold, so cleanup need not read the table", async () => {
+    const data = dir();
+    const v1 = defineSchema({ invoices: defineTable({ scan: id("_storage") }), photos: defineTable({ cover: file() }) });
+    const first = open(v1, data);
+    const scan = await first.storage.store(blob("scan"));
+    const cover = await first.storage.store(blob("cover"));
+    const orphan = await first.storage.store(blob("orphan"));
+    await first.writeTx(async (s) => {
+      await s.insert("invoices", { scan });
+      await s.insert("photos", { cover });
+    });
+    first.store.write.run(`UPDATE _storage SET data = json_set(data, '$.pending', json('true')) WHERE _id = ?`, [scan]);
+    await first.stop();
+
+    const second = open(defineSchema({ invoices: defineTable({ scan: z.string() }), photos: defineTable({ cover: file() }) }), data);
+    expect(JSON.parse(meta(second, scan)!.data).pending).toBeUndefined();
+
+    const db = second.store.write;
+    const query = db.query.bind(db);
+    const read: string[] = [];
+    db.query = ((sql: string) => {
+      read.push(sql);
+      return query(sql);
+    }) as typeof db.query;
+    expect(await second.storage.cleanup(Date.now() + 25 * HOUR)).toBe(1);
+    db.query = query;
+    expect(meta(second, orphan)).toBeNull();
+    expect(await second.storage.get(scan)).not.toBeNull();
+    expect(await second.storage.get(cover)).not.toBeNull();
+    // Neither table can hold a plain file id now, and both are in the schema.
+    expect(read.filter((sql) => /FROM "(invoices|photos)"/.test(sql))).toEqual([]);
+  });
 });
 
 describe("cleanup racing writes", () => {
@@ -351,4 +465,51 @@ describe("incibase serve", () => {
     await allowed.exited;
     expect(out).toContain("- field customers.taxNumber (data deleted from 1 document(s))");
   }, 20_000);
+
+  test("dev applies --allow-field-removal to the first start only, not to restarts after a save", async () => {
+    const root = dir();
+    const data = join(root, "data");
+    const fields = (...names: string[]) =>
+      `import { defineSchema, defineTable, z } from "incibase/server";\n` +
+      `export default defineSchema({ customers: defineTable({ ${names.map((n) => `${n}: z.string()`).join(", ")} }) });\n`;
+    const first = open(defineSchema({ customers: defineTable({ name: z.string(), fax: z.string(), taxNumber: z.string() }) }), data);
+    await first.writeTx((s) => s.insert("customers", { name: "Acme", fax: "0212", taxNumber: "TR-1" }));
+    await first.stop();
+    const source = join(root, "app");
+    mkdirSync(source);
+    writeFileSync(join(source, "schema.ts"), fields("name", "taxNumber")); // fax removed on purpose
+
+    const dev = Bun.spawn([process.execPath, CLI, "dev", "--dir", source, "--data", data, "--port", "0", "--host", "127.0.0.1", "--allow-field-removal"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, INCIBASE_RESTART: "1" },
+      timeout: 25_000,
+      killSignal: "SIGKILL",
+    });
+    const output = { text: "" };
+    for (const stream of [dev.stdout, dev.stderr]) {
+      void (async () => {
+        const decoder = new TextDecoder();
+        for await (const chunk of stream) output.text += decoder.decode(chunk, { stream: true });
+      })();
+    }
+    const until = async (...texts: string[]) => {
+      for (const end = Date.now() + 15_000; !texts.some((t) => output.text.includes(t)); await Bun.sleep(50)) {
+        if (Date.now() > end) throw new Error(`timed out waiting for ${texts.join(" or ")} in:\n${output.text}`);
+      }
+    };
+    try {
+      await until("ready");
+      expect(output.text).toContain("- field customers.fax (data deleted from 1 document(s))");
+      writeFileSync(join(source, "schema.ts"), fields("name")); // taxNumber commented out half-way through an edit
+      await until("customers.taxNumber: 1 document(s)", "- field customers.taxNumber");
+      expect(output.text).toContain("customers.taxNumber: 1 document(s)"); // refused
+      expect(output.text).toContain("--allow-field-removal applied to the first start only");
+    } finally {
+      dev.kill("SIGTERM");
+      await dev.exited;
+    }
+    const again = open(defineSchema({ customers: defineTable({ name: z.string(), taxNumber: z.string() }) }), data);
+    expect(rawDocs(again, "customers")).toEqual([{ name: "Acme", taxNumber: "TR-1" }]);
+  }, 30_000);
 });

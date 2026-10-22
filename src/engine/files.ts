@@ -9,36 +9,56 @@ import type { DbSession } from "./database.ts";
 import type { Identity } from "./engine.ts";
 import type { Document } from "./store.ts";
 
-/** A field holding `_storage` ids. `path` uses "*" for array items / record values. */
+/**
+ * A field holding `_storage` ids. `path` uses "*" for array items / record
+ * values and ends in "*key" for ids used as record keys.
+ */
 export interface StorageField {
   path: string[];
   /** Options of a `file()` field; null for a plain `id("_storage")` reference. */
   file: FileFieldOptions | null;
 }
 
-const WRAPPERS = new Set(["optional", "nullable", "default", "prefault", "readonly", "nonoptional", "catch"]);
+export const WRAPPERS = new Set(["optional", "nullable", "default", "prefault", "readonly", "nonoptional", "catch"]);
+
+const RECORD_KEY = "*key";
 
 export function storageFieldsOf(schema: z.ZodType): StorageField[] {
   const out: StorageField[] = [];
   const seen = new Set<string>();
+  const lazies = new Set<z.ZodType>(); // a recursive schema is followed one level deep
+  const add = (path: string[], file: FileFieldOptions | null) => {
+    const key = path.join(".");
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push({ path, file });
+    }
+  };
   const walk = (node: z.ZodType, path: string[]) => {
     const meta = z.globalRegistry.get(node) as Record<string, unknown> | undefined;
-    const add = (file: FileFieldOptions | null) => {
-      const key = path.join(".");
-      if (!seen.has(key)) {
-        seen.add(key);
-        out.push({ path, file });
-      }
-    };
-    if (meta?.[FILE_META_KEY]) return add(meta[FILE_META_KEY] as FileFieldOptions);
-    if (meta?.[ID_TABLE_META_KEY] === "_storage") return add(null);
+    if (meta?.[FILE_META_KEY]) return add(path, meta[FILE_META_KEY] as FileFieldOptions);
+    if (meta?.[ID_TABLE_META_KEY] === "_storage") return add(path, null);
     const def = (node as any)._zod.def;
+    if (def.type === "record") {
+      // Ids used as record keys count as plain references (file() keys too).
+      const keyMeta = z.globalRegistry.get(def.keyType) as Record<string, unknown> | undefined;
+      if (keyMeta?.[ID_TABLE_META_KEY] === "_storage") add([...path, RECORD_KEY], null);
+    }
     if (WRAPPERS.has(def.type)) walk(def.innerType, path);
     else if (def.type === "array") walk(def.element, [...path, "*"]);
     else if (def.type === "record") walk(def.valueType, [...path, "*"]);
-    else if (def.type === "object") for (const [key, child] of Object.entries(def.shape)) walk(child as z.ZodType, [...path, key]);
+    else if (def.type === "tuple") {
+      def.items.forEach((item: z.ZodType, i: number) => walk(item, [...path, String(i)]));
+      if (def.rest) walk(def.rest, [...path, "*"]);
+    } else if (def.type === "object") for (const [key, child] of Object.entries(def.shape)) walk(child as z.ZodType, [...path, key]);
     else if (def.type === "union") for (const option of def.options) walk(option, path);
-    else if (def.type === "pipe") walk(def.in, path);
+    else if (def.type === "intersection") for (const side of [def.left, def.right]) walk(side, path);
+    else if (def.type === "pipe") for (const side of [def.in, def.out]) walk(side, path);
+    else if (def.type === "lazy" && !lazies.has(node)) {
+      lazies.add(node);
+      walk(def.getter(), path);
+      lazies.delete(node);
+    }
   };
   walk(schema, []);
   return out;
@@ -49,8 +69,21 @@ export function idsAt(doc: unknown, path: string[]): string[] {
   if (path.length === 0) return typeof doc === "string" ? [doc] : [];
   if (typeof doc !== "object" || doc === null) return [];
   const [head, ...rest] = path;
+  if (head === RECORD_KEY) return Object.keys(doc);
   if (head === "*") return Object.values(doc).flatMap((v) => idsAt(v, rest));
   return idsAt((doc as Record<string, unknown>)[head!], rest);
+}
+
+/** Adds each of `candidates` that `value` holds anywhere, as a string value or as an object key. */
+export function collectHeldIds(value: unknown, candidates: Set<string>, found: Set<string>) {
+  if (typeof value === "string") {
+    if (candidates.has(value)) found.add(value);
+  } else if (typeof value === "object" && value !== null) {
+    for (const [key, child] of Object.entries(value)) {
+      if (candidates.has(key)) found.add(key);
+      collectHeldIds(child, candidates, found);
+    }
+  }
 }
 
 export function contentTypeMatches(type: string | undefined, patterns: string[]): boolean {
