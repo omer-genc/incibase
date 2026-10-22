@@ -16,6 +16,16 @@ export function isAdminPath(path: string): boolean {
   return path === "/api/schema" || path === "/_" || path.startsWith("/_/") || path === "/api/admin" || path.startsWith("/api/admin/");
 }
 
+/**
+ * Paths the admin surface does not serve: the app's stored files. Its origin
+ * (the tunnel's) is where the dashboard keeps the admin key, so it never
+ * serves tenant content; file URLs point at the public URL anyway. The app's
+ * HTTP actions are left out there too (see startServer's fallback).
+ */
+export function isAppContentPath(path: string): boolean {
+  return path === "/api/storage/:id";
+}
+
 /** Host names the admin surface answers to, with any port: a browser or client on the other end of the SSH tunnel. */
 const ADMIN_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$/i;
 
@@ -33,6 +43,15 @@ export function adminRequestRefusal(req: Request): string | null {
   const origin = req.headers.get("origin");
   if (origin !== null && origin.toLowerCase() !== `http://${host}`.toLowerCase()) {
     return `Origin "${origin}" is not this admin socket's origin (http://${host})`;
+  }
+  // A page of another site can still send the browser here without an Origin (a link, a form GET,
+  // an image). Browsers say so in Sec-Fetch-Site; such a request may only open the dashboard.
+  const site = req.headers.get("sec-fetch-site")?.toLowerCase();
+  if (site === "cross-site" || site === "same-site") {
+    const path = new URL(req.url).pathname;
+    const navigates = req.method === "GET" && req.headers.get("sec-fetch-mode")?.toLowerCase() === "navigate";
+    const opensDashboard = navigates && (path === "/_" || path === "/_/");
+    if (!opensDashboard) return `A request from another site (Sec-Fetch-Site: ${site}) may only open the dashboard on the admin socket`;
   }
   return null;
 }
@@ -75,7 +94,7 @@ function guarded(value: Route, refuse: (req: Request) => Response | null): Route
  * The routes a listener of `surface` serves. Combined keeps them as they
  * are. Public and admin put every route behind `refuse`, so a route added
  * later cannot skip the surface's checks; public also answers the admin paths
- * with `notFound`.
+ * with `notFound`, and admin the app's content paths.
  */
 export function routesFor<R extends Record<string, unknown>>(
   surface: Surface,
@@ -86,7 +105,8 @@ export function routesFor<R extends Record<string, unknown>>(
   if (surface === "combined") return routes;
   const out: Record<string, Route> = {};
   for (const [path, value] of Object.entries(routes)) {
-    out[path] = guarded(surface === "public" && isAdminPath(path) ? notFound : value, refuse);
+    const hidden = surface === "public" ? isAdminPath(path) : isAppContentPath(path);
+    out[path] = guarded(hidden ? notFound : value, refuse);
   }
   return out as R;
 }

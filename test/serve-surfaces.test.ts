@@ -2,8 +2,8 @@
 // and secrets that hosted mode takes only from the environment.
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { createServer, type Server as NetServer } from "node:net";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { connect, createServer, type Server as NetServer } from "node:net";
 import { join } from "node:path";
 import { action, defineSchema, defineTable, file, httpAction, httpRouter, id, internalQuery, mutation, query, z } from "incibase/server";
 import type { ServiceIdentity, ServiceScope } from "incibase/server";
@@ -56,6 +56,17 @@ router.route({
   path: "/hook",
   method: "GET",
   handler: httpAction(async (ctx: any) => Response.json({ isAdmin: ctx.auth.isAdmin, service: ctx.auth.service })),
+});
+// An app page that echoes its input and opens itself to every origin: what the admin origin must never serve.
+router.route({
+  path: "/page",
+  method: "GET",
+  handler: httpAction(
+    async (_ctx: any, req: Request) =>
+      new Response(`<h1>${new URL(req.url).searchParams.get("q")}</h1>`, {
+        headers: { "content-type": "text/html", "access-control-allow-origin": "*" },
+      }),
+  ),
 });
 
 const whoami = async (ctx: any) => ({ userId: await ctx.auth.getUserId(), isAdmin: ctx.auth.isAdmin, service: ctx.auth.service });
@@ -313,11 +324,32 @@ describe("hosted listeners", () => {
     const res = await upload(uploadKey.key);
     expect(res.status).toBe(200);
     const { storageId } = await res.json();
-    // Like an admin upload: no owner, so only the admin, system code and upload-scoped keys may attach it.
+    // No owner, like an admin upload, but marked as this key's: besides the admin and system code only it may attach it.
     const other = await over(h.pub, "/api/mutation", { ...callBody("app:attach", { file: storageId }), token: bareKey.key });
     expect(other.status).toBe(403);
     const attached = await over(h.pub, "/api/mutation", { ...callBody("app:attach", { file: storageId }), token: uploadKey.key });
     expect(attached.status).toBe(200);
+  });
+
+  test("the upload scope does not attach files the admin, system code or other keys stored", async () => {
+    const attach = (file: string, socket = h.pub, token = uploadKey.key) => over(socket, "/api/mutation", { ...callBody("app:attach", { file }), token });
+    const anonymousRead = async (file: string) => (await over(h.pub, `/api/storage/${file}`)).status;
+    const adminUpload = await over(h.admin, "/api/storage/upload?visibility=private", { method: "POST", body: "admin secret", token: ADMIN_KEY });
+    expect(adminUpload.status).toBe(200);
+    const byAdmin: string = (await adminUpload.json()).storageId;
+    // System code (a cron, an internal action) stores with no owner; so does another key's upload.
+    const bySystem = await h.engine.storage.store(new Blob(["salary report"]), { visibility: "private" });
+    const byOtherKey = await h.engine.storage.store(new Blob(["other key"]), { visibility: "private", serviceKeyId: "photos" });
+    for (const file of [byAdmin, bySystem, byOtherKey]) {
+      expect(await anonymousRead(file)).toBe(403);
+      const refused = await attach(file);
+      expect(refused.status).toBe(403);
+      expect((await refused.json()).error.message).toContain("only use files you uploaded");
+      // Attaching would have made it public (file() is public by default): it stays private.
+      expect(await anonymousRead(file)).toBe(403);
+    }
+    // The admin still may.
+    expect((await attach(byAdmin, h.admin, ADMIN_KEY)).status).toBe(200);
   });
 
   test("a service key subscribes to internal queries; other sockets do not share its run", async () => {
@@ -426,6 +458,63 @@ describe("hosted listeners", () => {
     expect(refused.headers.get("access-control-allow-origin")).toBe("*");
   });
 
+  test("the admin socket serves no app content: no HTTP actions, no stored files", async () => {
+    const page = "/page?q=%3Cscript%3Ealert(localStorage.getItem('incibase:admin-key'))%3C/script%3E";
+    // On the public socket they are the app's.
+    const pub = await over(h.pub, page);
+    expect(pub.status).toBe(200);
+    expect(pub.headers.get("access-control-allow-origin")).toBe("*");
+    const upload = await over(h.pub, "/api/storage/upload?visibility=public", { method: "POST", body: "<b>hi</b>", token: uploadKey.key });
+    const { storageId } = await upload.json();
+    expect((await over(h.pub, `/api/storage/${storageId}`)).status).toBe(200);
+    // On the admin socket, with a good Host and with or without the admin key, they are not there.
+    for (const token of [undefined, ADMIN_KEY]) {
+      for (const [path, init] of [
+        [page, {}],
+        ["/hook", {}],
+        ["/hook", { method: "OPTIONS", headers: { origin: "http://127.0.0.1:7101", "access-control-request-method": "GET" } }],
+        [`/api/storage/${storageId}`, {}],
+      ] as [string, RequestInit][]) {
+        const res = await over(h.admin, path, { ...init, host: "127.0.0.1:7101", token });
+        expect([path, init.method, res.status]).toEqual([path, init.method, 404]);
+        expect(res.headers.get("content-type")).toContain("application/json");
+        expect([...res.headers.keys()].filter((k) => k.startsWith("access-control-"))).toEqual([]);
+        expect(await res.text()).not.toContain("<");
+      }
+    }
+  });
+
+  test("the admin socket lets other sites' pages only open the dashboard", async () => {
+    const from = (site: string, mode: string) => ({ "sec-fetch-site": site, "sec-fetch-mode": mode });
+    // A link or window.open from another site sends no Origin on a GET, but says so in Sec-Fetch-Site.
+    for (const site of ["cross-site", "same-site"]) {
+      for (const path of ["/_/", "/_"]) {
+        const res = await over(h.admin, path, { host: "127.0.0.1:7101", headers: from(site, "navigate"), redirect: "manual" });
+        expect([site, path, res.status]).toEqual([site, path, path === "/_" ? 302 : 200]);
+      }
+      const refused: [string, RequestInit][] = [
+        ["/api/health", { headers: from(site, "navigate") }],
+        ["/page?q=x", { headers: from(site, "navigate") }],
+        ["/_/", { headers: from(site, "no-cors") }],
+        ["/api/schema", { headers: from(site, "no-cors") }],
+        ["/api/admin/admin_overview", { method: "POST", body: "{}", headers: from(site, "navigate") }],
+        ["/api/ws", { headers: from(site, "websocket") }],
+      ];
+      for (const [path, init] of refused) {
+        const res = await over(h.admin, path, { ...init, host: "127.0.0.1:7101", token: ADMIN_KEY });
+        expect([site, path, res.status]).toEqual([site, path, 403]);
+        expect((await res.json()).error.message).toContain("another site");
+      }
+    }
+    // The dashboard's own calls, and a URL typed or opened from the terminal.
+    for (const site of ["same-origin", "none"]) {
+      const res = await over(h.admin, "/api/admin/admin_overview", { ...json({}), host: "127.0.0.1:7101", token: ADMIN_KEY, headers: from(site, "cors") });
+      expect([site, res.status]).toEqual([site, 200]);
+    }
+    // The public socket does not look at it.
+    expect((await over(h.pub, "/api/health", { headers: from("cross-site", "no-cors") })).status).toBe(200);
+  });
+
   test("both sockets get mode 0770", () => {
     for (const path of [h.pub, h.admin]) {
       expect(lstatSync(path).isSocket()).toBe(true);
@@ -521,6 +610,62 @@ describe("socket paths", () => {
     expect(lstatSync(path).isSocket()).toBe(true);
   });
 
+  test("a live socket this process may not connect to is left alone (exit 64)", async () => {
+    if (process.getuid?.() === 0) return; // root connects anyway
+    const path = join(dir(), "other.sock");
+    const live = createServer((c) => c.end("still here")).listen(path);
+    holders.push(live);
+    await new Promise((resolve) => live.once("listening", resolve));
+    chmodSync(path, 0o000);
+    const err = await errorOf(() => clearStaleSocket(path));
+    expect(exitCodeOf(err)).toBe(ExitCode.CONFIG);
+    expect((err as Error).message).toContain("permission denied");
+    expect(lstatSync(path).isSocket()).toBe(true);
+    chmodSync(path, 0o770);
+    const reply = await new Promise<string>((resolve, reject) => {
+      const conn = connect(path);
+      let text = "";
+      conn.on("data", (d) => (text += d));
+      conn.on("end", () => resolve(text));
+      conn.on("error", reject);
+    });
+    expect(reply).toBe("still here");
+  });
+
+  test("a path that changes while the stale socket is checked is not removed", async () => {
+    const root = dir();
+    const swaps: [string, (path: string) => void, ExitCode][] = [
+      ["a file", (path) => writeFileSync(path, "precious"), ExitCode.CONFIG],
+      ["a symlink", (path) => symlinkSync(join(root, "target"), path), ExitCode.CONFIG],
+    ];
+    writeFileSync(join(root, "target"), "target");
+    for (const [what, put, code] of swaps) {
+      const path = join(root, `${what.replace(" ", "-")}.sock`);
+      await staleSocket(path);
+      const pending = errorOf(() => clearStaleSocket(path));
+      // Taken over in the same tick, while the probe connects.
+      rmSync(path);
+      put(path);
+      const err = await pending;
+      expect([what, exitCodeOf(err)]).toEqual([what, code]);
+      expect(lstatSync(path).isSocket()).toBe(false);
+    }
+    expect(readFileSync(join(root, "a-file.sock"), "utf8")).toBe("precious");
+    expect(lstatSync(join(root, "a-symlink.sock")).isSymbolicLink()).toBe(true);
+    // A new server's socket in its place is not taken either (exit 75).
+    const path = join(root, "taken.sock");
+    await staleSocket(path);
+    const pending = errorOf(() => clearStaleSocket(path));
+    rmSync(path);
+    const taker = Bun.serve({ unix: path, fetch: () => new Response("new") });
+    try {
+      expect(exitCodeOf(await pending)).toBe(ExitCode.TEMPORARY);
+      expect(await (await fetch("http://localhost/", { unix: path } as RequestInit)).text()).toBe("new");
+    } finally {
+      taker.stop(true);
+    }
+  });
+
   test("listen failures on a socket path say why, with their exit code", async () => {
     const root = dir();
     const engine = new Engine({ modules: {} }, { dataDir: join(root, "data"), quiet: true, publicUrl: "http://x.test" });
@@ -577,6 +722,15 @@ describe("socket paths", () => {
     expect(err({ socket: "/run/x.sock", host: "0.0.0.0", url: "https://x" })).toContain("--host");
     expect(err({ socket: "/run/x.sock" })).toContain("--url");
     expect(err({ socket: "/run/x.sock", adminSocket: "/run/x.sock", url: "https://x" })).toContain("different");
+    // The same file spelled another way, or through a symlinked directory.
+    expect(err({ socket: "run/a.sock", adminSocket: "./run/a.sock", url: "https://x" })).toContain("different");
+    expect(err({ socket: "run/a.sock", adminSocket: join(process.cwd(), "run", "x", "..", "a.sock"), url: "https://x" })).toContain("different");
+    const root = dir();
+    mkdirSync(join(root, "real"));
+    symlinkSync(join(root, "real"), join(root, "link"));
+    expect(err({ socket: join(root, "real", "a.sock"), adminSocket: join(root, "link", "a.sock"), url: "https://x" })).toContain("different");
+    expect(err({ socket: join(root, "real", "a.sock"), adminSocket: join(root, "link", "b.sock"), url: "https://x" })).toBeNull();
+    expect(err({ socket: "run/a.sock", adminSocket: "run/b.sock", url: "https://x" })).toBeNull();
     expect(err({ adminSocket: "", url: "https://x" })).toContain("needs a path");
     expect(err({ socket: "/run/x.sock", adminSocket: "/run/a.sock", url: "https://x" })).toBeNull();
     expect(err({ adminSocket: "/run/a.sock", port: "3000" })).toBeNull();
@@ -600,6 +754,17 @@ describe("surface rules", () => {
     expect(adminRequestRefusal(req({ host: "127.0.0.1", origin: "http://127.0.0.1" }))).toBeNull();
     expect(adminRequestRefusal(req({ host: "evil.example" }))).toContain("evil.example");
     expect(adminRequestRefusal(req({ host: "localhost:7101", origin: "http://localhost:7101/" }))).toContain("Origin");
+    // Other sites' pages may only navigate to the dashboard.
+    const nav = (path: string, site: string, mode = "navigate", method = "GET") =>
+      adminRequestRefusal(new Request(`http://localhost${path}`, { method, headers: { host: "localhost:7101", "sec-fetch-site": site, "sec-fetch-mode": mode } }));
+    expect(nav("/_/", "cross-site")).toBeNull();
+    expect(nav("/_", "Same-Site")).toBeNull();
+    expect(nav("/_/", "same-origin", "cors", "POST")).toBeNull();
+    expect(nav("/api/health", "none")).toBeNull();
+    expect(nav("/_/x", "cross-site")).toContain("another site");
+    expect(nav("/_/", "cross-site", "no-cors")).toContain("another site");
+    expect(nav("/_/", "same-site", "navigate", "POST")).toContain("another site");
+    expect(nav("/api/health", "cross-site")).toContain("another site");
   });
 
   test("INCIBASE_CORS_ORIGINS", () => {
@@ -1030,6 +1195,20 @@ describe("serve in hosted mode", () => {
     await run.ready();
     expect(run.proc.exitCode).toBeNull();
     expect((await over(p.pub, "/api/health")).status).toBe(200);
+  });
+
+  test("a bad INCIBASE_CORS_ORIGINS or INCIBASE_MAX_JSON_BYTES exits 64 before touching the data dir", async () => {
+    const p = project();
+    const args = ["serve", "--dir", p.source, "--data", p.data, "--port", "0", "--host", "127.0.0.1", "--log-format", "json"];
+    for (const [name, value] of [
+      ["INCIBASE_CORS_ORIGINS", "shop.com"],
+      ["INCIBASE_MAX_JSON_BYTES", "lots"],
+    ]) {
+      const run = await spawn(args, { [name!]: value! }).exit();
+      expect([name, run.code]).toEqual([name, ExitCode.CONFIG]);
+      expect(run.stdout).toContain(name!);
+      expect(existsSync(p.data)).toBe(false);
+    }
   });
 
   test("plain serve keeps the default SIGHUP (it ends the process)", async () => {

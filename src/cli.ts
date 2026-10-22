@@ -9,13 +9,13 @@ import { describeApp } from "./engine/describe.ts";
 import { embeddedRuntime } from "./engine/embedded.ts";
 import { Engine, type AppDefinition } from "./engine/engine.ts";
 import { ConfigError, DefinitionError, describeExit, exitCodeOf, ExitCode } from "./engine/exit-codes.ts";
-import { listenError } from "./engine/http.ts";
+import { listenError, maxJsonBytesFromEnv } from "./engine/http.ts";
 import { checkListenFlags, startListeners, type Listeners } from "./engine/listeners.ts";
 import { loadAppFromDir, schemaOf } from "./engine/loader.ts";
 import { color, isJson, logEvent, parseLogFormat, setLogFormat, stripQuery } from "./engine/log.ts";
 import { MigrationError } from "./engine/migrate.ts";
 import { handleReloads, serviceKeysFromEnv, type ReloadTarget } from "./engine/service-keys.ts";
-import { checkHostedSecrets } from "./engine/surface.ts";
+import { checkHostedSecrets, corsOriginsFromEnv } from "./engine/surface.ts";
 import { DataDirLockedError, readMeta } from "./engine/store.ts";
 import { VERSION } from "./engine/version.ts";
 
@@ -240,6 +240,9 @@ async function serve(values: Values, embedded?: EmbeddedApp) {
       host: values.host,
       url: values.url ?? process.env.INCIBASE_URL,
     });
+    // startServer reads these too, but only after the database has migrated.
+    corsOriginsFromEnv();
+    maxJsonBytesFromEnv();
     if (!embedded && !statSync(values.dir, { throwIfNoEntry: false })?.isDirectory()) {
       throw new ConfigError(`No app directory ${values.dir}: pass --dir, or create one with: incibase init`);
     }

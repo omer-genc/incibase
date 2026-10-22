@@ -44,7 +44,7 @@ export interface ServeOptions {
 const DEFAULT_MAX_JSON_BYTES = 1024 * 1024;
 
 /** `INCIBASE_MAX_JSON_BYTES`, so a server started by the CLI can raise the limit. */
-function maxJsonBytesFromEnv(): number | undefined {
+export function maxJsonBytesFromEnv(): number | undefined {
   const value = process.env.INCIBASE_MAX_JSON_BYTES;
   if (!value) return undefined;
   const bytes = Number(value);
@@ -321,7 +321,12 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
           const identity = engine.auth.identifyRequest(req);
           // The signed upload URL decides visibility; an admin (or the upload scope) may pass ?visibility= directly.
           const grant = identity.admin || hasScope(identity, "upload")
-            ? { visibility: (url.searchParams.get("visibility") ?? undefined) as "public" | "private" | undefined, ownerId: null }
+            ? {
+                visibility: (url.searchParams.get("visibility") ?? undefined) as "public" | "private" | undefined,
+                ownerId: null,
+                // A service key's upload is marked as its own: it may attach that file, not the admin's.
+                serviceKeyId: identity.admin ? undefined : identity.service?.keyId,
+              }
             : engine.storage.verifyUploadToken(url.searchParams.get("token"));
           if (!grant) {
             throw new IncibaseError({ code: "FORBIDDEN", message: "Invalid or expired upload URL" });
@@ -392,7 +397,9 @@ export function startServer(engine: Engine, options: ServeOptions): Server<Socke
     }),
 
     // The app's own responses are left as they are: the id is only for the log.
-    fetch: (req) => refuse(req) ?? withRid(ridFrom(req.headers.get("x-request-id")), () => httpAction(req)),
+    // The admin socket runs no HTTP actions: its origin holds the dashboard's admin key.
+    fetch: (req) =>
+      refuse(req) ?? (surface === "admin" ? notFound(req) : withRid(ridFrom(req.headers.get("x-request-id")), () => httpAction(req))),
 
     websocket: {
       // Behind a proxy (unix socket) the first ping comes before common 60-100 s idle cutoffs.

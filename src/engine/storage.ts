@@ -40,6 +40,8 @@ export interface UploadGrant {
   ownerId?: string | null;
   /** Uploaded without a user; anyone may attach such a file to a document. */
   anonymous?: boolean;
+  /** Uploaded by this service key without a signed URL (the upload scope); it may attach the file. */
+  serviceKeyId?: string;
   maxBytes?: number;
   contentTypes?: string[];
 }
@@ -246,6 +248,7 @@ export class StorageService {
             visibility,
             ...(options.ownerId ? { ownerId: options.ownerId } : {}),
             ...(options.anonymous && !options.ownerId ? { anonymous: true } : {}),
+            ...(options.serviceKeyId && !options.ownerId ? { serviceKeyId: options.serviceKeyId } : {}),
             // Collected by cleanup() unless a document references it in time.
             pending: true,
           }),

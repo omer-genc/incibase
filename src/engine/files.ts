@@ -7,7 +7,6 @@ import { IncibaseError } from "../errors.ts";
 import { FILE_META_KEY, ID_TABLE_META_KEY, type FileFieldOptions } from "../values.ts";
 import type { DbSession } from "./database.ts";
 import type { Identity } from "./engine.ts";
-import { hasScope } from "./service-keys.ts";
 import type { Document } from "./store.ts";
 
 /**
@@ -101,6 +100,8 @@ interface StorageData {
   size: number;
   ownerId?: string;
   anonymous?: boolean;
+  /** The service key that uploaded the file without a signed URL. */
+  serviceKeyId?: string;
   visibility?: string;
   attachedTo?: { table: string; id: string; field: string };
   pending?: boolean;
@@ -116,14 +117,14 @@ function loadFile(session: DbSession, fileId: string): StorageData {
 
 /**
  * Who may put a file into a document: its owner, admins and system code;
- * anyone for anonymous uploads. Files without an owner (admin, system and
- * service key uploads) also go to service keys with the upload scope, which
- * upload them that way.
+ * anyone for anonymous uploads; the service key that uploaded it without a
+ * signed URL. Other files without an owner (admin and system uploads) stay
+ * with admins and system code.
  */
 function mayAttach(file: StorageData, identity: Identity | undefined): boolean {
   if (!identity || identity.admin || identity.system) return true;
   if (file.ownerId) return file.ownerId === identity.userId;
-  return !!file.anonymous || hasScope(identity, "upload");
+  return !!file.anonymous || (!!file.serviceKeyId && file.serviceKeyId === identity.service?.keyId);
 }
 
 function attach(session: DbSession, fileId: string, target: { table: string; id: string; field: string }, options: FileFieldOptions) {
