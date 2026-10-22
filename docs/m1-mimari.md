@@ -468,6 +468,13 @@ Zaman yetmezse önce şunlar kesilir: adopt, alias'lar ve Cloudflare `real_ip` (
 
 ## 13. Sahibe açık sorular
 
+**Kararlar (2026-10-22):**
+- Dashboard ve MCP: M4'e kadar yalnızca SSH tüneli.
+- Domain ve TLS: Cloudflare'de ayrı bir alt alan (`apps.<x>`), proxied wildcard ve Origin CA (reçete A). Domain adı Faz B'den önce belirlenecek.
+- VPS: Ubuntu 24.04, KVM, en az 4 GB. Branch belleği prod 512M, dev 256M.
+- Alarm: ntfy.sh.
+- Üretimde 0.2.0 kurulumu yok varsayıldı; `host adopt` (adım 16) kesilebilir.
+
 1. **M4'e kadar dashboard ve MCP'ye yalnızca SSH tüneliyle erişmek kabul edilebilir mi?**
    - Önerilen: evet.
    - Telefondan erişim istenirse kontrol servisi ve owner auth öne çekilir; bu yaklaşık 6 gün ekler.
