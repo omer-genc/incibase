@@ -23,8 +23,16 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Tag matches package.json version
         run: test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
+      # Pre-releases (0.3.0-alpha.0) go to the "next" dist-tag so `bun add incibase` keeps the stable one.
+      - name: Release channel
+        id: channel
+        run: |
+          case "$GITHUB_REF_NAME" in
+            *-*) echo "npm_tag=next" >> "$GITHUB_OUTPUT"; echo "gh_flags=--prerelease" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "npm_tag=latest" >> "$GITHUB_OUTPUT"; echo "gh_flags=" >> "$GITHUB_OUTPUT" ;;
+          esac
       # prepublishOnly runs typecheck, tests and build:package.
-      - run: npm publish
+      - run: npm publish --tag ${{ steps.channel.outputs.npm_tag }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Build binaries
@@ -34,6 +42,6 @@ jobs:
           --target bun-darwin-x64 --target bun-darwin-arm64
           --target bun-windows-x64
       - name: GitHub Release
-        run: gh release create "$GITHUB_REF_NAME" dist/incibase-* --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/incibase-* --generate-notes ${{ steps.channel.outputs.gh_flags }}
         env:
           GH_TOKEN: ${{ github.token }}

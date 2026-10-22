@@ -1,5 +1,31 @@
 # Değişiklikler
 
+## 0.3.0-alpha.0
+
+M1 Faz A: tek sunucuda proje ve branch barındıracak host katmanının (Faz B) üzerine kurulacağı `serve` özellikleri. Tasarım: [docs/m1-mimari.md](docs/m1-mimari.md). Yeni davranışların çoğu bayrak ya da env ile açılır; bayraksız `serve`/`dev` aşağıda listelenenler dışında aynı çalışır.
+
+### Yeni
+
+- **Çıkış kodları.** `0` normal, `1` çökme, `64` config hatası, `65` migration reddi, `75` geçici (data dir kilitli, port meşgul), `78` uygulama tanım hatası. Tanım hataları (bozuk şema, bilinmeyen cron hedefi, tekrarlanan route) artık migration'dan **önce** yakalanır; veritabanına hiçbir şey yazılmaz.
+- **JSON log.** `--log-format json` (ya da `INCIBASE_LOG_FORMAT`): her satır bir JSON nesnesi. İstek kimliği (`x-request-id`, `rid`) fonksiyonlara, job'lara ve abonelik yeniden çalıştırmalarına taşınır; kullanıcı kodundaki `console.*` çağrıları da JSON olur. Anahtar ve token'lar log'a yazılmaz.
+- **Unix socket'ler ve admin yüzeyi ayrımı.** `--socket` public yüzeyi, `--admin-socket` dashboard'u ve admin API'sini ayrı socket'lerde sunar (`0770`). Admin yüzeyi yalnızca `localhost` Host'larını kabul eder, Origin kontrolü yapar ve CORS göndermez; public tarafta admin key `401` alır. Hosted modda `INCIBASE_ADMIN_KEY` ve `INCIBASE_STORAGE_SECRET` env'den zorunludur, meta'da secret varsa başlamaz.
+- **Servis anahtarları.** `ik_svc_<id>_<secret>`, `INCIBASE_SERVICE_KEYS_FILE` ile; kapsamlar `internal`, `impersonate`, `upload`. Admin değildir; `SIGHUP` ile restart'sız yenilenir. Fonksiyonlarda `ctx.auth.service`. Public CORS için `INCIBASE_CORS_ORIGINS`.
+- **Fonksiyon timeout'ları.** `--timeouts query=10s,mutation=10s,action=120s,http=120s`: süresi dolan çağrı geri alınır, kilidi bırakır, `504 FUNCTION_TIMEOUT` döner.
+- **Drain.** `SIGTERM`/`SIGINT`'te yeni bağlantılar kesilir, WebSocket'ler `1012` ile kapanır, süren çağrılar ve job'lar `--drain-timeout` (varsayılan 10 s, dev 1 s) kadar beklenir. Yarıda kalan job'lar `interrupted` olur; `retryOnInterrupt` ile bir kez yeniden kuyruğa alınabilir. Kaçırılan cron'lar `cron_skipped` olarak loglanır.
+- **Yüklemeler ve limitler.** Yüklemeler belleğe alınmadan diske stream edilir (`INCIBASE_UPLOAD_CONCURRENCY`, varsayılan 2). `INCIBASE_MAX_UPLOAD_BYTES`, `INCIBASE_MAX_STORAGE_BYTES` (toplam kota), `INCIBASE_MAX_DB_BYTES` (`max_page_count`), S3 için `INCIBASE_S3_PREFIX`.
+- **Release bundle'ları.** `incibase bundle` uygulamayı npm bağımlılıklarıyla birlikte tek bir `app.ib` dosyasına paketler (manifest + sha256); `serve --bundle app.ib` onu çalıştırır. Değiştirilmiş bundle ve native addon reddedilir.
+- **Preflight.** `serve --migrate-only` migration'ı çalıştırıp dinlemeden çıkar. Migration doğrulaması sayfalı yapılır; bellek kullanımı sınırlıdır.
+- **Diğer.** Şifre hash'leme eşzamanlılığı sınırlı (`INCIBASE_AUTH_CONCURRENCY`, aşılırsa `503 AUTH_BUSY`). `/api/health` `generation`, `admin_overview` branch etiketi döner; dashboard'da branch etiketi ve prod şeridi.
+
+### Davranışı değişenler (bayraksız kullanım dahil)
+
+- Başlangıç hataları artık hep `1` değil, yukarıdaki kodlarla çıkar; bilinmeyen bayrak `64` verir.
+- `SIGTERM` sunucuyu anında kapatmak yerine drain eder (en fazla 10 s).
+- Restart sırasında yarıda kalan job'lar `failed` yerine `interrupted` olarak işaretlenir.
+- Cron hedefi bir fonksiyon referansı olmalı; tekrarlanan HTTP route'ları ve var olan tekrarlara unique index tanım/migration hatasıdır.
+- API yanıtları `x-request-id` başlığı taşır; `NO_COLOR` desteklenir.
+- İstemci oturum token'ını `incibase:token:<baseUrl>` altında saklar (eski anahtar bir kez okunur), yeniden bağlanırken jitter kullanır ve `503` + `x-incibase-unprocessed: 1` yanıtlarını en fazla ~15 s tekrar dener.
+
 ## 0.2.0
 
 Gerçek veriyle çalışmadan önce gereken güvenlik ve veri güvenliği düzeltmeleri.
