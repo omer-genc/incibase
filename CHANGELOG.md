@@ -12,10 +12,10 @@ M1 Faz A: tek sunucuda proje ve branch barındıracak host katmanının (Faz B) 
 - **Servis anahtarları.** `ik_svc_<id>_<secret>`, `INCIBASE_SERVICE_KEYS_FILE` ile; kapsamlar `internal`, `impersonate`, `upload`. Admin değildir; `SIGHUP` ile restart'sız yenilenir. Fonksiyonlarda `ctx.auth.service`. Public CORS için `INCIBASE_CORS_ORIGINS`.
 - **Fonksiyon timeout'ları.** `--timeouts query=10s,mutation=10s,action=120s,http=120s`: süresi dolan çağrı geri alınır, kilidi bırakır, `504 FUNCTION_TIMEOUT` döner.
 - **Drain.** `SIGTERM`/`SIGINT`'te yeni bağlantılar kesilir, WebSocket'ler `1012` ile kapanır, süren çağrılar ve job'lar `--drain-timeout` (varsayılan 10 s, dev 1 s) kadar beklenir. Yarıda kalan job'lar `interrupted` olur; `retryOnInterrupt` ile bir kez yeniden kuyruğa alınabilir. Kaçırılan cron'lar `cron_skipped` olarak loglanır.
-- **Yüklemeler ve limitler.** Yüklemeler belleğe alınmadan diske stream edilir (`INCIBASE_UPLOAD_CONCURRENCY`, varsayılan 2). `INCIBASE_MAX_UPLOAD_BYTES`, `INCIBASE_MAX_STORAGE_BYTES` (toplam kota), `INCIBASE_MAX_DB_BYTES` (`max_page_count`), S3 için `INCIBASE_S3_PREFIX`.
-- **Release bundle'ları.** `incibase bundle` uygulamayı npm bağımlılıklarıyla birlikte tek bir `app.ib` dosyasına paketler (manifest + sha256); `serve --bundle app.ib` onu çalıştırır. Değiştirilmiş bundle ve native addon reddedilir.
-- **Preflight.** `serve --migrate-only` migration'ı çalıştırıp dinlemeden çıkar. Migration doğrulaması sayfalı yapılır; bellek kullanımı sınırlıdır.
-- **Diğer.** Şifre hash'leme eşzamanlılığı sınırlı (`INCIBASE_AUTH_CONCURRENCY`, aşılırsa `503 AUTH_BUSY`). `/api/health` `generation`, `admin_overview` branch etiketi döner; dashboard'da branch etiketi ve prod şeridi.
+- **Yüklemeler ve limitler.** Yüklemeler belleğe alınmadan diske stream edilir; eşzamanlı yükleme sayısı `INCIBASE_UPLOAD_CONCURRENCY` ile sınırlanabilir (varsayılan: sınırsız). `INCIBASE_MAX_UPLOAD_BYTES`, `INCIBASE_MAX_STORAGE_BYTES` (toplam kota), `INCIBASE_MAX_DB_BYTES` (`max_page_count`), S3 için `INCIBASE_S3_PREFIX`.
+- **Release bundle'ları.** `incibase bundle` uygulamayı npm bağımlılıklarıyla birlikte tek bir `app.ib` dosyasına paketler (manifest + sha256); `serve --bundle app.ib` onu çalıştırır. Değiştirilmiş bundle, manifest'e gizlenmiş kod ve native addon reddedilir.
+- **Preflight.** `serve --migrate-only` migration'ı çalıştırıp dinlemeden çıkar (`data.db` yoksa `64`; ilk release için `--allow-empty`). Migration da `INCIBASE_MAX_DB_BYTES` sınırına tabidir. Migration doğrulaması sayfalı yapılır; bellek kullanımı sınırlıdır.
+- **Diğer.** Şifre hash'leme eşzamanlılığı `INCIBASE_AUTH_CONCURRENCY` ile sınırlanabilir (varsayılan: sınırsız; aşılırsa `503 AUTH_BUSY`). `/api/health` `generation`, `admin_overview` branch etiketi döner; dashboard'da branch etiketi ve prod şeridi.
 
 ### Davranışı değişenler (bayraksız kullanım dahil)
 
