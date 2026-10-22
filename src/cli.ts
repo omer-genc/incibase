@@ -151,6 +151,8 @@ async function serve(values: Values, embedded?: AppDefinition) {
   engine.start();
   const dashboard = !values["no-dashboard"];
   const server = startServer(engine, { port, hostname: values.host ?? (dev ? "localhost" : "0.0.0.0"), dashboard });
+  // Only once serving: a startup error must still exit instead of leaving a process that serves nothing.
+  installCrashHandlers();
 
   const mcpUrl = `${publicUrl}/mcp`;
   const tableCount = [...engine.store.tables.values()].filter((t) => !t.system).length;
@@ -179,12 +181,35 @@ async function serve(values: Values, embedded?: AppDefinition) {
   const shutdown = async () => {
     if (stopping) return;
     stopping = true;
-    server.stop(true);
-    await engine.stop();
-    process.exit(0);
+    // A failure here must still exit: the crash handlers would otherwise keep the process up.
+    let code = 0;
+    try {
+      server.stop(true);
+      await engine.stop();
+    } catch (err) {
+      console.error("[incibase] shutdown failed:", err);
+      code = 1;
+    }
+    process.exit(code);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+/**
+ * Logs errors that escape every handler and keeps serving, for `serve` and the
+ * server process of `dev`. Bun exits on them by default, so one deployed
+ * function that forgets an `await` (say on ctx.runMutation) would take every
+ * client down, and nothing restarts the server. Carrying on is safe: all state
+ * is in SQLite, and a write that failed was rolled back with its transaction.
+ */
+export function installCrashHandlers() {
+  process.on("unhandledRejection", (reason) => {
+    console.error("[incibase] unhandled promise rejection (a missing await?); still serving:", reason);
+  });
+  process.on("uncaughtException", (err, origin) => {
+    console.error(`[incibase] uncaught exception (${origin}); still serving:`, err);
+  });
 }
 
 function selfCommand(): string[] {
