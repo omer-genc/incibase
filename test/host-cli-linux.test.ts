@@ -158,6 +158,13 @@ describe.skipIf(!enabled)("the owner's CLI on a real host", () => {
   test("init, runtime, project, releases, keys, env, status, logs, delete", async () => {
     // Usage errors and help need no host.
     expect(incibase(["branch", "create", "shop"], { ok: [2] }).stderr).toContain("Expected <project>/<branch>");
+    expect(incibase(["branch", "set", "shop/dev", "--memory", "lots"], { ok: [2] }).stderr).toContain("--memory: Invalid size");
+    // Before host init, and at a mistyped root, commands refuse and create no registry.
+    expect(incibase(["status"], { ok: [1] }).stderr).toContain(`No incibase host at ${ROOT}: run sudo incibase host init`);
+    expect(existsSync(join(ROOT, "control"))).toBe(false);
+    const typo = join(ROOT, "typo");
+    expect(run([process.execPath, CLI, "project", "create", "shop", "--branches", "", "--root", typo], { ok: [1] }).stderr).toContain(`No incibase host at ${typo}`);
+    expect(existsSync(typo)).toBe(false);
 
     const init = incibase([
       "host", "init",
@@ -228,6 +235,16 @@ describe.skipIf(!enabled)("the owner's CLI on a real host", () => {
     const logs = incibase(["logs", "shop/dev", "--lines", "200"]);
     expect(logs.stdout).toContain('"ev":"ready"');
     expect(incibase(["logs", "shop/dev", "--errors", "--since", "1 hour ago"]).code).toBe(0);
+    // What the tenant logs reaches root's terminal without its control characters.
+    const unit = JSON.parse(incibase(["branch", "info", "shop/dev", "--json"]).stdout).id as string;
+    run(["logger", "--journald"], { stdin: Buffer.from(`MESSAGE=before\u001b]0;PWNED\u0007\u001b[2Jafter\tend\nOBJECT_SYSTEMD_UNIT=${LAYOUT.unitPrefix}-branch@${unit}.service\n`) });
+    let escaped = "";
+    for (let i = 0; i < 50 && !escaped.includes("before"); i++, await Bun.sleep(100)) escaped = incibase(["logs", "shop/dev", "--lines", "20"]).stdout;
+    expect(escaped).toContain("before?]0;PWNED??[2Jafter\tend");
+    expect(escaped).not.toMatch(/[\u001b\u0007]/);
+    // A --since journalctl cannot read is a usage error, also with --errors (whose "no match" is exit 1 too).
+    expect(incibase(["logs", "shop/dev", "--since", "abc"], { ok: [2] }).stderr).toContain('--since: journalctl cannot read "abc"');
+    expect(incibase(["logs", "shop/dev", "--errors", "--since", "abc"], { ok: [2] }).code).toBe(2);
 
     if (TUNNEL_DIR) {
       writeFileSync(join(TUNNEL_DIR, "ready.json"), JSON.stringify({ root: ROOT, user: ADMIN_USER, branch: "shop/dev" }));

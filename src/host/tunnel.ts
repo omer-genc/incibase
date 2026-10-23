@@ -143,12 +143,16 @@ export async function tunnelCli(argv: string[]): Promise<number> {
       throw new TunnelError(`--ssh-config takes an existing file without spaces or quotes, got ${JSON.stringify(values["ssh-config"])}`, true);
     }
     const sshBase = configFile === undefined ? ["ssh"] : ["ssh", "-F", configFile];
+    // Never through a ControlMaster from the user's config: as a mux client, `ssh -N -L`
+    // hands the forward to a master that outlives it (ControlPersist), exits at once,
+    // and Ctrl-C here could not close the port. Each call is its own connection.
+    const sshArgs = [...sshBase, "-o", "ControlMaster=no", "-o", "ControlPath=none"];
     const localPort = number("local-port", values["local-port"], 1024, 65535);
     const timeoutMs = (number("timeout", values.timeout, 1, 600) ?? 30) * 1000;
 
     // 1. Where the branch's socket is, from the server.
     const indexPath = `${root}/admin/index.json`;
-    const read = Bun.spawn([...sshBase, "-o", "ConnectTimeout=15", "--", dest, "cat", indexPath], { stdin: "inherit", stdout: "pipe", stderr: "pipe" });
+    const read = Bun.spawn([...sshArgs, "-o", "ConnectTimeout=15", "--", dest, "cat", indexPath], { stdin: "inherit", stdout: "pipe", stderr: "pipe" });
     const [out, errText, code] = await Promise.all([new Response(read.stdout).text(), new Response(read.stderr).text(), read.exited]);
     if (code !== 0) {
       const denied = /permission denied/i.test(errText) && !/publickey|password/i.test(errText);
@@ -164,7 +168,7 @@ export async function tunnelCli(argv: string[]): Promise<number> {
     if (await portInUse(port)) throw new TunnelError(`127.0.0.1:${port} is in use (another tunnel?); close it or pass --local-port`);
 
     // 2. The tunnel.
-    ssh = Bun.spawn([...sshBase, "-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-L", `127.0.0.1:${port}:${socket}`, "--", dest], {
+    ssh = Bun.spawn([...sshArgs, "-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-L", `127.0.0.1:${port}:${socket}`, "--", dest], {
       stdin: "inherit",
       stdout: "inherit",
       stderr: "inherit",

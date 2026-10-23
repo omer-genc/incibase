@@ -3,13 +3,13 @@
 // root requirement, release from stdin, env import, admin-key's two
 // meanings, logs, help; and `incibase tunnel` against a fake ssh on PATH.
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { manifestLine, sha256Hex, type BundleManifest } from "../src/engine/manifest.ts";
 import { VERSION } from "../src/engine/version.ts";
 import { hostedAdminKey } from "../src/cli.ts";
-import { formatBytes, parseEnvImport, runCommand, table, type CommandIO } from "../src/host/commands.ts";
+import { formatBytes, parseEnvImport, processIO, runCommand, table, type CommandIO } from "../src/host/commands.ts";
 import type { DoctorContext } from "../src/host/doctor.ts";
 import { indexEntry } from "../src/host/tunnel.ts";
 import * as ops from "../src/host/ops.ts";
@@ -32,6 +32,11 @@ interface Session {
   stdin: Uint8Array;
   root: boolean;
   execCode: number;
+  /** What the command `exec` runs prints: stdout lines and stderr. */
+  execOutput: string[];
+  execStderr: string;
+  /** Whether each open was allowed to create a host. */
+  creates: boolean[];
   /** Output of the last run only. */
   last(): { out: string; err: string };
 }
@@ -48,6 +53,9 @@ async function session(): Promise<Session> {
     stdin: new Uint8Array(),
     root: true,
     execCode: 0,
+    execOutput: [],
+    execStderr: "",
+    creates: [],
     async run(...argv) {
       mark = { out: s.out.length, err: s.err.length };
       return runCommand(argv, io);
@@ -62,13 +70,15 @@ async function session(): Promise<Session> {
       return s.stdin;
     },
     isRoot: () => s.root,
-    open({ root }) {
+    open({ root, create }) {
       s.opened.push(root);
+      s.creates.push(create === true);
       return { ctx: host, close() {} };
     },
-    async exec(argv) {
+    async exec(argv, line) {
       s.execs.push(argv);
-      return s.execCode;
+      for (const text of s.execOutput) line(text);
+      return { code: s.execCode, stderr: s.execStderr };
     },
     env: {},
   };
@@ -112,6 +122,13 @@ describe("help and usage", () => {
     for (const f of ["--kind <prod|dev|preview>", "--protected", "--runtime <x.y.z>", "--root <dir>", "--json"]) expect(s.last().out).toContain(f);
     expect(await s.run("release", "add", "-h")).toBe(0);
     expect(s.last().out).toContain("--no-preflight");
+    // No ssh -t with stdin redirected: ssh allocates no terminal then, so sudo cannot ask for a password.
+    expect(s.last().out).toContain("scp app.ib vps: && ssh -t vps sudo incibase release add shop/prod app.ib");
+    expect(s.last().out).toContain("needs passwordless sudo");
+    expect(s.last().out).toContain("  ssh vps sudo incibase release add shop/prod - < app.ib");
+    expect(s.last().out).not.toContain("ssh -t vps sudo incibase release add shop/prod - <");
+    expect(await s.run("env", "set", "--help")).toBe(0);
+    expect(s.last().out).toContain("For secrets use env import <project>/<branch> - (stdin)");
     expect(await s.run("branch")).toBe(0);
     expect(s.last().out).toContain("incibase branch upgrade <project>/<branch>");
     // Help needs neither root nor a host.
@@ -133,6 +150,27 @@ describe("help and usage", () => {
       [["release", "add", "shop/dev"], /release add takes/],
       [["service-key", "revoke", "shop/dev"], /takes <project>\/<branch> <id>/],
       [["host", "add-admin"], /takes <unix user>/],
+      // Checks of the flags and arguments alone also come before root and the host.
+      [["host", "init"], /--domain is required/],
+      [["host", "init", "--domain", "x.example.net", "--https-port", "http"], /--https-port takes a whole number/],
+      [["host", "init", "--domain", "x.example.net", "--layout", "{"], /--layout takes a JSON object/],
+      [["host", "gc", "--older-than", "soon"], /--older-than takes/],
+      [["host", "set", "colour", "blue"], /Unknown setting "colour"/],
+      [["host", "set", "https_port", "0"], /--https_port takes/],
+      [["host", "tls", "--cert", "c.pem"], /--cert and --key are required/],
+      [["project", "create", "Shop"], /lowercase/],
+      [["branch", "list", "Shop"], /lowercase/],
+      [["branch", "create", "shop/dev", "--kind", "staging"], /--kind takes/],
+      [["branch", "set", "shop/dev"], /Nothing to change/],
+      [["branch", "set", "shop/dev", "--memory", "lots"], /--memory: Invalid size/],
+      [["branch", "upgrade", "shop/dev"], /--runtime is required/],
+      [["release", "add", "shop/dev", "app.ib", "--preflight", "--no-preflight"], /not both/],
+      [["release", "rollback", "shop/dev", "--to", "last"], /--to takes/],
+      [["env", "set", "shop/dev", "NOVALUE"], /Expected NAME=VALUE/],
+      [["service-key", "create", "shop/dev"], /--label is required/],
+      [["service-key", "revoke", "shop/dev", "../etc"], /not a service key id/],
+      [["status", "Shop"], /lowercase/],
+      [["logs", "shop/dev", "--lines", "0"], /--lines takes/],
     ];
     for (const [argv, message] of cases) {
       expect({ argv, code: await s.run(...argv) }).toEqual({ argv, code: 2 });
@@ -174,6 +212,21 @@ describe("help and usage", () => {
     await s.run("project", "list", "--root", "/srv/other");
     await s.run("project", "list");
     expect(s.opened).toEqual(["/srv/other", "/var/lib/incibase"]);
+  });
+
+  test("only host init may set up a host; any other command refuses a root that has none", async () => {
+    const s = await session();
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    await s.run("status");
+    expect(s.creates).toEqual([true, false]);
+    // The real open: a mistyped --root is refused before a registry is created there.
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "incibase-noroot-")));
+    try {
+      expect(() => processIO.open({ root: join(dir, "typo") })).toThrow(`No incibase host at ${join(dir, "typo")}: run sudo incibase host init`);
+      expect(readdirSync(dir)).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -537,6 +590,16 @@ describe("keys", () => {
     expect(hostedAdminKey(["--data", "./a/b"])).toBe(false);
     expect(hostedAdminKey(["--data=./a/b"])).toBe(false);
     expect(hostedAdminKey(["incibase_data"])).toBe(false);
+    // Flags may come first, as with every hosted command; values of --data and --root are not the <project>/<branch>.
+    expect(hostedAdminKey(["--rotate", "shop/prod"])).toBe(true);
+    expect(hostedAdminKey(["--root", "/var/lib/x", "shop/prod"])).toBe(true);
+    expect(hostedAdminKey(["--root=/var/lib/x", "shop/prod"])).toBe(true);
+    expect(hostedAdminKey(["--json", "shop/prod"])).toBe(true);
+    expect(hostedAdminKey(["--root", "/var/lib/x"])).toBe(true);
+    expect(hostedAdminKey(["--data", "./a/b", "--dir", "src/x"])).toBe(false);
+    expect(hostedAdminKey(["--data", "./a/b", "shop/prod"])).toBe(true);
+    expect(hostedAdminKey(["--data", "x", "--rotate"])).toBe(true);
+    expect(hostedAdminKey(["--", "shop/prod"])).toBe(true);
     const dir = realpathSync(mkdtempSync(join(tmpdir(), "incibase-cli-")));
     try {
       const run = (...args: string[]) => Bun.spawnSync([process.execPath, CLI, ...args], { stdout: "pipe", stderr: "pipe", cwd: dir, env: { ...process.env, INCIBASE_ADMIN_KEY: "" } });
@@ -549,6 +612,17 @@ describe("keys", () => {
       expect(hosted.exitCode).toBe(1);
       expect(hosted.stderr.toString()).toContain("runs on the server as root: sudo incibase admin-key");
       expect(run("admin-key", "shop/prod", "--data", "x").exitCode).toBe(2);
+      for (const args of [["--rotate", "shop/prod"], ["--root", "/var/lib/x", "shop/prod"], ["--json", "shop/prod"]]) {
+        const r = run("admin-key", ...args);
+        expect({ args, code: r.exitCode }).toEqual({ args, code: 1 });
+        expect(r.stderr.toString()).toContain("runs on the server as root: sudo incibase admin-key");
+      }
+      // Hosted-only flags without a <project>/<branch>, or with --data: usage errors of the hosted command, not the app's help.
+      for (const args of [["--root", "/var/lib/x"], ["--data", "x", "--rotate"], ["--data", "x", "shop/prod"]]) {
+        const r = run("admin-key", ...args);
+        expect({ args, code: r.exitCode }).toEqual({ args, code: 2 });
+        expect(r.stdout.toString()).not.toContain("Commands:");
+      }
       // Hosted commands are routed, and the app's help still lists both.
       expect(run("status", "--bogus").exitCode).toBe(2);
       expect(run("--help").stdout.toString()).toContain("admin-key <project>/<branch>");
@@ -610,11 +684,39 @@ describe("status and logs", () => {
     expect(await s.run("logs", "shop/dev", "--json")).toBe(0);
     expect(s.execs.at(-1)).toEqual(["journalctl", "--unit", unit, "--output", "json"]);
     expect(s.last().out).toBe("");
-    // journalctl --grep exits 1 when nothing matched; anything else failing is passed on.
+    // journalctl --grep exits 1, silently, when nothing matched; anything else failing is passed on.
     s.execCode = 1;
     expect(await s.run("logs", "shop/dev", "--errors")).toBe(0);
     expect(await s.run("logs", "shop/dev")).toBe(1);
     expect(await s.run("logs", "shop/dev", "--since", "$(reboot)")).toBe(2);
+    // A --since journalctl cannot read is a usage error, with --errors too; not "no matches".
+    s.execStderr = "Failed to parse timestamp: abc\n";
+    for (const extra of [[], ["--errors"]]) {
+      expect(await s.run("logs", "shop/dev", "--since", "abc", ...extra)).toBe(2);
+      expect(s.last().err).toContain('--since: journalctl cannot read "abc"');
+    }
+    s.execStderr = "Failed to open journal: \u001b[2Jno space\n";
+    expect(await s.run("logs", "shop/dev", "--errors")).toBe(1);
+    expect(s.last().err).toBe("Failed to open journal: ?[2Jno space");
+  });
+
+  test("logs prints the tenant's lines without control characters, so escape sequences never reach root's terminal", async () => {
+    const s = await shop();
+    s.execOutput = ["before\u001b]0;PWNED\u0007\u001b[2Jafter", "tab\there\rcr", "\u009b31mC1"];
+    expect(await s.run("logs", "shop/dev", "-f")).toBe(0);
+    expect(s.last().out.split("\n")).toEqual(["before?]0;PWNED??[2Jafter", "tab\there?cr", "?31mC1"]);
+    expect(s.last().out).not.toMatch(/[\u001b\u0007\u009b\r]/);
+  });
+
+  test("processIO.exec reads the child's stdout line by line (never inherited) and hands back its code and stderr", async () => {
+    const lines: string[] = [];
+    const r = await processIO.exec(["/bin/sh", "-c", "printf 'one\\033[2J\\ntwo'; printf 'oops\\n' >&2; exit 3"], (line) => lines.push(line));
+    expect(lines).toEqual(["one\u001b[2J", "two"]);
+    expect(r).toEqual({ code: 3, stderr: "oops\n" });
+    // A line longer than 64 KiB is split, not held.
+    const long: string[] = [];
+    await processIO.exec(["/bin/sh", "-c", "head -c 70000 /dev/zero | tr '\\0' a"], (line) => long.push(line));
+    expect(long.map((l) => l.length)).toEqual([65536, 70000 - 65536]);
   });
 
   test("the systemd driver's journalctl command for logs --errors", () => {
@@ -725,9 +827,11 @@ describe("tunnel", () => {
     expect(out).toContain(`MCP        claude mcp add --transport http incibase-dev--shop ${base}/mcp --header "Authorization: Bearer $(ssh omer@vps.example.net sudo incibase admin-key shop/dev)"`);
     expect(out).toContain("Admin key  ssh omer@vps.example.net sudo incibase admin-key shop/dev");
     expect(await (await fetch(`${base}/api/health`)).json()).toEqual({ ok: true });
+    // Both without a ControlMaster from ~/.ssh/config: a mux client's -N -L would leave the forward in a master that outlives Ctrl-C.
+    const noMux = ["-o", "ControlMaster=no", "-o", "ControlPath=none"];
     expect(t.log().slice(0, 2)).toEqual([
-      ["-o", "ConnectTimeout=15", "--", "omer@vps.example.net", "cat", "/var/lib/incibase/admin/index.json"],
-      ["-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-L", `127.0.0.1:${t.port}:/var/lib/incibase/admin/dev--shop.sock`, "--", "omer@vps.example.net"],
+      [...noMux, "-o", "ConnectTimeout=15", "--", "omer@vps.example.net", "cat", "/var/lib/incibase/admin/index.json"],
+      [...noMux, "-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-L", `127.0.0.1:${t.port}:/var/lib/incibase/admin/dev--shop.sock`, "--", "omer@vps.example.net"],
     ]);
     proc.kill("SIGINT");
     expect(await proc.exited).toBe(0);
@@ -743,8 +847,8 @@ describe("tunnel", () => {
     const proc = t.spawn(["shop/dev", "--ssh", "vps", "--local-port", String(port), "--root", "/srv/incibase", "--ssh-config", config, "--json"]);
     const line = JSON.parse((await readUntil(proc.stdout as ReadableStream<Uint8Array>, "}\n")).trim());
     expect(line).toMatchObject({ branch: "shop/dev", port, socket: "/srv/incibase/admin/dev--shop.sock", dashboard: `http://127.0.0.1:${port}/_/`, adminKeyCommand: `ssh -F ${config} vps sudo incibase admin-key shop/dev --root /srv/incibase` });
-    expect(t.log()[0]).toEqual(["-F", config, "-o", "ConnectTimeout=15", "--", "vps", "cat", "/srv/incibase/admin/index.json"]);
-    expect((t.log()[1] as string[]).slice(0, 3)).toEqual(["-F", config, "-N"]);
+    expect(t.log()[0]).toEqual(["-F", config, "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ConnectTimeout=15", "--", "vps", "cat", "/srv/incibase/admin/index.json"]);
+    expect((t.log()[1] as string[]).slice(0, 7)).toEqual(["-F", config, "-o", "ControlMaster=no", "-o", "ControlPath=none", "-N"]);
     proc.kill("SIGTERM");
     expect(await proc.exited).toBe(0);
   }, 30_000);

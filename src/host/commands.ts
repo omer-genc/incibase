@@ -8,7 +8,7 @@
 //
 // Everything the commands touch outside the ops comes through CommandIO,
 // so tests run them in-process against a fake host.
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -19,7 +19,7 @@ import { openHost, type OpsContext } from "./context.ts";
 import { ALERT_WEBHOOK } from "./alerts.ts";
 import { formatDoctor } from "./doctor.ts";
 import { printable } from "./driver.ts";
-import { DEFAULT_ROOT, type LayoutOptions } from "./layout.ts";
+import { DEFAULT_ROOT, HostLayout, type LayoutOptions } from "./layout.ts";
 import { BRANCH_KINDS, branchRef, checkProjectSlug, NameError, parseBranchRef } from "./names.ts";
 import { TRUST_PROXY } from "./nginx.ts";
 import * as ops from "./ops.ts";
@@ -48,13 +48,21 @@ export interface CommandIO {
   /** All of stdin, for `release add … -` and `env import … -`; throws past `maxBytes`. */
   readStdin(maxBytes: number): Promise<Uint8Array>;
   isRoot(): boolean;
-  open(options: { root: string; layout?: Omit<LayoutOptions, "root"> }): OpenedHost;
-  /** Runs a command on this terminal (journalctl for `logs`) and returns its exit code. */
-  exec(argv: string[]): Promise<number>;
+  /** The host at `root`; only `host init` (`create`) may open one that is not set up yet. */
+  open(options: { root: string; layout?: Omit<LayoutOptions, "root">; create?: boolean }): OpenedHost;
+  /**
+   * Runs a command (journalctl for `logs`): each line of its stdout goes to
+   * `line` as it comes, raw; its exit code and stderr come back.
+   */
+  exec(argv: string[], line: (text: string) => void): Promise<{ code: number; stderr: string }>;
   env: Record<string, string | undefined>;
 }
 
-/** The real machine: stdout/stderr, openHost and an inherited-stdio child. */
+/** The longest line `exec` hands on; a longer one is split. */
+const MAX_LINE = 64 * 1024;
+const MAX_STDERR = 64 * 1024;
+
+/** The real machine: stdout/stderr, openHost and a child whose output is read here. */
 export const processIO: CommandIO = {
   out: (line) => void process.stdout.write(`${line}\n`),
   err: (line) => void process.stderr.write(`${line}\n`),
@@ -69,23 +77,48 @@ export const processIO: CommandIO = {
     return Buffer.concat(chunks);
   },
   isRoot: () => process.getuid?.() === 0,
-  open(options) {
+  open({ create, ...options }) {
+    // Registry.open creates a registry where there is none: a mistyped --root would become an empty host.
+    if (!create && !existsSync(new HostLayout({ root: options.root }).registry)) throw notSetUp(options.root);
     const ctx = openHost(options);
+    if (!create && ctx.registry.savedLayout() === null) {
+      ctx.registry.close();
+      throw notSetUp(options.root);
+    }
     return { ctx, close: () => ctx.registry.close() };
   },
-  async exec(argv) {
+  async exec(argv, line) {
     // Ctrl-C on `logs -f` reaches journalctl too (one process group); this process waits for it to end.
     const ignore = () => {};
     process.on("SIGINT", ignore);
     try {
-      const child = Bun.spawn(argv, { stdio: ["inherit", "inherit", "inherit"], env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LC_ALL: "C.UTF-8", SYSTEMD_COLORS: "0" } });
-      return await child.exited;
+      // Its output is the tenant's, so it never reaches the terminal unread (escape sequences): see logs.
+      const child = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "pipe", env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LC_ALL: "C.UTF-8", SYSTEMD_COLORS: "0" } });
+      const stderr = (async () => {
+        let text = "";
+        for await (const chunk of child.stderr.pipeThrough(new TextDecoderStream())) if (text.length < MAX_STDERR) text += chunk;
+        return text.slice(0, MAX_STDERR);
+      })();
+      let rest = "";
+      for await (const chunk of child.stdout.pipeThrough(new TextDecoderStream())) {
+        rest += chunk;
+        let nl: number;
+        while ((nl = rest.indexOf("\n")) >= 0 || rest.length > MAX_LINE) {
+          const end = nl >= 0 && nl <= MAX_LINE ? nl : MAX_LINE;
+          line(rest.slice(0, end));
+          rest = rest.slice(end === nl ? end + 1 : end);
+        }
+      }
+      if (rest) line(rest);
+      return { code: await child.exited, stderr: await stderr };
     } finally {
       process.off("SIGINT", ignore);
     }
   },
   env: process.env,
 };
+
+const notSetUp = (root: string) => new OpError("FAILED", `No incibase host at ${root}: run sudo incibase host init --domain <domain> there first, or pass the right --root`);
 
 // ---- command table -------------------------------------------------------------------
 
@@ -137,6 +170,8 @@ interface Spec {
   local?: boolean;
   /** Layout options for `host init`. */
   layout?: (values: Values) => Omit<LayoutOptions, "root"> | undefined;
+  /** What can be checked from the command line alone; runs before root and the host are looked at. */
+  check?(values: Values, args: string[]): void;
   run(call: Call): Promise<Outcome>;
 }
 
@@ -318,6 +353,68 @@ function alertLines(alerts: AlertRow[]): string[] {
 
 // ---- host ------------------------------------------------------------------------------
 
+/** `host init`'s flags as initHost's input. */
+function initInput(values: Values) {
+  const domain = str(values, "domain");
+  if (!domain) throw new UsageError("--domain is required");
+  const cert = str(values, "tls-cert");
+  const key = str(values, "tls-key");
+  const trust = str(values, "trust-proxy");
+  if (trust !== undefined && !(TRUST_PROXY as readonly string[]).includes(trust)) throw new UsageError(`--trust-proxy takes ${TRUST_PROXY.join(" or ")}`);
+  return {
+    domain,
+    ...(str(values, "timezone") !== undefined ? { timezone: str(values, "timezone") } : {}),
+    ...(cert !== undefined ? { tlsCert: resolve(cert) } : {}),
+    ...(key !== undefined ? { tlsKey: resolve(key) } : {}),
+    ...(trust !== undefined ? { trustProxy: trust as (typeof TRUST_PROXY)[number] } : {}),
+    ...(values["https-port"] !== undefined ? { httpsPort: int("https-port", str(values, "https-port"), 1, 65535) } : {}),
+    ...(values["uid-base"] !== undefined ? { uidBase: int("uid-base", str(values, "uid-base"), 0, 99_999) } : {}),
+    ...(values["tunnel-port-base"] !== undefined ? { tunnelPortBase: int("tunnel-port-base", str(values, "tunnel-port-base"), 1024, 65_000) } : {}),
+    ...(values["slice-memory"] !== undefined ? { sliceMemoryMax: size("slice-memory", str(values, "slice-memory")) } : {}),
+    ...(bool(values, "no-check-timer") ? { checkTimer: false } : {}),
+  };
+}
+
+/** `host set <key> <value>`, checked: which setting, and its value. */
+function hostSetting(args: string[], values: Values): { key: "alert_webhook"; value: string | null } | { key: "trust_proxy"; value: (typeof TRUST_PROXY)[number] } | { key: "https_port"; value: number } {
+  const [key, value] = args as [string, string];
+  if (key === "alert_webhook") return { key, value: value || null };
+  if (bool(values, "test")) throw new UsageError("--test is for alert_webhook");
+  if (key === "trust_proxy") {
+    if (!(TRUST_PROXY as readonly string[]).includes(value)) throw new UsageError(`trust_proxy takes ${TRUST_PROXY.join(" or ")}`);
+    return { key, value: value as (typeof TRUST_PROXY)[number] };
+  }
+  if (key === "https_port") return { key, value: int("https_port", value, 1, 65535)! };
+  throw new UsageError(`Unknown setting ${JSON.stringify(key)}: use alert_webhook, trust_proxy or https_port`);
+}
+
+/** `branch set`'s flags: the limits, settings and protection to change. */
+function branchChanges(values: Values): { limits: Partial<BranchLimits>; config: BranchConfig; protect: boolean | undefined } {
+  const limits: Partial<BranchLimits> = {};
+  const set = <K extends keyof BranchLimits>(k: K, v: BranchLimits[K] | undefined) => v !== undefined && (limits[k] = v);
+  set("memoryMax", size("memory", str(values, "memory")));
+  set("memoryHigh", size("memory-high", str(values, "memory-high")));
+  set("cpuQuota", int("cpu", str(values, "cpu"), 1, 100_000));
+  set("tasksMax", int("tasks", str(values, "tasks"), 16, 65_536));
+  set("maxDbBytes", size("max-db", str(values, "max-db")));
+  set("maxStorageBytes", size("max-storage", str(values, "max-storage")));
+  set("maxUploadBytes", size("max-upload", str(values, "max-upload")));
+  const config: BranchConfig = {};
+  try {
+    if (values.timeouts !== undefined) config.timeouts = parseTimeouts(str(values, "timeouts")!);
+    if (values["drain-timeout"] !== undefined) config.drainMs = parseDrainTimeout(str(values, "drain-timeout")!);
+  } catch (err) {
+    throw new UsageError((err as Error).message);
+  }
+  const preflight = onOff("preflight", str(values, "preflight"));
+  if (preflight !== undefined) config.preflight = preflight;
+  const protect = onOff("protected", str(values, "protected"));
+  if (!Object.keys(limits).length && !Object.keys(config).length && protect === undefined) throw new UsageError("Nothing to change: pass a limit, a setting or --protected");
+  return { limits, config, protect };
+}
+
+const SERVICE_KEY_ID = /^k[0-9a-z]{9}$/;
+
 const RUNTIME_DETAILS = `Installs a runtime: the local <binary> checked against its SHA256SUMS entry or sha256,
 or, without one, incibase-linux-<arch> downloaded from the GitHub release v<x.y.z>
 and checked against that release's SHA256SUMS.`;
@@ -350,25 +447,9 @@ const SPECS: Spec[] = [
         throw new UsageError("--layout takes a JSON object");
       }
     },
+    check: (values) => void initInput(values),
     async run({ ctx, values, root }) {
-      const domain = str(values, "domain");
-      if (!domain) throw new UsageError("--domain is required");
-      const cert = str(values, "tls-cert");
-      const key = str(values, "tls-key");
-      const trust = str(values, "trust-proxy");
-      if (trust !== undefined && !(TRUST_PROXY as readonly string[]).includes(trust)) throw new UsageError(`--trust-proxy takes ${TRUST_PROXY.join(" or ")}`);
-      const result = await ops.initHost(ctx, {
-        domain,
-        ...(str(values, "timezone") !== undefined ? { timezone: str(values, "timezone") } : {}),
-        ...(cert !== undefined ? { tlsCert: resolve(cert) } : {}),
-        ...(key !== undefined ? { tlsKey: resolve(key) } : {}),
-        ...(trust !== undefined ? { trustProxy: trust as (typeof TRUST_PROXY)[number] } : {}),
-        ...(values["https-port"] !== undefined ? { httpsPort: int("https-port", str(values, "https-port"), 1, 65535) } : {}),
-        ...(values["uid-base"] !== undefined ? { uidBase: int("uid-base", str(values, "uid-base"), 0, 99_999) } : {}),
-        ...(values["tunnel-port-base"] !== undefined ? { tunnelPortBase: int("tunnel-port-base", str(values, "tunnel-port-base"), 1024, 65_000) } : {}),
-        ...(values["slice-memory"] !== undefined ? { sliceMemoryMax: size("slice-memory", str(values, "slice-memory")) } : {}),
-        ...(bool(values, "no-check-timer") ? { checkTimer: false } : {}),
-      });
+      const result = await ops.initHost(ctx, initInput(values));
       const front = result.frontDoor;
       return {
         json: result,
@@ -487,6 +568,7 @@ const SPECS: Spec[] = [
     summary: "Remove trash older than --older-than days (7) and the runtimes nothing uses",
     positionals: [0, 0],
     flags: { "older-than": { type: "string", value: "<days>", help: "Trash older than this many days (default 7)" } },
+    check: (values) => void int("older-than", str(values, "older-than"), 0, 3650),
     async run({ ctx, values }) {
       const days = int("older-than", str(values, "older-than"), 0, 3650);
       const r = await ops.gc(ctx, days === undefined ? {} : { olderThanDays: days });
@@ -557,23 +639,19 @@ const SPECS: Spec[] = [
     positionals: [2, 2],
     flags: { test: { type: "boolean", help: "alert_webhook: send a test notification" } },
     details: "alert_webhook is where alerts go, e.g. an ntfy.sh topic; '' removes it.",
+    check: (values, args) => void hostSetting(args, values),
     async run({ ctx, values, args }) {
-      const [key, value] = args as [string, string];
-      if (key === "alert_webhook") {
-        const r = await ops.setSetting(ctx, { key, value: value || null, test: bool(values, "test") });
+      const setting = hostSetting(args, values);
+      if (setting.key === "alert_webhook") {
+        const r = await ops.setSetting(ctx, { key: setting.key, value: setting.value, test: bool(values, "test") });
         return { json: r, text: [r.set ? `alert_webhook set (${clean(r.host)})${r.tested ? "; the test notification was sent" : ""}` : "alert_webhook removed"] };
       }
-      if (bool(values, "test")) throw new UsageError("--test is for alert_webhook");
-      if (key === "trust_proxy") {
-        if (!(TRUST_PROXY as readonly string[]).includes(value)) throw new UsageError(`trust_proxy takes ${TRUST_PROXY.join(" or ")}`);
-        const r = await ops.setFrontDoor(ctx, { trustProxy: value as (typeof TRUST_PROXY)[number] });
-        return { json: r, text: [`trust_proxy is ${value}`] };
+      if (setting.key === "trust_proxy") {
+        const r = await ops.setFrontDoor(ctx, { trustProxy: setting.value });
+        return { json: r, text: [`trust_proxy is ${setting.value}`] };
       }
-      if (key === "https_port") {
-        const r = await ops.setFrontDoor(ctx, { httpsPort: int("https_port", value, 1, 65535) });
-        return { json: r, text: [`nginx serves HTTPS on port ${value}`] };
-      }
-      throw new UsageError(`Unknown setting ${JSON.stringify(key)}: use alert_webhook, trust_proxy or https_port`);
+      const r = await ops.setFrontDoor(ctx, { httpsPort: setting.value });
+      return { json: r, text: [`nginx serves HTTPS on port ${setting.value}`] };
     },
   },
   {
@@ -584,6 +662,9 @@ const SPECS: Spec[] = [
     flags: {
       cert: { type: "string", value: "<file>", help: "PEM certificate for *.<domain> (required)" },
       key: { type: "string", value: "<file>", help: "Its private key (required)" },
+    },
+    check(values) {
+      if (!str(values, "cert") || !str(values, "key")) throw new UsageError("--cert and --key are required");
     },
     async run({ ctx, values }) {
       const cert = str(values, "cert");
@@ -605,6 +686,7 @@ const SPECS: Spec[] = [
       branches: { type: "string", value: "<a,b>", help: "Branches to create with it (default prod,dev; '' for none)" },
       name: { type: "string", value: "<text>", help: "A display name (default the slug)" },
     },
+    check: (_values, args) => void checkProjectSlug(args[0]),
     async run({ ctx, values, args }) {
       const list = str(values, "branches");
       const branches = list === undefined ? undefined : list.split(",").map((b) => b.trim()).filter(Boolean);
@@ -655,11 +737,14 @@ const SPECS: Spec[] = [
       unprotected: { type: "boolean", help: "Not protected, even as prod" },
       runtime: { type: "string", value: "<x.y.z>", help: "Pin an installed runtime (default this incibase's version)" },
     },
-    async run({ ctx, values, args }) {
-      const t = target(args);
+    check(values) {
       if (bool(values, "protected") && bool(values, "unprotected")) throw new UsageError("Pass --protected or --unprotected, not both");
       const kind = str(values, "kind");
       if (kind !== undefined && !(BRANCH_KINDS as readonly string[]).includes(kind)) throw new UsageError(`--kind takes ${BRANCH_KINDS.join(", ")}`);
+    },
+    async run({ ctx, values, args }) {
+      const t = target(args);
+      const kind = str(values, "kind");
       const b = await ops.createBranch(ctx, {
         project: t.project,
         name: t.branch,
@@ -676,6 +761,7 @@ const SPECS: Spec[] = [
     args: "[<project>]",
     summary: "The branches, with what they should and do run",
     positionals: [0, 1],
+    check: (_values, args) => void (args[0] === undefined || checkProjectSlug(args[0])),
     async run({ ctx, args }) {
       const r = await ops.status(ctx, args[0] === undefined ? {} : { project: checkProjectSlug(args[0]) });
       return {
@@ -759,28 +845,10 @@ const SPECS: Spec[] = [
       confirm: CONFIRM,
       restart: RESTART,
     },
+    check: (values) => void branchChanges(values),
     async run({ ctx, values, args }) {
       const t = target(args);
-      const limits: Partial<BranchLimits> = {};
-      const set = <K extends keyof BranchLimits>(k: K, v: BranchLimits[K] | undefined) => v !== undefined && (limits[k] = v);
-      set("memoryMax", size("memory", str(values, "memory")));
-      set("memoryHigh", size("memory-high", str(values, "memory-high")));
-      set("cpuQuota", int("cpu", str(values, "cpu"), 1, 100_000));
-      set("tasksMax", int("tasks", str(values, "tasks"), 16, 65_536));
-      set("maxDbBytes", size("max-db", str(values, "max-db")));
-      set("maxStorageBytes", size("max-storage", str(values, "max-storage")));
-      set("maxUploadBytes", size("max-upload", str(values, "max-upload")));
-      const config: BranchConfig = {};
-      try {
-        if (values.timeouts !== undefined) config.timeouts = parseTimeouts(str(values, "timeouts")!);
-        if (values["drain-timeout"] !== undefined) config.drainMs = parseDrainTimeout(str(values, "drain-timeout")!);
-      } catch (err) {
-        throw new UsageError((err as Error).message);
-      }
-      const preflight = onOff("preflight", str(values, "preflight"));
-      if (preflight !== undefined) config.preflight = preflight;
-      const protect = onOff("protected", str(values, "protected"));
-      if (!Object.keys(limits).length && !Object.keys(config).length && protect === undefined) throw new UsageError("Nothing to change: pass a limit, a setting or --protected");
+      const { limits, config, protect } = branchChanges(values);
       const r = await ops.setBranch(ctx, {
         ...t,
         ...(Object.keys(limits).length ? { limits } : {}),
@@ -848,6 +916,9 @@ const SPECS: Spec[] = [
     positionals: [1, 1],
     ref: true,
     flags: { runtime: { type: "string", value: "<x.y.z>", help: "The installed runtime to run (required; see host runtimes)" } },
+    check(values) {
+      if (!str(values, "runtime")) throw new UsageError("--runtime is required");
+    },
     async run({ ctx, values, args }) {
       const t = target(args);
       const runtime = str(values, "runtime");
@@ -874,7 +945,14 @@ const SPECS: Spec[] = [
       "no-preflight": { type: "boolean", help: "Skip the preflight on a copy of the data" },
       preflight: { type: "boolean", help: "Run a preflight even where it is off by default (dev, preview)" },
     },
-    details: "Over SSH: ssh -t vps sudo incibase release add shop/prod - < app.ib",
+    details:
+      "From your laptop, copy the bundle and release it:\n" +
+      "  scp app.ib vps: && ssh -t vps sudo incibase release add shop/prod app.ib\n" +
+      "or stream it (needs passwordless sudo: with stdin redirected, ssh gives sudo no terminal to ask on):\n" +
+      "  ssh vps sudo incibase release add shop/prod - < app.ib",
+    check(values) {
+      if (bool(values, "preflight") && bool(values, "no-preflight")) throw new UsageError("Pass --preflight or --no-preflight, not both");
+    },
     async run({ ctx, values, args, io }) {
       const t = target(args);
       if (bool(values, "preflight") && bool(values, "no-preflight")) throw new UsageError("Pass --preflight or --no-preflight, not both");
@@ -937,6 +1015,7 @@ const SPECS: Spec[] = [
       snapshot: { type: "string", value: "<name>", help: "Put back this snapshot instead, e.g. pre-7" },
       confirm: CONFIRM,
     },
+    check: (values) => void int("to", str(values, "to"), 1, 1_000_000_000),
     async run({ ctx, values, args }) {
       const t = target(args);
       const to = int("to", str(values, "to"), 1, 1_000_000_000);
@@ -982,7 +1061,11 @@ const SPECS: Spec[] = [
     positionals: [2, 201],
     ref: true,
     flags: { restart: RESTART, "shared-s3-credentials": { type: "boolean", help: "Allow an S3_ACCESS_KEY_ID another branch uses" } },
-    details: "Values may not contain newlines; encode multi-line values (PEM keys), e.g. in base64.",
+    details:
+      "Values may not contain newlines; encode multi-line values (PEM keys), e.g. in base64.\n" +
+      "For secrets use env import <project>/<branch> - (stdin), e.g. ssh vps sudo incibase env import shop/prod - < prod.env:\n" +
+      "a value on this command line is in sudo's log (auth.log, the journal) and in ps for every account.",
+    check: (_values, args) => void assignments(args.slice(1)),
     async run({ ctx, values, args }) {
       const t = target(args);
       const r = await ops.envSet(ctx, { ...t, vars: assignments(args.slice(1)), restart: bool(values, "restart"), sharedS3Credentials: bool(values, "shared-s3-credentials") });
@@ -1065,6 +1148,9 @@ const SPECS: Spec[] = [
       label: { type: "string", value: "<text>", help: "What it is for (required)" },
       scopes: { type: "string", value: "<a,b>", help: "internal, impersonate, upload (default internal)" },
     },
+    check(values) {
+      if (!str(values, "label")) throw new UsageError("--label is required");
+    },
     async run({ ctx, values, args }) {
       const t = target(args);
       const label = str(values, "label");
@@ -1101,11 +1187,14 @@ const SPECS: Spec[] = [
     summary: "Revoke a service key; the branch reloads its keys at once",
     positionals: [2, 2],
     ref: true,
+    check(_values, args) {
+      if (!SERVICE_KEY_ID.test(args[1]!)) throw new OpError("INVALID", `${JSON.stringify(args[1])} is not a service key id such as k3fq9a1c7e`);
+    },
     async run({ ctx, args }) {
       const t = target(args);
       const id = args[1]!;
       const keys = await ops.serviceKeyList(ctx, t);
-      if (!/^k[0-9a-z]{9}$/.test(id)) throw new OpError("INVALID", `${JSON.stringify(id)} is not a service key id such as k3fq9a1c7e`);
+      if (!SERVICE_KEY_ID.test(id)) throw new OpError("INVALID", `${JSON.stringify(id)} is not a service key id such as k3fq9a1c7e`);
       if (!keys.some((k) => k.id === id)) throw new OpError("NOT_FOUND", `No service key ${id} on ${branchRef(t.project, t.branch)}`);
       const r = await ops.serviceKeyRevoke(ctx, { id });
       return {
@@ -1127,6 +1216,7 @@ const SPECS: Spec[] = [
     args: "[<project>[/<branch>]]",
     summary: "Every branch: desired vs actual state, release, generation, memory; and the firing alerts",
     positionals: [0, 1],
+    check: (_values, args) => void (args[0] === undefined || (args[0].includes("/") ? target(args) : checkProjectSlug(args[0]))),
     async run({ ctx, args }) {
       const filter = args[0] === undefined ? {} : args[0].includes("/") ? target(args) : { project: checkProjectSlug(args[0]) };
       const r = await ops.status(ctx, filter);
@@ -1166,19 +1256,26 @@ const SPECS: Spec[] = [
       lines: { type: "string", value: "<n>", help: "The last n lines" },
     },
     details: "--json prints the journal entries as JSON (journalctl --output json).",
+    check: (values) => void int("lines", str(values, "lines"), 1, 100_000),
     async run({ ctx, values, args, io, json }) {
       const lines = int("lines", str(values, "lines"), 1, 100_000);
+      const since = str(values, "since");
       const r = await ops.logs(ctx, {
         ...target(args),
         follow: bool(values, "follow"),
         errors: bool(values, "errors"),
         json,
         ...(lines !== undefined ? { lines } : {}),
-        ...(str(values, "since") !== undefined ? { since: str(values, "since") } : {}),
+        ...(since !== undefined ? { since } : {}),
       });
-      const code = await io.exec(r.command);
-      // journalctl --grep exits 1 when nothing matched.
-      return { json: undefined, ok: code === 0 || (code === 1 && bool(values, "errors")) };
+      // The lines are the tenant's: printed without control characters (escape sequences
+      // that would retitle, clear or write the clipboard of root's terminal); tabs stay.
+      const { code, stderr } = await io.exec(r.command, (line) => io.out(printable(line, MAX_LINE)));
+      const said = stderr.trim();
+      if (since !== undefined && /Failed to parse timestamp/.test(said)) throw new UsageError(`--since: journalctl cannot read ${JSON.stringify(since)}; e.g. "1 hour ago", "2026-10-23 12:00", today`);
+      for (const line of said ? said.split("\n") : []) io.err(printable(line, 1000));
+      // journalctl --grep exits 1, silently, when nothing matched; any other failure says why on stderr.
+      return { json: undefined, ok: code === 0 || (code === 1 && bool(values, "errors") && !said) };
     },
   },
 ];
@@ -1274,11 +1371,14 @@ export async function runCommand(argv: string[], io: CommandIO = processIO): Pro
       throw new UsageError(`${spec.path.join(" ")} takes ${spec.args || "no arguments"}${positionals.length > max ? `; unexpected ${JSON.stringify(positionals[max])}` : ""}`);
     }
     if (spec.ref) parseBranchRef(positionals[0]!);
+    // The command line alone first: a usage error is exit 2 whoever runs it, and touches no host.
+    spec.check?.(v, positionals);
+    const layout = spec.layout?.(v);
     const root = (v.root as string | undefined) ?? io.env.INCIBASE_HOST_ROOT ?? DEFAULT_ROOT;
     if (!spec.local && !io.isRoot()) {
       throw new OpError("FAILED", `incibase ${spec.path.join(" ")} runs on the server as root: sudo incibase ${spec.path.join(" ")} ...`);
     }
-    opened = io.open({ root, layout: spec.layout?.(v) });
+    opened = io.open({ root, layout, create: spec.path.join(" ") === "host init" });
     const ctx = opened.ctx;
     // Progress (release jobs, gates): stdout for people, stderr under --json.
     ctx.log = json ? io.err : io.out;

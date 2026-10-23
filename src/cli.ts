@@ -143,14 +143,30 @@ function parse(argv: string[]) {
 /** Commands for hosted branches (src/host/commands.ts, as root on the server) and `tunnel` (on the laptop). */
 const HOSTED_COMMANDS = new Set(["project", "branch", "release", "env", "service-key", "status", "logs", "tunnel"]);
 
+/** Flags of parse() and of the hosted commands that take a value, which is not a positional. */
+const VALUE_FLAGS = new Set(["--dir", "--data", "--port", "--host", "--url", "--outfile", "--target", "--out", "--bundle", "--socket", "--admin-socket", "--log-format", "--timeouts", "--drain-timeout", "--root"]);
+/** Flags only the hosted admin-key has. */
+const HOSTED_ADMIN_KEY_FLAGS = new Set(["--rotate", "--root", "--json"]);
+
 /**
  * `admin-key shop/prod` is a hosted branch's key; `admin-key` alone or with
  * --data reads a local app's data dir, as it always has. The argument
- * shape decides: a first argument with a "/" that is not a flag.
+ * shape decides, wherever the flags are: a positional with a "/" (the
+ * values of --data, --root and the like are not positionals) or a flag
+ * only the hosted one has (--rotate, --root, --json) makes it hosted. One
+ * of those together with --data is a usage error there.
  */
 export function hostedAdminKey(args: string[]): boolean {
-  const first = args[0];
-  return first !== undefined && !first.startsWith("-") && first.includes("/");
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--") return args.slice(i + 1).some((a) => a.includes("/"));
+    if (arg.startsWith("-")) {
+      const name = arg.split("=", 1)[0]!;
+      if (HOSTED_ADMIN_KEY_FLAGS.has(name)) return true;
+      if (!arg.includes("=") && VALUE_FLAGS.has(name)) i++;
+    } else if (arg.includes("/")) return true;
+  }
+  return false;
 }
 
 /** The log format `argv` asks for when it does not parse, so a bad flag still fails in the right format. */
