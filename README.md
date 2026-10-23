@@ -217,6 +217,10 @@ bunx incibase build --outfile ./my-app --target bun-linux-x64
 
 Standalone `incibase` binary'sinin kendisi: `bun run build:binary` → `dist/incibase`. Bu binary kullanıcı kodunu diskten yükler (`incibase`, `incibase/server`, `zod` import'ları binary'nin içindeki kopyalara yönlenir) ve `build` ile uygulamayı derleyebilir. Not: Bun 1.4'teki bir hata yüzünden standalone binary'den *aynı platform* için derleme PATH'te `bun` ister; başka platform hedefleri (`--target`) için gerekmez.
 
+## Sunucuda barındırma
+
+Tek VPS'te projeler ve branch'ler (prod, dev) için kurulum, release, env, alarmlar ve günlük işletim: [docs/host.md](docs/host.md).
+
 ## Komutlar ve ayarlar
 
 | Komut | |
