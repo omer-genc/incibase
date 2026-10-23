@@ -119,7 +119,7 @@ const machine: DoctorHooks = {
   file: (path) => {
     try {
       const st = lstatSync(path);
-      return { type: st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : st.isFile() ? "file" : "other", uid: st.uid, gid: st.gid, mode: st.mode & 0o7777, size: st.size, mtimeMs: st.mtimeMs };
+      return { type: st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : st.isFile() ? "file" : "other", uid: st.uid, gid: st.gid, mode: st.mode & 0o7777, size: st.size, blocks: Number(st.blocks), mtimeMs: st.mtimeMs };
     } catch {
       return null;
     }

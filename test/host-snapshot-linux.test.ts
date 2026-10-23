@@ -29,7 +29,7 @@
 // removes everything it made.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chownSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, chownSync, existsSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { VERSION } from "../src/engine/version.ts";
 import { openHost, type OpsContext } from "../src/host/context.ts";
@@ -108,6 +108,29 @@ function seed(branch: BranchRow, value: string, rows = 40): string {
 
 const asBranch = (uid: number, argv: string[], opts: { timeout?: number } = {}) =>
   Bun.spawnSync(["setpriv", `--reuid=${uid}`, `--regid=${uid}`, "--clear-groups", "--", ...argv], { stdout: "pipe", stderr: "pipe", timeout: opts.timeout });
+
+/**
+ * The removed root-side algorithm (commit 2f794ad), kept here only as the
+ * regression guard: root pins data.db with O_NOFOLLOW and hands SQLite
+ * `/proc/self/fd/N`. SQLite's unix VFS readlinks that back to the real path
+ * and reopens data.db — and data.db-wal and data.db-shm — BY NAME, so a -wal
+ * symlinked at a foreign WAL is followed and its frames are read as root.
+ */
+function oldSnapshotByName(dataDir: string, out: string): void {
+  rmSync(out, { force: true });
+  const fd = openSync(join(dataDir, "data.db"), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const db = new Database(`/proc/self/fd/${fd}`, { readonly: true });
+    try {
+      db.run("PRAGMA trusted_schema = OFF");
+      db.run(`VACUUM INTO '${out.replaceAll("'", "''")}'`);
+    } finally {
+      db.close();
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
 
 /** Whether a snapshot file leaks any secret the branch must not reach. */
 function leaks(path: string): boolean {
@@ -221,6 +244,27 @@ describe.skipIf(!enabled)("privilege-separated snapshots defeat a branch racing 
     rmSync(dest, { force: true });
   }, SLOW);
 
+  test("a sparse staging file under the size cap is refused by its allocated blocks, writing nothing large (finding 2)", async () => {
+    const staging = stagingFile();
+    const dest = join(ROOT, "sparse-take-in.db");
+    const q = JSON.stringify;
+    rmSync(staging, { force: true });
+    rmSync(dest, { force: true });
+    // As the branch: a 200 MiB file that is all holes (0 blocks allocated), well under a 1 GiB cap. The old cap
+    // trusted st_size, so root's copyBytes would read 200 MiB of zeros and write them as real blocks into backups/.
+    const r = asBranch(prod.os_uid, [process.execPath, "-e", `const fs=require("fs");const fd=fs.openSync(${q(staging)},"w");fs.ftruncateSync(fd,200*1024*1024);fs.closeSync(fd)`]);
+    expect(r.exitCode ?? r.signalCode).toBe(0);
+    expect(statSync(staging).size).toBe(200 * 1024 * 1024);
+    expect(statSync(staging).blocks).toBe(0);
+    const maxBytes = 1024 * 1024 * 1024;
+    const freeBefore = sys.freeBytes(ROOT);
+    expect(() => sys.ingestFile(staging, dest, { uid: prod.os_uid, maxBytes, owner: { uid: 0, gid: 0, mode: 0o600 }, check: () => null })).toThrow(/is sparse \(0 bytes allocated of 209715200\)/);
+    expect(existsSync(dest)).toBe(false);
+    // Nothing large was written: free space barely moved (allow slack for other activity on the box).
+    expect(sys.freeBytes(ROOT)).toBeGreaterThan(freeBefore - 50 * 1024 * 1024);
+    rmSync(staging, { force: true });
+  }, SLOW);
+
   test("the snapshot unit runs as the branch: a redirected data.db, -wal or -shm gains nothing", async () => {
     const data = ctx.layout.branch(prod.id).data;
     const dest = join(ctx.layout.branch(prod.id).backups, "pre-probe.db");
@@ -319,6 +363,113 @@ describe.skipIf(!enabled)("privilege-separated snapshots defeat a branch racing 
     const after = new Database(restored, { readonly: true });
     expect((after.query("SELECT count(*) AS n FROM t").get() as { n: number }).n).toBe(rows);
     after.close();
+  }, SLOW);
+
+  test("deterministic self-check: the removed by-name open leaks under the data.db-flip race; snapshotDatabase never does (finding 1)", async () => {
+    const data = ctx.layout.branch(prod.id).data;
+    // A clean branch database in WAL mode, a connection held open so its -wal/-shm exist throughout.
+    for (const db of live.splice(0)) try { db.close(); } catch {}
+    for (const name of readdirSync(data)) rmSync(join(data, name), { force: true, recursive: true });
+    seed(prod, "branchdata");
+
+    // Why the flip, not a -wal symlink: the registry's secrets live in its MAIN file (beforeAll's
+    // wal_checkpoint(TRUNCATE) left registry-wal at 0 bytes — the very reason the old suite's one deterministic
+    // -wal variant could not catch the bug), and SQLite rejects a foreign -wal symlink (SQLITE_CANTOPEN), so it
+    // leaks nothing. The exploitable vector is the data.db flip: SQLite reopens the pinned path BY NAME, so a
+    // branch swapping data.db for a symlink to the registry mid-read redirects root there. Print the WAL size.
+    const regWal = `${ctx.layout.registry}-wal`;
+    console.log(`[finding-1] registry-wal bytes ${existsSync(regWal) ? statSync(regWal).size : 0}; secret (SECRET_MARKER) in registry main: ${readFileSync(ctx.layout.registry).includes(MARKER)}`);
+    expect(readFileSync(ctx.layout.registry).includes(MARKER)).toBe(true);
+
+    // The branch races root, flipping data.db (and its staging output) through a symlink to the registry etc.
+    const child = Bun.spawn(["setpriv", `--reuid=${prod.os_uid}`, `--regid=${prod.os_uid}`, "--clear-groups", "--", process.execPath, RACER, dataDb(), stagingFile(), ctx.layout.registry, join(ctx.layout.branch(other.id).data, "data.db"), SROOT, "14"], { stdout: "ignore", stderr: "ignore" });
+    await Bun.sleep(300);
+
+    // SELF-CHECK: the removed root-side algorithm DOES leak the registry under this race. Without proving the
+    // harness can catch the old bug, the zero-leak assertion on the real code below would be hollow. Loop only
+    // until the first leak (it comes in milliseconds), with a generous ceiling.
+    const leakOut = join(ROOT, "old-by-name.db");
+    let oldOk = 0;
+    let oldLeaked = 0;
+    const selfDeadline = Date.now() + 20_000;
+    while (Date.now() < selfDeadline && oldLeaked === 0) {
+      rmSync(leakOut, { force: true });
+      try {
+        oldSnapshotByName(data, leakOut); // throws (ELOOP/CANTOPEN) while data.db is a symlink this instant
+      } catch {
+        continue;
+      }
+      oldOk++;
+      if (existsSync(leakOut) && leaks(leakOut)) oldLeaked++;
+    }
+    rmSync(leakOut, { force: true });
+    console.log(`[finding-1] old by-name open: ${oldOk} runs, ${oldLeaked} leaked the registry`);
+    expect(oldLeaked).toBeGreaterThan(0);
+
+    // THE FIX, under the same race: snapshotDatabase runs _snapshot as the branch, which cannot read control/,
+    // so a data.db pointed at the registry only ever points the unit at what the branch cannot read anyway.
+    const dest = join(ROOT, "new-snap.db");
+    let newOk = 0;
+    let newRefused = 0;
+    let newLeaked = 0;
+    const newDeadline = Date.now() + 8000;
+    while (Date.now() < newDeadline && newOk < 6) {
+      rmSync(dest, { force: true });
+      try {
+        await snapshotDatabase(ctx, prod, dest, { uid: 0, gid: 0, mode: 0o600 });
+      } catch (err) {
+        if (err instanceof SnapshotError) {
+          newRefused++;
+          continue;
+        }
+        throw err;
+      }
+      newOk++;
+      if (leaks(dest)) newLeaked++;
+    }
+    child.kill("SIGKILL");
+    await child.exited;
+    rmSync(dest, { force: true });
+    console.log(`[finding-1] new snapshotDatabase: ${newOk} ok, ${newRefused} refused, ${newLeaked} leaked`);
+    expect(newLeaked).toBe(0);
+    // Leave data/ clean for the next test.
+    for (const db of live.splice(0)) try { db.close(); } catch {}
+    for (const name of readdirSync(data)) rmSync(join(data, name), { force: true, recursive: true });
+    seed(prod, "branchdata");
+  }, SLOW);
+
+  test("the snapshot unit runs the host's current runtime, not the branch's pin that lacks _snapshot (finding 3)", async () => {
+    // Install a stub runtime that answers --version but exits 78 (CONFIG) on any command, like a build from before
+    // _snapshot existed. Pin a fresh branch to it. The snapshot unit must run the host's current runtime instead.
+    const stub = join(ROOT, "stub-runtime");
+    writeFileSync(stub, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 0.0.1; exit 0; fi\necho "unknown command $1" >&2\nexit 78\n`, { mode: 0o755 });
+    const sha = new Bun.CryptoHasher("sha256").update(readFileSync(stub)).digest("hex");
+    await ops.installRuntime(ctx, { binary: stub, version: "0.0.1", sha256: sha });
+    // Sanity: the stub really rejects _snapshot with 78.
+    const stubBin = ctx.layout.runtimeBinary("0.0.1");
+    expect(Bun.spawnSync([stubBin, "_snapshot", "--data", "/x", "--out", "/y"]).exitCode).toBe(78);
+
+    await ops.createBranch(ctx, { project: "shop", name: "legacy", kind: "dev", runtimeVersion: "0.0.1" });
+    const legacy = ctx.registry.findBranch("shop", "legacy")!;
+    expect(legacy.runtime_version).toBe("0.0.1");
+    if (!sys.lstat(ctx.layout.branch(legacy.id).backups)) sys.mkdir(ctx.layout.branch(legacy.id).backups, 0o700);
+    seed(legacy, "legacydata");
+
+    // The drop-in the host renders for the snapshot unit must point at the current runtime, not 0.0.1.
+    const { renderSnapshotUnit } = await import("../src/host/render.ts");
+    renderSnapshotUnit(ctx, legacy);
+    const dropIn = readFileSync(ctx.layout.dropIn(ctx.layout.units.snapshot(legacy.id)), "utf8");
+    expect(dropIn).toContain(`${ctx.layout.runtimeBinary(VERSION)} _snapshot`);
+    expect(dropIn).not.toContain("/0.0.1/");
+
+    // And the snapshot really succeeds, although the branch is pinned to the stub.
+    const snapshot = ctx.layout.snapshot(legacy.id, "pre-1");
+    await snapshotDatabase(ctx, legacy, snapshot, { uid: 0, gid: 0, mode: 0o600 });
+    expect(statSync(snapshot)).toMatchObject({ uid: 0 });
+    const copy = new Database(snapshot, { readonly: true });
+    expect((copy.query("SELECT count(*) AS n FROM t").get() as { n: number }).n).toBeGreaterThanOrEqual(40);
+    copy.close();
+    for (const db of live.splice(0)) try { db.close(); } catch {}
   }, SLOW);
 });
 

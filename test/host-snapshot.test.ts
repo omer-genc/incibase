@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { SnapshotCommandError, SNAPSHOT_EXIT, takeSnapshot } from "../src/host/snapshot-command.ts";
 import * as ops from "../src/host/ops.ts";
 import type { BranchRow } from "../src/host/registry.ts";
-import { placeCopy, restoreDatabase, snapshotDatabase, SnapshotError, sqliteHeaderProblem } from "../src/host/snapshot.ts";
+import { cleanupSnapshot, placeCopy, restoreDatabase, snapshotDatabase, SnapshotError, sqliteHeaderProblem } from "../src/host/snapshot.ts";
 import { closeOpsHosts, fakeOpsHost, seedDatabase, type OpsTestHost } from "./host-helpers.ts";
 
 afterEach(closeOpsHosts);
@@ -169,6 +169,34 @@ describe("snapshotDatabase: the snapshot unit copies as the branch, root takes t
     expect(strayTemps(host)).toEqual([]);
   });
 
+  test("a sparse staging file just under the size cap is refused, and copies nothing large into backups/", async () => {
+    const { host, branch } = await prodBranch();
+    seedDatabase(host, branch, 2);
+    // Its apparent size is under the cap (twice a tiny database plus 100 MiB), but it is sparse: no real disk is
+    // allocated. The old st_size-based cap would let root's copy write 64 MiB of real zero blocks into backups/.
+    stagingIs(host, (path, b) => {
+      writeFileSync(path, "");
+      truncateSync(path, 64 * 1024 * 1024);
+      host.sys.own(path, b.os_uid, b.os_uid, 0o600);
+    });
+    await expect(snapshotDatabase(host, branch, host.layout.snapshot(branch.id, "pre-1"), ROOT_FILE)).rejects.toThrow(/is sparse \(\d+ bytes allocated of 67108864\)/);
+    expect(strayTemps(host)).toEqual([]);
+  });
+
+  test("the copy is capped at the branch's INCIBASE_MAX_DB_BYTES, even with free disk to spare", async () => {
+    const { host, branch } = await prodBranch();
+    seedDatabase(host, branch, 2);
+    // The branch's own database may never exceed 10 MiB, so neither may a copy of it. A dense 12 MiB staging file
+    // is refused although there is 100 GiB free and twice the database plus headroom would otherwise allow it.
+    const limited = { ...branch, limits_json: JSON.stringify({ memoryMax: 512 * 1024 * 1024, maxDbBytes: 10 * 1024 * 1024 }) };
+    stagingIs(host, (path, b) => {
+      writeFileSync(path, Buffer.alloc(12 * 1024 * 1024, 0x41));
+      host.sys.own(path, b.os_uid, b.os_uid, 0o600);
+    });
+    await expect(snapshotDatabase(host, limited, host.layout.snapshot(limited.id, "pre-1"), ROOT_FILE)).rejects.toThrow(/more than the 10485760 allowed/);
+    expect(strayTemps(host)).toEqual([]);
+  });
+
   test("a staging file bigger than the free space allows is refused", async () => {
     const { host, branch } = await prodBranch();
     seedDatabase(host, branch, 2);
@@ -267,6 +295,49 @@ describe("placeCopy: root's copy goes into a branch directory by rename", () => 
     expect(existsSync(sentinel)).toBe(false);
     expect(host.sys.lstat(join(dir, "data.db"))).toMatchObject({ type: "file", uid: branch.os_uid, mode: 0o600 });
     expect(count(join(dir, "data.db"))).toBe(3);
+    expect(strayTemps(host)).toEqual([]);
+  });
+});
+
+describe("cleanupSnapshot leaves no orphan after a killed job", () => {
+  test("empties the whole staging dir, including a killed _snapshot's snapshot.db.tmp", async () => {
+    const { host, branch } = await prodBranch();
+    const staging = host.layout.branch(branch.id).snapshot;
+    // A killed _snapshot (OOM, RuntimeMaxSec, stop) left a near-full temp beside a partial final file.
+    for (const [name, size] of [["snapshot.db.tmp", 4096], ["snapshot.db", 64]] as const) {
+      const p = join(staging, name);
+      writeFileSync(p, Buffer.alloc(size));
+      host.sys.own(p, branch.os_uid, branch.os_uid, 0o600);
+    }
+    await cleanupSnapshot(host, branch);
+    expect(readdirSync(staging)).toEqual([]);
+  });
+
+  test("sweeps this branch's backups/.snap-<id>-*.tmp a killed ingest left, and no other's", async () => {
+    const { host, branch } = await prodBranch();
+    const mine = join(host.layout.backups, `.snap-${branch.id}-deadbeef.tmp`);
+    writeFileSync(mine, Buffer.alloc(4096));
+    host.sys.own(mine, 0, 0, 0o600);
+    // Another branch's temp (and a non-temp file) must survive.
+    const other = join(host.layout.backups, `.snap-bz9q8w7e-cafe.tmp`);
+    writeFileSync(other, Buffer.alloc(16));
+    await cleanupSnapshot(host, branch);
+    expect(existsSync(mine)).toBe(false);
+    expect(existsSync(other)).toBe(true);
+    rmSync(other, { force: true });
+  });
+
+  test("when ingest throws, the staging dir is emptied (snapshot.db and any leftover .tmp)", async () => {
+    const { host, branch } = await prodBranch();
+    seedDatabase(host, branch, 2);
+    stagingIs(host, (path, b) => {
+      // A refused final file (not an SQLite database), plus a .tmp a killed VACUUM would have left next to it.
+      writeFileSync(path, Buffer.alloc(8192, 0x41));
+      writeFileSync(`${path}.tmp`, Buffer.alloc(4096));
+      host.sys.own(path, b.os_uid, b.os_uid, 0o600);
+    });
+    await expect(snapshotDatabase(host, branch, host.layout.snapshot(branch.id, "pre-1"), ROOT_FILE)).rejects.toThrow(/not an SQLite database/);
+    expect(readdirSync(host.layout.branch(branch.id).snapshot)).toEqual([]);
     expect(strayTemps(host)).toEqual([]);
   });
 });

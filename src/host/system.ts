@@ -51,6 +51,8 @@ export interface FileInfo {
   /** Permission bits with setuid, setgid and sticky (`& 0o7777`). */
   mode: number;
   size: number;
+  /** 512-byte blocks the file system actually allocated (st_blocks): the real disk it uses, never the tenant-settable size. */
+  blocks: number;
   mtimeMs: number;
 }
 
@@ -196,7 +198,7 @@ function fileInfo(path: string): FileInfo | null {
     throw err;
   }
   const type = st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : st.isFile() ? "file" : "other";
-  return { type, uid: st.uid, gid: st.gid, mode: st.mode & 0o7777, size: st.size, mtimeMs: st.mtimeMs };
+  return { type, uid: st.uid, gid: st.gid, mode: st.mode & 0o7777, size: st.size, blocks: Number(st.blocks), mtimeMs: st.mtimeMs };
 }
 
 /** Names in `dir`, sorted; empty when it does not exist. */
@@ -276,6 +278,11 @@ export function ingestByFd(from: string, to: string, options: IngestOptions, pla
     if (uid !== options.uid) throw new IngestError(`${from} is owned by uid ${uid}, not ${options.uid}; refusing to read it`);
     if (st.nlink !== 1) throw new IngestError(`${from} has ${st.nlink} links; refusing to read it`);
     if (st.size > options.maxBytes) throw new IngestError(`${from} is ${st.size} bytes, more than the ${options.maxBytes} allowed; refusing to copy it`);
+    // VACUUM INTO output is dense; a sparse file (its allocated blocks well below st_size) would still copy as
+    // real zero-filled blocks into backups/. Refuse it before a byte is copied, so a branch cannot spend root's
+    // disk through a cheap hole-punched file. (st_blocks is 512-byte units, independent of the file system's block size.)
+    const allocated = Number(st.blocks) * 512;
+    if (st.size > 0 && allocated * 2 < st.size) throw new IngestError(`${from} is sparse (${allocated} bytes allocated of ${st.size}); refusing to copy it`);
     if (options.check) {
       const head = Buffer.alloc(Math.min(100, st.size));
       const n = head.length ? readSync(src, head, 0, head.length, 0) : 0;

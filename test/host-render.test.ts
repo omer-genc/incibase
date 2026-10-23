@@ -176,12 +176,16 @@ TimeoutStopSec=25
 `);
   });
 
-  test("the snapshot drop-in runs the pinned runtime's _snapshot as the branch, with its limits", () => {
-    expect(snapshotDropIn(layout, branch)).toBe(`${HEADER}[Service]
+  test("the snapshot drop-in runs the given host runtime's _snapshot as the branch, never the branch's pin", () => {
+    // The branch is pinned to 0.3.1, but the drop-in runs the host binary it is handed (the current code), so a
+    // branch pinned to a runtime built before _snapshot existed still snapshots. Use a distinct version here to
+    // show the pin never reaches the command.
+    const hostBinary = layout.runtimeBinary("9.9.9");
+    expect(snapshotDropIn(layout, branch, hostBinary)).toBe(`${HEADER}[Service]
 User=ib-b7k2m9q4
 Group=ib-b7k2m9q4
 ExecStart=
-ExecStart=/usr/local/lib/incibase/0.3.1/incibase _snapshot --data /var/lib/incibase/branches/b7k2m9q4/data --out /var/lib/incibase/branches/b7k2m9q4/snapshot/snapshot.db
+ExecStart=/usr/local/lib/incibase/9.9.9/incibase _snapshot --data /var/lib/incibase/branches/b7k2m9q4/data --out /var/lib/incibase/branches/b7k2m9q4/snapshot/snapshot.db
 MemoryMax=512M
 MemoryHigh=460M
 MemorySwapMax=0
@@ -189,7 +193,8 @@ CPUQuota=100%
 TasksMax=256
 TimeoutStopSec=25
 `);
-    expect(() => snapshotDropIn(layout, { ...branch, runtime_version: "0.3.1 --evil" })).toThrow(/Invalid runtime version/);
+    expect(snapshotDropIn(layout, branch, hostBinary)).not.toContain(`/${branch.runtime_version}/`);
+    expect(() => snapshotDropIn(layout, branch, "/usr/local/lib/incibase/x y/incibase")).toThrow(/Refusing to write/);
   });
 
   test("nothing that systemd would expand or split reaches a unit file", () => {

@@ -124,7 +124,7 @@ export class FakeSystem implements HostSystem {
     }
     const type = st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : st.isFile() ? "file" : "other";
     const meta = this.meta.get(path);
-    return { type, uid: meta?.uid ?? 0, gid: meta?.gid ?? 0, mode: meta?.mode ?? st.mode & 0o7777, size: st.size, mtimeMs: st.mtimeMs };
+    return { type, uid: meta?.uid ?? 0, gid: meta?.gid ?? 0, mode: meta?.mode ?? st.mode & 0o7777, size: st.size, blocks: Number(st.blocks), mtimeMs: st.mtimeMs };
   }
 
   mkdir(path: string, mode: number) {

@@ -5,9 +5,10 @@
 // write a file atomically (temp file, fsync, rename, via HostSystem) and only
 // when its content, owner or mode differ, and say whether a unit file changed,
 // so the caller runs `systemctl daemon-reload` once, and only then.
+import { VERSION } from "../engine/version.ts";
 import type { BranchConfig, ResolvedLimits } from "./config.ts";
 import { authConcurrency, drainMs, durationText, parseConfig, parseLimits, resolveLimits, stopTimeoutSec, systemdSize, timeoutsFlag } from "./config.ts";
-import type { HostLayout } from "./layout.ts";
+import { RUNTIME_VERSION_REGEX, type HostLayout } from "./layout.ts";
 import { branchUser, checkDomain, checkEnvName, checkLabel } from "./names.ts";
 import type { HostContext } from "./provision.ts";
 import type { BranchRow, EnvRow, ReleaseRow, ServiceKeyRow } from "./registry.ts";
@@ -326,12 +327,32 @@ ${limitLines(limits, config)}
 `;
 }
 
-/** `incibase-snapshot@<id>.service.d/10-incibase.conf`: the branch's user and limits, its pinned runtime's `_snapshot`. */
-export function snapshotDropIn(layout: HostLayout, branch: BranchRow): string {
+/**
+ * The root-owned incibase binary the snapshot (and any _snapshot) runs: the
+ * host's own current code, picked like doctor's probe — this binary's VERSION
+ * if it is installed, else the newest installed runtime that is root-owned and
+ * world-executable. Never the branch's pinned runtime: `_snapshot` is root's
+ * code running AS the branch, and a branch pinned to a runtime built before
+ * `_snapshot` existed would reject the command (exit 78) and fail every
+ * production release and upgrade. Null when no usable runtime is installed.
+ */
+export function hostRuntimeBinary(ctx: HostContext): string | null {
+  const { sys, layout } = ctx;
+  const usable = sys.readdir(layout.runtimeRoot).filter((v) => {
+    if (!RUNTIME_VERSION_REGEX.test(v)) return false;
+    const info = sys.lstat(layout.runtimeBinary(v));
+    return info?.type === "file" && info.uid === 0 && (info.mode & 0o022) === 0 && (info.mode & 0o005) === 0o005;
+  });
+  const pick = usable.includes(VERSION) ? VERSION : usable.sort(Bun.semver.order).at(-1);
+  return pick ? layout.runtimeBinary(pick) : null;
+}
+
+/** `incibase-snapshot@<id>.service.d/10-incibase.conf`: the branch's user and limits, the host's own `_snapshot` (never the branch's pinned runtime). */
+export function snapshotDropIn(layout: HostLayout, branch: BranchRow, runtimeBinary: string): string {
   const limits = resolveLimits(parseLimits(branch.limits_json));
   const config = parseConfig(branch.config_json);
   const paths = layout.branch(branch.id);
-  const command = [layout.runtimeBinary(branch.runtime_version), "_snapshot", "--data", paths.data, "--out", paths.snapshotFile].map(word).join(" ");
+  const command = [runtimeBinary, "_snapshot", "--data", paths.data, "--out", paths.snapshotFile].map(word).join(" ");
   const user = branchUser(branch.id);
   return `${HEADER}[Service]
 User=${user}
@@ -491,11 +512,13 @@ export function renderPreflightUnit(ctx: HostContext, input: Omit<PreflightUnitI
  */
 export function renderSnapshotUnit(ctx: HostContext, branch: BranchRow): boolean {
   const { layout } = ctx;
+  const runtimeBinary = hostRuntimeBinary(ctx);
+  if (!runtimeBinary) throw new Error(`No installed runtime to take a snapshot with; install one with incibase host install-runtime`);
   ensureDir(ctx, layout.systemdDir);
   let changed = writeIfChanged(ctx, layout.unitFile(layout.units.snapshotTemplate), snapshotTemplateUnit(layout), UNIT_FILE);
   const dropIn = layout.dropIn(layout.units.snapshot(branch.id));
   ensureDir(ctx, dropIn.slice(0, dropIn.lastIndexOf("/")));
-  changed = writeIfChanged(ctx, dropIn, snapshotDropIn(layout, branch), UNIT_FILE) || changed;
+  changed = writeIfChanged(ctx, dropIn, snapshotDropIn(layout, branch, runtimeBinary), UNIT_FILE) || changed;
   return changed;
 }
 

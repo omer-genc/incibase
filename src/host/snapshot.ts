@@ -8,7 +8,8 @@
 // path and opens the -wal and -shm by name, so a read made as root could be
 // pointed at another branch's data or the control plane. Instead:
 //
-//   1. `incibase-snapshot@<id>` runs the branch's pinned runtime as
+//   1. `incibase-snapshot@<id>` runs the host's own current runtime (not the
+//      branch's pinned one: this is root's code running as the tenant) as
 //      `incibase _snapshot` (snapshot-command.ts) with the branch's uid, in
 //      the branch's sandbox (control/, backups/ and trash/ inaccessible, its
 //      MemoryMax, RuntimeMaxSec). It `VACUUM INTO`s data.db into the
@@ -29,7 +30,7 @@
 // is moved aside by rename, never opened.
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
-import { MiB } from "./config.ts";
+import { MiB, parseLimits, resolveLimits } from "./config.ts";
 import { defaults, type OpsContext } from "./context.ts";
 import { CLD_EXITED, ranToSuccess, settled, unitJournalTail, type UnitStatus } from "./driver.ts";
 import { SNAPSHOT_NAME } from "./layout.ts";
@@ -54,11 +55,17 @@ export class SnapshotError extends Error {
   }
 }
 
-/** The database and its WAL, in bytes (lstat: never followed); 0 when the branch has no database yet. */
-export function databaseBytes(ctx: HostContext, dataDir: string): number {
+/**
+ * The disk the database and its WAL actually use, in bytes (st_blocks*512,
+ * lstat: never followed); 0 when the branch has no database yet. Never
+ * st_size, which the branch can inflate with a sparse file (ftruncate) to
+ * nothing on disk, so it cannot be used to widen the size cap root allows the
+ * staging copy.
+ */
+export function allocatedDatabaseBytes(ctx: HostContext, dataDir: string): number {
   return ["data.db", "data.db-wal"].reduce((sum, name) => {
     const info = ctx.sys.lstat(join(dataDir, name));
-    return sum + (info?.type === "file" ? info.size : 0);
+    return sum + (info?.type === "file" ? info.blocks * 512 : 0);
   }, 0);
 }
 
@@ -183,7 +190,9 @@ export async function snapshotDatabase(ctx: OpsContext, branch: BranchRow, dest:
   const { sys, layout } = ctx;
   const paths = layout.branch(branch.id);
   if (!hasDatabase(ctx, branch)) throw new SnapshotError(`${branch.project}/${branch.name} has no database to snapshot`);
-  const before = databaseBytes(ctx, paths.data);
+  // Measured BEFORE the unit runs and from allocated blocks, not st_size: a branch that makes data.db or its
+  // WAL sparse cannot use their apparent size to widen the cap and have root copy real zero blocks into backups/.
+  const before = allocatedDatabaseBytes(ctx, paths.data);
   const free = sys.freeBytes(dirname(dest));
   const need = 2 * before + SNAPSHOT_HEADROOM;
   if (free < need) {
@@ -194,10 +203,15 @@ export async function snapshotDatabase(ctx: OpsContext, branch: BranchRow, dest:
   }
   ensureStaging(ctx, branch);
   await runSnapshotUnit(ctx, branch);
-  // The copy can be no larger than the database was (it keeps growing meanwhile, hence twice), and root's
-  // copy of it must leave the headroom free.
-  const after = databaseBytes(ctx, paths.data);
-  const maxBytes = Math.max(0, Math.min(2 * Math.max(before, after) + SNAPSHOT_HEADROOM, sys.freeBytes(layout.backups) - SNAPSHOT_HEADROOM));
+  // The copy can be no larger than the disk the database actually uses (it keeps growing meanwhile, hence
+  // twice), no larger than the branch's own INCIBASE_MAX_DB_BYTES (a VACUUM copy is at most the live database,
+  // which max_page_count holds to that; a database already over a lowered limit is covered by `before`), and
+  // root's copy must leave the headroom free. ingestFile also refuses a sparse staging file; this bounds a dense one.
+  const after = allocatedDatabaseBytes(ctx, paths.data);
+  const maxDbBytes = resolveLimits(parseLimits(branch.limits_json)).maxDbBytes;
+  const caps = [2 * Math.max(before, after) + SNAPSHOT_HEADROOM, sys.freeBytes(layout.backups) - SNAPSHOT_HEADROOM];
+  if (maxDbBytes !== undefined) caps.push(Math.max(maxDbBytes, before));
+  const maxBytes = Math.max(0, Math.min(...caps));
   const temp = snapshotTemp(ctx, branch.id);
   try {
     sys.ingestFile(paths.snapshotFile, temp, { uid: branch.os_uid, maxBytes, owner, check: sqliteHeaderProblem });
@@ -216,19 +230,41 @@ export async function snapshotDatabase(ctx: OpsContext, branch: BranchRow, dest:
   }
 }
 
-/** Unlinks the branch's staging file (one entry, never followed); what cannot go is the next unit's to clear, as the branch. */
+/**
+ * Empties the branch's staging dir (every entry, never followed): snapshot.db
+ * and any snapshot.db.tmp a killed `_snapshot` left mid-VACUUM, which can be a
+ * near-full copy of the database. The dir is branch-owned 0700; root removes
+ * each entry by lstat + remove without following it, so a symlink or FIFO
+ * planted there has only its own entry removed.
+ */
 function discardStaging(ctx: HostContext, branch: BranchRow) {
-  try {
-    ctx.sys.unlink(ctx.layout.branch(branch.id).snapshotFile);
-  } catch {
-    // A directory planted there: the snapshot unit removes it, with the branch's rights, before its next copy.
+  const dir = ctx.layout.branch(branch.id).snapshot;
+  for (const name of ctx.sys.readdir(dir)) {
+    const path = join(dir, name);
+    try {
+      if (ctx.sys.lstat(path)) ctx.sys.remove(path);
+    } catch {
+      // Whatever cannot go is the next unit's to clear, with the branch's own rights, before its next copy.
+    }
   }
 }
 
-/** Stops a branch's snapshot unit and discards its staging file, so a killed job leaves no orphan behind. */
+/** Removes any `backups/.snap-<id>-*.tmp` a killed ingest or placeCopy left: root-only dir, each by lstat + unlink, never followed. */
+function sweepSnapshotTemps(ctx: HostContext, id: string) {
+  const dir = ctx.layout.backups;
+  const prefix = `.snap-${id}-`;
+  for (const name of ctx.sys.readdir(dir)) {
+    if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
+    const path = join(dir, name);
+    if (ctx.sys.lstat(path)) ctx.sys.unlink(path);
+  }
+}
+
+/** Stops a branch's snapshot unit and discards its staging dir and any root-side ingest temp, so a killed job leaves no orphan behind. */
 export async function cleanupSnapshot(ctx: OpsContext, branch: BranchRow): Promise<void> {
   await stopUnit(ctx, ctx.layout.units.snapshot(branch.id));
   discardStaging(ctx, branch);
+  sweepSnapshotTemps(ctx, branch.id);
 }
 
 /**
