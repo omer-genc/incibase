@@ -240,6 +240,10 @@ const MIGRATIONS: string[] = [
     installed_at INTEGER NOT NULL
   );
   `,
+  // Step 12: "project delete" keeps the row (deleted branches still name it) and marks it.
+  `
+  ALTER TABLE projects ADD COLUMN deleted_at INTEGER;
+  `,
 ];
 
 /** The newest registry schema this binary knows. */
@@ -455,16 +459,29 @@ export class Registry {
 
   // ---- projects ----------------------------------------------------------
 
+  /** A new project, or a deleted one with the same slug made live again. */
   insertProject(slug: string, name: string, at: number) {
-    this.tx(() => this.db.run(`INSERT INTO projects (slug, name, created_at) VALUES (?, ?, ?)`, [slug, name, at]));
+    this.tx(() =>
+      this.db.run(
+        `INSERT INTO projects (slug, name, created_at) VALUES (?, ?, ?)
+         ON CONFLICT (slug) DO UPDATE SET name = excluded.name, created_at = excluded.created_at, deleted_at = NULL WHERE deleted_at IS NOT NULL`,
+        [slug, name, at],
+      ),
+    );
   }
 
+  /** The project unless it was deleted. */
   getProject(slug: string): ProjectRow | null {
-    return this.db.query(`SELECT * FROM projects WHERE slug = ?`).get(slug) as ProjectRow | null;
+    return this.db.query(`SELECT slug, name, created_at FROM projects WHERE slug = ? AND deleted_at IS NULL`).get(slug) as ProjectRow | null;
   }
 
   listProjects(): ProjectRow[] {
-    return this.db.query(`SELECT * FROM projects ORDER BY slug`).all() as ProjectRow[];
+    return this.db.query(`SELECT slug, name, created_at FROM projects WHERE deleted_at IS NULL ORDER BY slug`).all() as ProjectRow[];
+  }
+
+  /** Marks a project deleted; its row stays, since the rows of its deleted branches name it. */
+  deleteProject(slug: string, at: number): boolean {
+    return this.tx(() => this.db.run(`UPDATE projects SET deleted_at = ? WHERE slug = ? AND deleted_at IS NULL`, [at, slug]).changes === 1);
   }
 
   // ---- branches ----------------------------------------------------------

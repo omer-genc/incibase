@@ -297,6 +297,37 @@ export async function gcTrash(ctx: OpsContext, input: z.input<typeof gcSchema> =
   );
 }
 
+const addAdminSchema = z.strictObject({ user: z.string().regex(/^[a-z_][a-z0-9_-]{0,31}$/, "must be a Unix user name") });
+
+/** Login accounts: Ubuntu's UID_MIN to UID_MAX (login.defs). */
+const LOGIN_UID = { min: 1000, max: 60000 };
+
+/**
+ * `host add-admin <user>`: adds a person's login account to the admin
+ * group, which may open admin/index.json and the admin sockets (the SSH
+ * tunnel). Only login accounts: never a branch's user, nginx's or another
+ * system account, which would reach every branch's admin API.
+ */
+export async function addAdmin(ctx: OpsContext, input: z.input<typeof addAdminSchema>) {
+  const { user } = parse(addAdminSchema, input);
+  return audited(ctx, "host.add_admin", null, () =>
+    ctx.registry.withLock(() => {
+      const group = ctx.layout.groups.admin;
+      const entry = ctx.sys.getpwnam(user);
+      if (!entry) throw new OpError("NOT_FOUND", `No user ${user} on this machine: create the account first (adduser ${user})`);
+      if (entry.uid < LOGIN_UID.min || entry.uid >= LOGIN_UID.max) {
+        throw new OpError("INVALID", `${user} (uid ${entry.uid}) is not a login account; only people's accounts (uid ${LOGIN_UID.min} to ${LOGIN_UID.max - 1}) may be admins`);
+      }
+      const admins = ctx.sys.getgrnam(group);
+      if (!admins) throw new OpError("FAILED", `The group ${group} does not exist: run incibase host init first`);
+      const added = !admins.members.includes(user);
+      if (added) ctx.sys.addToGroup(user, group);
+      ctx.registry.audit({ actor: actor(ctx), action: "host.add_admin", detail: { user, group, added }, ok: true }, now(ctx));
+      return { user, group, added };
+    }),
+  );
+}
+
 // ---- projects and branches -----------------------------------------------------------
 
 const createProjectSchema = z.strictObject({
@@ -315,6 +346,37 @@ export async function createProject(ctx: OpsContext, input: z.input<typeof creat
     for (const branch of branches) created.push(await createBranch(ctx, { project: slug, name: branch }));
     return { project: row, branches: created };
   });
+}
+
+/** The projects with their live branches' names. */
+export async function listProjects(ctx: OpsContext, _input: Record<string, never> = {}) {
+  const branches = ctx.registry.listBranches({ phase: ["provisioning", "ready", "deleting"] });
+  return ctx.registry.listProjects().map((p) => ({ ...p, branches: branches.filter((b) => b.project === p.slug).map((b) => b.name) }));
+}
+
+const deleteProjectSchema = z.strictObject({ slug: project });
+
+/**
+ * Deletes a project that has no branches left. Branches are deleted one by
+ * one first (`branch delete`, with its confirmation for production), so
+ * one command never removes a production branch's data in passing.
+ */
+export async function deleteProject(ctx: OpsContext, input: z.input<typeof deleteProjectSchema>) {
+  const { slug } = parse(deleteProjectSchema, input);
+  return audited(ctx, "project.delete", null, () =>
+    ctx.registry.withLock(() => {
+      if (!ctx.registry.getProject(slug)) throw new OpError("NOT_FOUND", `No project ${slug}`);
+      const live = ctx.registry.listBranches({ phase: ["provisioning", "ready", "deleting"], project: slug });
+      if (live.length) {
+        throw new OpError("CONFLICT", `Project ${slug} still has branches (${live.map((b) => branchRef(b.project, b.name)).join(", ")}): delete them first with incibase branch delete`);
+      }
+      ctx.registry.tx(() => {
+        ctx.registry.deleteProject(slug, now(ctx));
+        ctx.registry.audit({ actor: actor(ctx), action: "project.delete", detail: { slug }, ok: true }, now(ctx));
+      });
+      return { slug, deleted: true };
+    }),
+  );
 }
 
 const createBranchSchema = z.strictObject({
@@ -877,13 +939,27 @@ const logsSchema = z.strictObject({
   lines: z.number().int().min(1).max(100_000).optional(),
   since: z.string().regex(/^[A-Za-z0-9 :.+-]{1,40}$/).optional(),
   json: z.boolean().default(false),
+  /** Only the error lines: branches log JSON (`--log-format json`), these have `"level":"error"`. */
+  errors: z.boolean().default(false),
 });
+
+/** journalctl --grep for the error lines of a branch's JSON log. */
+export const ERROR_LINES = '"level":"error"';
 
 /** The journalctl command that shows a branch's log, for the CLI to run with its terminal. */
 export async function logs(ctx: OpsContext, input: z.input<typeof logsSchema>) {
   const data = parse(logsSchema, input);
   const branch = findBranch(ctx, data);
-  return { command: ctx.driver.journalCommand({ unit: ctx.layout.units.branch(branch.id), follow: data.follow, lines: data.lines, since: data.since, json: data.json }) };
+  return {
+    command: ctx.driver.journalCommand({
+      unit: ctx.layout.units.branch(branch.id),
+      follow: data.follow,
+      lines: data.lines,
+      since: data.since,
+      json: data.json,
+      ...(data.errors ? { grep: ERROR_LINES } : {}),
+    }),
+  };
 }
 
 /** Every op by name, for `incibase host op <name> <json>` (and M4's routes). */
@@ -899,7 +975,10 @@ export const OPS = {
   gcTrash,
   gcRuntimes,
   gc,
+  addAdmin,
   createProject,
+  listProjects,
+  deleteProject,
   createBranch,
   setBranch,
   start,

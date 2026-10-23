@@ -93,6 +93,16 @@ export class FakeSystem implements HostSystem {
     if (group && group.gid === user.gid && group.members.length === 0) this.groups.delete(name);
   }
 
+  addToGroup(user: string, group: string) {
+    checkAccountName(user);
+    checkAccountName(group);
+    this.change(`usermod -aG ${group} ${user}`);
+    const entry = this.groups.get(group);
+    if (!this.users.has(user)) throw new SystemCommandError(["usermod", user], 6, `usermod: user '${user}' does not exist`);
+    if (!entry) throw new SystemCommandError(["usermod", user], 6, `usermod: group '${group}' does not exist`);
+    if (!entry.members.includes(user)) entry.members.push(user);
+  }
+
   lstat(path: string): FileInfo | null {
     let st;
     try {

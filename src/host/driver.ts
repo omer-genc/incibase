@@ -80,7 +80,7 @@ export interface Driver {
   /** Flushes journald so a just-stopped process's lines are readable (`journalctl --sync`). */
   syncJournal(): void;
   /** The journalctl command for `incibase logs`, for the caller to run with its own terminal. */
-  journalCommand(query: { unit: string; follow?: boolean; lines?: number; since?: string; json?: boolean }): string[];
+  journalCommand(query: { unit: string; follow?: boolean; lines?: number; since?: string; json?: boolean; grep?: string }): string[];
 }
 
 /** Whether a unit has stopped running (or never ran), as far as `show` tells. */
