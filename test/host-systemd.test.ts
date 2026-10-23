@@ -314,9 +314,22 @@ describe.skipIf(!enabled)("the host on systemd", () => {
     const dev = branch("dev");
     const before = show(dev);
     process.kill(before.mainPid, "SIGKILL");
-    const after = await waitFor("a new process", async () => {
-      const now = show(dev);
-      return now.mainPid !== before.mainPid && now.activeState === "active" && (await health(dev)).json?.generation === dev.generation ? now : null;
+    let seen = "";
+    const after = await waitFor(
+      "a new process",
+      async () => {
+        const now = show(dev);
+        if (now.mainPid === before.mainPid || now.activeState !== "active") return (seen = `${now.activeState}/${now.subState} pid ${now.mainPid}`), null;
+        // Type=exec: the unit is active as soon as serve starts, before it listens. Until then its admin
+        // socket is the killed process's stale file (ECONNREFUSED) or missing (ENOENT): not an answer yet.
+        const answer = await health(dev).catch((err: Error) => ({ status: 0, json: { error: err.message } }));
+        seen = `active pid ${now.mainPid}, health ${answer.status} ${JSON.stringify(answer.json)}`;
+        return answer.json?.generation === dev.generation ? now : null;
+      },
+      // RestartSec=2, then a cold start of the runtime (right after a build it is not in the page cache yet).
+      120_000,
+    ).catch((err: Error) => {
+      throw new Error(`${err.message} (last seen: ${seen})`);
     });
     // systemd restarted it (Restart=on-failure), as opposed to a start of ours.
     expect(after.nRestarts).toBeGreaterThan(before.nRestarts);
@@ -381,7 +394,9 @@ describe.skipIf(!enabled)("the host on systemd", () => {
     const report = await sandboxReport(branch("dev"), branch("prod"));
     for (const line of report.lines) console.log(`  sandbox: ${line}`);
     expect(report.required).toEqual([]);
-    if (REQUIRE_SANDBOX) expect(report.ineffective).toEqual([]);
+    // SocketBindDeny needs systemd's BPF framework, which Ubuntu 24.04 builds systemd without, on a VM too (host doctor WARNs).
+    const unsupported = systemdFeature(run(["systemctl", "--version"]).stdout, "BPF_FRAMEWORK") === false ? ["SocketBindDeny"] : [];
+    if (REQUIRE_SANDBOX) expect(report.ineffective.filter((name) => !unsupported.includes(name))).toEqual([]);
   }, SLOW);
 
   test("delete removes units, users and directories; prod's data waits in trash", async () => {

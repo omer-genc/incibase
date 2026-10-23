@@ -274,7 +274,8 @@ describe.skipIf(!enabled)("host check and doctor on systemd", () => {
       }
     } else expect(by.virtualization!.status).toBe("OK");
     // SocketBindDeny needs systemd's BPF framework; Ubuntu 24.04 builds it without (VM or container): a WARN naming the build.
-    if (systemdFeature(run(["systemctl", "--version"]).stdout, "BPF_FRAMEWORK") === false) {
+    const noBpf = systemdFeature(run(["systemctl", "--version"]).stdout, "BPF_FRAMEWORK") === false;
+    if (noBpf) {
       const bind = by["sandbox SocketBindDeny"]!;
       expect(bind.status).toBe("WARN");
       expect(bind.detail).toStartWith("unsupported by this systemd build (-BPF_FRAMEWORK)");
@@ -282,7 +283,10 @@ describe.skipIf(!enabled)("host check and doctor on systemd", () => {
     }
     // journald's effective Storage= (Ubuntu: auto, with /var/log/journal/<machine-id> written).
     expect(by.journald).toMatchObject({ status: "OK", detail: "persistent storage (Storage=auto, /var/log/journal)" });
-    if (REQUIRE_SANDBOX) for (const c of report.checks.filter((x) => x.name.startsWith("sandbox "))) expect(c.status).toBe("OK");
+    // On a VM every directive takes effect but SocketBindDeny where this systemd cannot apply it (the WARN above).
+    if (REQUIRE_SANDBOX) {
+      for (const c of report.checks.filter((x) => x.name.startsWith("sandbox ") && !(noBpf && x.name === "sandbox SocketBindDeny"))) expect(c).toMatchObject({ status: "OK" });
+    }
     // The probe cleaned up after itself.
     expect(readdirSync("/run").filter((n) => n.startsWith(`${LABEL}-doctor-`))).toEqual([]);
     expect(readdirSync("/var/tmp").filter((n) => n.startsWith(`${LABEL}-doctor-`))).toEqual([]);
