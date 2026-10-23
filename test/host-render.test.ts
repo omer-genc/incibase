@@ -176,10 +176,9 @@ TimeoutStopSec=25
 `);
   });
 
-  test("the snapshot drop-in runs the given host runtime's _snapshot as the branch, never the branch's pin", () => {
-    // The branch is pinned to 0.3.1, but the drop-in runs the host binary it is handed (the current code), so a
-    // branch pinned to a runtime built before _snapshot existed still snapshots. Use a distinct version here to
-    // show the pin never reaches the command.
+  test("the snapshot drop-in runs the _snapshot of the runtime it is handed, as the branch, with its limits", () => {
+    // The branch is pinned to 0.3.1; the drop-in runs the binary it is handed (render.hostRuntime's pick, the newer
+    // of the host's runtime and the pin), never one derived from the branch row. A distinct version shows that.
     const hostBinary = layout.runtimeBinary("9.9.9");
     expect(snapshotDropIn(layout, branch, hostBinary)).toBe(`${HEADER}[Service]
 User=ib-b7k2m9q4

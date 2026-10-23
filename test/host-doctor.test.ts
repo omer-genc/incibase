@@ -25,7 +25,7 @@ import { closeOpsHosts, fakeBundle, fakeOpsHost, type OpsTestHost } from "./host
 
 afterEach(closeOpsHosts);
 
-const dir: FileInfo = { type: "dir", uid: 0, gid: 0, mode: 0o755, size: 0, blocks: 0, mtimeMs: 0 };
+const dir: FileInfo = { type: "dir", uid: 0, gid: 0, mode: 0o755, size: 0, mtimeMs: 0 };
 const file: FileInfo = { ...dir, type: "file", mode: 0o644 };
 const ok = (stdout: string): CommandResult => ({ exitCode: 0, stdout, stderr: "" });
 

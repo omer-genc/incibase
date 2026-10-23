@@ -417,6 +417,44 @@ describe("bookkeeping", () => {
     expect(readdirSync(host.layout.branch(prod.id).snapshot)).toEqual([]);
   });
 
+  test("render cleans up a dead job's leftovers before it frees the branch, holding the lock", async () => {
+    const host = await shop(["prod"]);
+    const prod = branchOf(host, "prod");
+    seedDatabase(host, prod);
+    host.driver.behavior = (run) => (run.kind === "snapshot" ? { hang: true } : {});
+    host.driver.onTransient = () => new Promise(() => {});
+    const { unit } = await release(host, "prod", fakeBundle(host.dir, "v1"), { wait: false });
+    // The job is killed mid-snapshot: its unit still runs, and a root-side ingest temp is left in backups/.
+    const snapshotUnit = host.layout.units.snapshot(prod.id);
+    provision.renderBranchFiles(host, prod);
+    const { renderSnapshotUnit } = await import("../src/host/render.ts");
+    renderSnapshotUnit(host, prod);
+    host.driver.start(snapshotUnit);
+    const temp = join(host.layout.backups, `.snap-${prod.id}-0123456789abcdef.tmp`);
+    writeFileSync(temp, "partial");
+    host.driver.stop(unit);
+    // While render stops that unit (the first step of its cleanup), another command must not get the lock, and
+    // the branch must still be busy: a new job could otherwise claim it and have its own files swept.
+    const other = Registry.open(host.layout);
+    let during: { busy: string | null; lock: Promise<string> } | null = null;
+    const stop = host.driver.stop.bind(host.driver);
+    host.driver.stop = (name) => {
+      if (name === snapshotUnit && !during) {
+        // timeoutMs 0: one try, made right now (withLock's first attempt runs before it awaits anything).
+        during = { busy: other.getBranch(prod.id)!.busy_unit, lock: other.withLock(() => "got it", { timeoutMs: 0 }).catch((err: Error) => err.name) };
+      }
+      stop(name);
+    };
+    expect((await ops.render(host)).interrupted).toEqual([prod.id]);
+    expect(during).not.toBeNull();
+    expect(during!.busy).toBe(unit);
+    expect(await during!.lock).toBe("RegistryLockedError");
+    expect(existsSync(temp)).toBe(false);
+    expect(host.driver.isActive(snapshotUnit)).toBe(false);
+    expect(branchOf(host, "prod").busy_unit).toBeNull();
+    other.close();
+  });
+
   test("a release needs its runtime installed", async () => {
     const host = await shop([]);
     // A branch cannot pin a runtime that is not installed.

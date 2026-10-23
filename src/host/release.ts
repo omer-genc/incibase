@@ -582,8 +582,9 @@ async function stopPreflight(ctx: OpsContext, unit: string): Promise<boolean> {
 }
 
 /**
- * Stops a branch's preflight and snapshot units, empties preflight/ and
- * discards the staging file, so a killed job leaves no orphan process or copy behind.
+ * Stops a branch's preflight and snapshot units, empties preflight/ and the
+ * snapshot staging dir and removes its ingest temps in backups/, so a killed
+ * job leaves no orphan process or copy behind.
  */
 export async function cleanupPreflight(ctx: OpsContext, branch: BranchRow): Promise<void> {
   await stopPreflight(ctx, ctx.layout.units.preflight(branch.id));

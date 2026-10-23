@@ -8,21 +8,23 @@
 // path and opens the -wal and -shm by name, so a read made as root could be
 // pointed at another branch's data or the control plane. Instead:
 //
-//   1. `incibase-snapshot@<id>` runs the host's own current runtime (not the
-//      branch's pinned one: this is root's code running as the tenant) as
-//      `incibase _snapshot` (snapshot-command.ts) with the branch's uid, in
-//      the branch's sandbox (control/, backups/ and trash/ inaccessible, its
-//      MemoryMax, RuntimeMaxSec). It `VACUUM INTO`s data.db into the
-//      branch-owned staging dir (snapshot/snapshot.db). As the branch it can
-//      only ever read what the branch could read anyway.
+//   1. `incibase-snapshot@<id>` runs `incibase _snapshot` (snapshot-command.ts)
+//      with the branch's uid, in the branch's sandbox (control/, backups/ and
+//      trash/ inaccessible, its MemoryMax, RuntimeMaxSec), from the newer of
+//      the host's own runtime and the branch's pinned one (render.hostRuntime).
+//      It `VACUUM INTO`s data.db into the branch-owned staging dir
+//      (snapshot/snapshot.db). As the branch it can only ever read what the
+//      branch could read anyway.
 //   2. Root takes the staging file in by fd (HostSystem.ingestFile): opened
 //      once with O_NOFOLLOW|O_NONBLOCK, checked from that fd (a regular file
-//      of the branch's uid with one link, no larger than the database and
-//      the free space allow, an SQLite header that agrees with its size) and
-//      copied into a fresh temp in backups/ (root 0700) that gets its final
-//      owner and mode and an fsync, then renamed into place. Root never runs
-//      SQLite on those bytes. The staging file is unlinked (one entry, never
-//      followed).
+//      of the branch's uid with one link, no larger than the database, its
+//      INCIBASE_MAX_DB_BYTES and the free space allow, an SQLite header that
+//      agrees with its size) and copied, sparse-preserving (blocks of zeros
+//      stay holes, so a sparse file costs root no disk), into a fresh temp in
+//      backups/ (root 0700) that gets its final owner and mode and an fsync,
+//      then renamed into place. Root never runs SQLite on those bytes. The
+//      staging dir is emptied afterwards, whether the unit or the ingest
+//      worked or not (each entry removed, never followed).
 //
 // The preflight copy and `rollback --restore` follow the same rule: the copy
 // is made in backups/ and renamed into the branch's directory (a rename
@@ -30,13 +32,14 @@
 // is moved aside by rename, never opened.
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
+import { VERSION } from "../engine/version.ts";
 import { MiB, parseLimits, resolveLimits } from "./config.ts";
 import { defaults, type OpsContext } from "./context.ts";
 import { CLD_EXITED, ranToSuccess, settled, unitJournalTail, type UnitStatus } from "./driver.ts";
 import { SNAPSHOT_NAME } from "./layout.ts";
 import type { HostContext } from "./provision.ts";
 import type { BranchRow } from "./registry.ts";
-import { renderSnapshotUnit, SNAPSHOT_RUNTIME_MAX_SEC } from "./render.ts";
+import { hostRuntime, renderSnapshotUnit, SNAPSHOT_RUNTIME_MAX_SEC, type HostRuntime } from "./render.ts";
 import { SNAPSHOT_EXIT } from "./snapshot-command.ts";
 import { IngestError, type Owner } from "./system.ts";
 
@@ -56,16 +59,19 @@ export class SnapshotError extends Error {
 }
 
 /**
- * The disk the database and its WAL actually use, in bytes (st_blocks*512,
- * lstat: never followed); 0 when the branch has no database yet. Never
- * st_size, which the branch can inflate with a sparse file (ftruncate) to
- * nothing on disk, so it cannot be used to widen the size cap root allows the
- * staging copy.
+ * The size of the database and its WAL in bytes (st_size, lstat: never
+ * followed; 0 when the branch has no database yet). A VACUUM INTO copy is
+ * never larger. It is the apparent size, which a branch can inflate with a
+ * sparse file, so it only bounds the copy of a database that is not hostile:
+ * the copy is sparse-preserving (a hole costs root no disk), and how much
+ * root reads is held by the free space and INCIBASE_MAX_DB_BYTES, which the
+ * branch cannot raise. (Never st_blocks: on a compressing file system, ZFS or
+ * btrfs with compression, it is the compressed size.)
  */
-export function allocatedDatabaseBytes(ctx: HostContext, dataDir: string): number {
+export function databaseBytes(ctx: HostContext, dataDir: string): number {
   return ["data.db", "data.db-wal"].reduce((sum, name) => {
     const info = ctx.sys.lstat(join(dataDir, name));
-    return sum + (info?.type === "file" ? info.blocks * 512 : 0);
+    return sum + (info?.type === "file" ? info.size : 0);
   }, 0);
 }
 
@@ -129,12 +135,22 @@ async function stopUnit(ctx: OpsContext, unit: string): Promise<boolean> {
   return ok;
 }
 
-function describeSnapshotExit(status: UnitStatus): string {
+/**
+ * What a runtime that has no `_snapshot` exits with: every incibase built
+ * before it says `Unknown command "_snapshot"` and exits 64 (ExitCode.CONFIG,
+ * the code `_snapshot` itself uses for bad arguments); `_snapshot` never
+ * exits 78 (ExitCode.DEFINITION), so 78 means a binary that does not run it.
+ */
+const NO_SNAPSHOT_COMMAND = /Unknown command "_snapshot"/;
+
+function describeSnapshotExit(status: UnitStatus, runtime: HostRuntime, tail: string): string {
   if (status.result === "oom-kill") return "it ran out of memory (killed by the OOM killer)";
   if (status.result === "timeout") return `it ran past its time limit (${SNAPSHOT_RUNTIME_MAX_SEC} s)`;
   if (status.execMainCode === CLD_EXITED) {
     const code = status.execMainStatus;
-    const why = code === SNAPSHOT_EXIT.NO_DATABASE ? "no database" : code === SNAPSHOT_EXIT.USAGE ? "bad arguments, or a runtime without _snapshot" : "the copy failed";
+    const lacking = `the runtime ${runtime.version} it ran (${runtime.binary}) has no _snapshot; install a newer one with incibase host install-runtime`;
+    if (code === 78 || (code === SNAPSHOT_EXIT.USAGE && NO_SNAPSHOT_COMMAND.test(tail))) return `it exited with ${code}: ${lacking}`;
+    const why = code === SNAPSHOT_EXIT.NO_DATABASE ? "no database" : code === SNAPSHOT_EXIT.USAGE ? `bad arguments, or ${lacking}` : "the copy failed";
     return `it exited with ${code} (${why})`;
   }
   if (status.execMainCode > CLD_EXITED) return `it was killed by signal ${status.execMainStatus}`;
@@ -146,10 +162,17 @@ async function runSnapshotUnit(ctx: OpsContext, branch: BranchRow): Promise<void
   const { driver, layout } = ctx;
   const unit = layout.units.snapshot(branch.id);
   const sleep = defaults.sleep(ctx);
+  const runtime = hostRuntime(ctx, branch.runtime_version);
+  if (!runtime) {
+    throw new SnapshotError(
+      `No runtime to snapshot ${branch.project}/${branch.name} with: neither this host's ${VERSION} nor its pinned ${branch.runtime_version} is installed ` +
+        `as a root-owned file no one else can write under ${layout.runtimeRoot}; install one with incibase host install-runtime`,
+    );
+  }
   // An earlier snapshot of this branch may still run (its job was killed): `start` would be a no-op on that
   // active unit and we would take in the OLD run's file. Stop it and wait until it settles first.
   if (!(await stopUnit(ctx, unit))) throw new SnapshotError(`An earlier snapshot (${unit}) is still running and would not stop`);
-  if (renderSnapshotUnit(ctx, branch)) driver.daemonReload();
+  if (renderSnapshotUnit(ctx, branch, runtime)) driver.daemonReload();
   const cursor = driver.journalCursor();
   driver.resetFailed(unit);
   const started = performance.now();
@@ -173,7 +196,7 @@ async function runSnapshotUnit(ctx: OpsContext, branch: BranchRow): Promise<void
   driver.resetFailed(unit);
   if (!ranToSuccess(status)) {
     const tail = unitJournalTail(driver, unit, cursor, 10);
-    throw new SnapshotError(`The snapshot of ${branch.project}/${branch.name} failed: ${unit} ${describeSnapshotExit(status)}${tail ? `\n${tail}` : ""}`);
+    throw new SnapshotError(`The snapshot of ${branch.project}/${branch.name} failed: ${unit} ${describeSnapshotExit(status, runtime, tail)}${tail ? `\n${tail}` : ""}`);
   }
 }
 
@@ -184,15 +207,14 @@ async function runSnapshotUnit(ctx: OpsContext, branch: BranchRow): Promise<void
  * into place. Refuses when the file system of `dest` has less than twice the
  * database plus SNAPSHOT_HEADROOM free, and refuses a staging file that is
  * not what the unit leaves (a symlink, a FIFO, another owner, a hard link,
- * larger than the database allows or the disk has room for, no SQLite header).
+ * larger than the database, its limit or the free space allows, no SQLite
+ * header). The staging dir is emptied however it ends.
  */
 export async function snapshotDatabase(ctx: OpsContext, branch: BranchRow, dest: string, owner: Owner): Promise<void> {
   const { sys, layout } = ctx;
   const paths = layout.branch(branch.id);
   if (!hasDatabase(ctx, branch)) throw new SnapshotError(`${branch.project}/${branch.name} has no database to snapshot`);
-  // Measured BEFORE the unit runs and from allocated blocks, not st_size: a branch that makes data.db or its
-  // WAL sparse cannot use their apparent size to widen the cap and have root copy real zero blocks into backups/.
-  const before = allocatedDatabaseBytes(ctx, paths.data);
+  const before = databaseBytes(ctx, paths.data);
   const free = sys.freeBytes(dirname(dest));
   const need = 2 * before + SNAPSHOT_HEADROOM;
   if (free < need) {
@@ -202,31 +224,33 @@ export async function snapshotDatabase(ctx: OpsContext, branch: BranchRow, dest:
     );
   }
   ensureStaging(ctx, branch);
-  await runSnapshotUnit(ctx, branch);
-  // The copy can be no larger than the disk the database actually uses (it keeps growing meanwhile, hence
-  // twice), no larger than the branch's own INCIBASE_MAX_DB_BYTES (a VACUUM copy is at most the live database,
-  // which max_page_count holds to that; a database already over a lowered limit is covered by `before`), and
-  // root's copy must leave the headroom free. ingestFile also refuses a sparse staging file; this bounds a dense one.
-  const after = allocatedDatabaseBytes(ctx, paths.data);
-  const maxDbBytes = resolveLimits(parseLimits(branch.limits_json)).maxDbBytes;
-  const caps = [2 * Math.max(before, after) + SNAPSHOT_HEADROOM, sys.freeBytes(layout.backups) - SNAPSHOT_HEADROOM];
-  if (maxDbBytes !== undefined) caps.push(Math.max(maxDbBytes, before));
-  const maxBytes = Math.max(0, Math.min(...caps));
-  const temp = snapshotTemp(ctx, branch.id);
+  let temp: string | null = null;
   try {
-    sys.ingestFile(paths.snapshotFile, temp, { uid: branch.os_uid, maxBytes, owner, check: sqliteHeaderProblem });
-  } catch (err) {
-    removeTemp(ctx, temp);
-    if (err instanceof IngestError) throw new SnapshotError(`The snapshot of ${branch.project}/${branch.name} was refused: ${err.message}`);
-    throw new SnapshotError(`Taking in the snapshot of ${branch.project}/${branch.name} failed: ${(err as Error).message}`);
-  } finally {
-    discardStaging(ctx, branch);
-  }
-  try {
+    // A unit that fails or is killed (OOM, RuntimeMaxSec, a stop) while this job lives on leaves a partial
+    // snapshot.db.tmp and its -journal, as large as the database; the finally below clears them too.
+    await runSnapshotUnit(ctx, branch);
+    // How much root reads: no more than the database could hold (twice, as it keeps growing meanwhile), no more
+    // than the branch's own INCIBASE_MAX_DB_BYTES (a VACUUM copy is at most the live database, which
+    // max_page_count holds to that; one already over a lowered limit keeps its size), and room for the headroom
+    // in backups/. The database's size is the apparent one, which a branch can inflate; the free space and the
+    // limit are not, and the copy keeps holes, so neither a sparse nor a zero-filled file costs root disk.
+    const after = databaseBytes(ctx, paths.data);
+    const maxDbBytes = resolveLimits(parseLimits(branch.limits_json)).maxDbBytes;
+    const caps = [2 * Math.max(before, after) + SNAPSHOT_HEADROOM, sys.freeBytes(layout.backups) - SNAPSHOT_HEADROOM];
+    if (maxDbBytes !== undefined) caps.push(Math.max(maxDbBytes, before));
+    const maxBytes = Math.max(0, Math.min(...caps));
+    temp = snapshotTemp(ctx, branch.id);
+    try {
+      sys.ingestFile(paths.snapshotFile, temp, { uid: branch.os_uid, maxBytes, owner, check: sqliteHeaderProblem });
+    } catch (err) {
+      if (err instanceof IngestError) throw new SnapshotError(`The snapshot of ${branch.project}/${branch.name} was refused: ${err.message}`);
+      throw new SnapshotError(`Taking in the snapshot of ${branch.project}/${branch.name} failed: ${(err as Error).message}`);
+    }
     sys.rename(temp, dest);
-  } catch (err) {
-    removeTemp(ctx, temp);
-    throw err;
+    temp = null;
+  } finally {
+    if (temp) removeTemp(ctx, temp);
+    discardStaging(ctx, branch);
   }
 }
 

@@ -3,20 +3,29 @@
 // the snapshot unit (`incibase-snapshot@<id>`, here FakeDriver running the
 // real `_snapshot` copy in-process) writes the branch's staging file, and
 // root takes it in by fd into a root-only temp and renames it into place.
-// These tests hand root every kind of staging file a branch could leave
-// instead (symlink, FIFO, foreign owner, hard link, huge sparse file,
-// garbage) and check it is refused without a copy, a hang or a stray temp;
-// that the preflight copy and a restore are made in backups/ and renamed in;
-// and that a restore never opens the entries it moves aside. The race
-// against a real branch uid runs in test/host-snapshot-linux.test.ts.
+// These tests check which runtime the unit runs (the newer of the host's and
+// the branch's pin) and how a failed unit is reported; hand root every kind
+// of staging file a branch could leave instead (symlink, FIFO, foreign
+// owner, hard link, a file larger than the cap, garbage) and check it is
+// refused without a copy, a hang or a stray temp; check that the by-fd copy
+// keeps holes (a sparse staging file costs root no disk) and gives back the
+// same bytes; that a unit that fails or is killed leaves its staging dir
+// empty; that the preflight copy and a restore are made in backups/ and
+// renamed in; and that a restore never opens the entries it moves aside. The
+// race against a real branch uid runs in test/host-snapshot-linux.test.ts.
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
+import { sha256Hex } from "../src/engine/manifest.ts";
+import { VERSION } from "../src/engine/version.ts";
 import { SnapshotCommandError, SNAPSHOT_EXIT, takeSnapshot } from "../src/host/snapshot-command.ts";
 import * as ops from "../src/host/ops.ts";
+import type { FakeRun } from "../src/host/fake-driver.ts";
 import type { BranchRow } from "../src/host/registry.ts";
+import { hostRuntime } from "../src/host/render.ts";
 import { cleanupSnapshot, placeCopy, restoreDatabase, snapshotDatabase, SnapshotError, sqliteHeaderProblem } from "../src/host/snapshot.ts";
+import { ingestByFd } from "../src/host/system.ts";
 import { closeOpsHosts, fakeOpsHost, seedDatabase, type OpsTestHost } from "./host-helpers.ts";
 
 afterEach(closeOpsHosts);
@@ -35,6 +44,37 @@ const count = (path: string) => (new Database(path, { readonly: true }).query("S
 /** Temps root left in backups/ (there should never be any). */
 const strayTemps = (host: OpsTestHost) => readdirSync(host.layout.backups).filter((n) => n.startsWith(".snap-") || n.endsWith(".tmp"));
 
+/** Installs runtime `version` on the fake host: a root 0755 script that only says its version. */
+async function withRuntime(host: OpsTestHost, version: string) {
+  const binary = join(host.dir, `incibase-${version}`);
+  writeFileSync(binary, `#!/bin/sh\necho ${version}\n`, { mode: 0o755 });
+  await ops.installRuntime(host, { binary, version, sha256: sha256Hex(readFileSync(binary)) });
+}
+
+/** A dev branch of shop pinned to `version` (installed first), with its backups/ made. */
+async function pinnedBranch(host: OpsTestHost, name: string, version: string): Promise<BranchRow> {
+  await withRuntime(host, version);
+  await ops.createBranch(host, { project: "shop", name, kind: "dev", runtimeVersion: version });
+  const branch = host.registry.findBranch("shop", name)!;
+  host.sys.mkdir(host.layout.branch(branch.id).backups, 0o700);
+  return branch;
+}
+
+/** An SQLite header for `size` bytes of 4096-byte pages, as VACUUM INTO writes one; the rest of the file is up to the caller. */
+function sqliteHeader(size: number): Buffer {
+  const head = Buffer.alloc(100);
+  head.write("SQLite format 3\0", 0, "latin1");
+  head.writeUInt16BE(4096, 16);
+  head.writeUInt32BE(1, 24); // change counter ...
+  head.writeUInt32BE(size / 4096, 28); // ... the page count ...
+  head.writeUInt32BE(1, 92); // ... valid for it
+  return head;
+}
+
+/** Bytes the file system allocated for `path` (st_blocks are 512-byte units). */
+const allocated = (path: string) => statSync(path).blocks * 512;
+const sha256Of = (path: string) => sha256Hex(readFileSync(path));
+
 /** Makes the fake snapshot unit leave `make(path)` as its staging file instead of a real copy, and exit 0. */
 function stagingIs(host: OpsTestHost, make: (path: string, branch: BranchRow) => void) {
   host.driver.snapshot = (run) => {
@@ -48,7 +88,9 @@ function stagingIs(host: OpsTestHost, make: (path: string, branch: BranchRow) =>
 
 describe("snapshotDatabase: the snapshot unit copies as the branch, root takes the file in by fd", () => {
   test("copies the branch's own database, uncheckpointed WAL rows included", async () => {
-    const { host, branch } = await prodBranch();
+    const { host } = await prodBranch();
+    // Pinned to a runtime newer than this host's own: the unit runs the pin's _snapshot (the newer of the two).
+    const branch = await pinnedBranch(host, "next", "99.0.0");
     const path = seedDatabase(host, branch, 4);
     // The branch keeps a connection open with rows only in its WAL.
     const live = new Database(path);
@@ -56,21 +98,97 @@ describe("snapshotDatabase: the snapshot unit copies as the branch, root takes t
     live.run("INSERT INTO docs (body) VALUES ('in the wal')");
     const dest = host.layout.snapshot(branch.id, "pre-1");
     const calls = host.driver.calls.length;
+    const runs: FakeRun[] = [];
+    host.driver.snapshot = (run) => (runs.push(run), host.driver.copySnapshot(run));
     await snapshotDatabase(host, branch, dest, ROOT_FILE);
     live.close();
     expect(host.sys.lstat(dest)).toMatchObject({ type: "file", uid: 0, gid: 0, mode: 0o600 });
     expect(count(dest)).toBe(5);
-    // The copy ran in the branch's snapshot unit, as the branch, with its pinned runtime's _snapshot.
+    // The copy ran in the branch's snapshot unit, as the branch, with the 99.0.0 runtime's _snapshot.
     const unit = host.layout.units.snapshot(branch.id);
     expect(host.driver.calls.slice(calls)).toContain(`start ${unit}`);
+    expect(runs.map((r) => [r.user, r.runtime])).toEqual([[`ib-${branch.id}`, "99.0.0"]]);
     const dropIn = readFileSync(host.layout.dropIn(unit), "utf8");
     expect(dropIn).toContain(`User=ib-${branch.id}\n`);
     expect(dropIn).toContain(
-      `ExecStart=${host.layout.runtimeBinary(branch.runtime_version)} _snapshot --data ${host.layout.branch(branch.id).data} --out ${host.layout.branch(branch.id).snapshotFile}\n`,
+      `ExecStart=${host.layout.runtimeBinary("99.0.0")} _snapshot --data ${host.layout.branch(branch.id).data} --out ${host.layout.branch(branch.id).snapshotFile}\n`,
     );
     // The staging file is gone, and root left no temp behind.
     expect(readdirSync(host.layout.branch(branch.id).snapshot)).toEqual([]);
     expect(strayTemps(host)).toEqual([]);
+  });
+
+  test("runs the newer of the host's runtime and the branch's pin, never one root cannot trust", async () => {
+    const { host } = await prodBranch();
+    expect(VERSION).not.toBe("0.0.1");
+    // Pinned to a runtime older than this host's (say, from before _snapshot existed): the host's own runs it.
+    const old = await pinnedBranch(host, "old", "0.0.1");
+    seedDatabase(host, old, 2);
+    const runs: FakeRun[] = [];
+    host.driver.snapshot = (run) => (runs.push(run), host.driver.copySnapshot(run));
+    await snapshotDatabase(host, old, host.layout.snapshot(old.id, "pre-1"), ROOT_FILE);
+    expect(runs.map((r) => r.runtime)).toEqual([VERSION]);
+    expect(readFileSync(host.layout.dropIn(host.layout.units.snapshot(old.id)), "utf8")).toContain(`ExecStart=${host.layout.runtimeBinary(VERSION)} _snapshot `);
+    // A newer runtime nobody pins is never picked: only this host's and the branch's own count.
+    await withRuntime(host, "98.0.0");
+    expect(hostRuntime(host, old.runtime_version)?.version).toBe(VERSION);
+    expect(hostRuntime(host, "98.0.0")?.version).toBe("98.0.0");
+    // A binary or its version dir that someone else can write or own, or a symlink, is never run; nothing in a
+    // runtime root someone else can write is.
+    const binary = host.layout.runtimeBinary("98.0.0");
+    for (const [path, uid, mode, expected] of [
+      [binary, 0, 0o775, VERSION],
+      [binary, 1000, 0o755, VERSION],
+      [binary, 0, 0o750, VERSION], // not executable by the branch
+      [host.layout.runtimeDir("98.0.0"), 0, 0o777, VERSION],
+      [host.layout.runtimeRoot, 0, 0o775, undefined],
+    ] as const) {
+      const before = host.sys.lstat(path)!;
+      host.sys.own(path, uid, 0, mode);
+      expect(hostRuntime(host, "98.0.0")?.version).toBe(expected);
+      host.sys.own(path, before.uid, before.gid, before.mode);
+    }
+    expect(hostRuntime(host, "98.0.0")?.version).toBe("98.0.0");
+    const script = readFileSync(binary);
+    rmSync(binary);
+    symlinkSync(host.layout.runtimeBinary(VERSION), binary);
+    expect(hostRuntime(host, "98.0.0")?.version).toBe(VERSION);
+    rmSync(binary);
+    writeFileSync(binary, script, { mode: 0o755 });
+    host.sys.own(binary, 0, 0, 0o755);
+    // Doctor's probe (no pin) uses the same pick: this host's runtime while it is trusted, else the newest trusted.
+    expect(hostRuntime(host, null)?.version).toBe(VERSION);
+    host.sys.own(host.layout.runtimeBinary(VERSION), 0, 0, 0o777);
+    expect(hostRuntime(host, null)?.version).toBe("98.0.0");
+    // Neither this host's runtime nor the pin trusted: no snapshot, saying why, before any unit starts.
+    host.sys.own(host.layout.runtimeBinary("0.0.1"), 0, 0, 0o777);
+    const calls = host.driver.calls.length;
+    await expect(snapshotDatabase(host, old, host.layout.snapshot(old.id, "pre-2"), ROOT_FILE)).rejects.toThrow(
+      new RegExp(`No runtime to snapshot shop/old with: neither this host's ${VERSION.replaceAll(".", "\\.")} nor its pinned 0\\.0\\.1 is installed`),
+    );
+    expect(host.driver.calls.slice(calls).filter((c) => c.startsWith("start "))).toEqual([]);
+  });
+
+  test("a runtime without _snapshot fails the snapshot saying so", async () => {
+    const { host } = await prodBranch();
+    const old = await pinnedBranch(host, "old", "0.0.1");
+    seedDatabase(host, old, 2);
+    // This host's own runtime cannot be trusted, so the pin (from before _snapshot) is all there is.
+    host.sys.own(host.layout.runtimeBinary(VERSION), 0, 0, 0o777);
+    const dest = host.layout.snapshot(old.id, "pre-1");
+    // What every incibase before _snapshot does with it: "Unknown command", exit 64 (CONFIG).
+    host.driver.snapshot = (run) => (host.driver.log(run.unit, 'Unknown command "_snapshot"'), 64);
+    await expect(snapshotDatabase(host, old, dest, ROOT_FILE)).rejects.toThrow(
+      new RegExp(`it exited with 64: the runtime 0\\.0\\.1 it ran \\(${host.layout.runtimeBinary("0.0.1")}\\) has no _snapshot; install a newer one`),
+    );
+    // 78 is never _snapshot's own exit: a binary that does not run it.
+    host.driver.snapshot = () => 78;
+    await expect(snapshotDatabase(host, old, dest, ROOT_FILE)).rejects.toThrow(/it exited with 78: the runtime 0\.0\.1 it ran .* has no _snapshot/);
+    // _snapshot's own 64 (bad arguments) still names both causes.
+    host.driver.snapshot = () => SNAPSHOT_EXIT.USAGE;
+    await expect(snapshotDatabase(host, old, dest, ROOT_FILE)).rejects.toThrow(/it exited with 64 \(bad arguments, or the runtime 0\.0\.1 it ran .* has no _snapshot/);
+    expect(existsSync(dest)).toBe(false);
+    expect(readdirSync(host.layout.branch(old.id).snapshot)).toEqual([]);
   });
 
   test("never writes through the destination's directory entries: the copy is renamed in from backups/", async () => {
@@ -169,18 +287,52 @@ describe("snapshotDatabase: the snapshot unit copies as the branch, root takes t
     expect(strayTemps(host)).toEqual([]);
   });
 
-  test("a sparse staging file just under the size cap is refused, and copies nothing large into backups/", async () => {
+  test("a sparse staging file under the size cap is taken in as a sparse copy that costs no disk", async () => {
     const { host, branch } = await prodBranch();
     seedDatabase(host, branch, 2);
-    // Its apparent size is under the cap (twice a tiny database plus 100 MiB), but it is sparse: no real disk is
-    // allocated. The old st_size-based cap would let root's copy write 64 MiB of real zero blocks into backups/.
+    // 64 MiB that the branch never wrote (holes, behind a valid header): under the cap of twice a tiny database
+    // plus 100 MiB. Root's copy keeps the holes, so it costs backups/ no more disk than the branch's file did.
+    const size = 64 * 1024 * 1024;
     stagingIs(host, (path, b) => {
-      writeFileSync(path, "");
-      truncateSync(path, 64 * 1024 * 1024);
+      writeFileSync(path, sqliteHeader(size));
+      truncateSync(path, size);
       host.sys.own(path, b.os_uid, b.os_uid, 0o600);
     });
-    await expect(snapshotDatabase(host, branch, host.layout.snapshot(branch.id, "pre-1"), ROOT_FILE)).rejects.toThrow(/is sparse \(\d+ bytes allocated of 67108864\)/);
+    const dest = host.layout.snapshot(branch.id, "pre-1");
+    await snapshotDatabase(host, branch, dest, ROOT_FILE);
+    expect(statSync(dest).size).toBe(size);
+    expect(allocated(dest)).toBeLessThan(1024 * 1024);
+    expect(readFileSync(dest).subarray(0, 100).equals(sqliteHeader(size))).toBe(true);
     expect(strayTemps(host)).toEqual([]);
+  });
+
+  test("a database with long runs of zeros round-trips byte for byte, its zeros left as holes", async () => {
+    const { host, branch } = await prodBranch();
+    // 64 KiB pages with zeroblob overflow: every page is 4 bytes of next-page number and then zeros.
+    const path = join(host.layout.branch(branch.id).data, "data.db");
+    const db = new Database(path, { create: true });
+    db.run("PRAGMA page_size = 65536");
+    db.run("PRAGMA journal_mode = WAL");
+    db.run("CREATE TABLE docs (id INTEGER PRIMARY KEY, body BLOB)");
+    for (let i = 0; i < 4; i++) db.run("INSERT INTO docs (body) VALUES (zeroblob(2 * 1024 * 1024))");
+    db.run("INSERT INTO docs (body) VALUES ('not all zeros')");
+    db.close();
+    host.sys.own(path, branch.os_uid, branch.os_uid, 0o600);
+    // The real _snapshot copy, its bytes noted before root takes it in.
+    let staged = "";
+    stagingIs(host, (out, b) => {
+      takeSnapshot(host.layout.branch(b.id).data, out);
+      host.sys.own(out, b.os_uid, b.os_uid, 0o600);
+      staged = sha256Of(out);
+    });
+    const dest = host.layout.snapshot(branch.id, "pre-1");
+    await snapshotDatabase(host, branch, dest, ROOT_FILE);
+    expect(sha256Of(dest)).toBe(staged);
+    expect(statSync(dest).size).toBeGreaterThan(8 * 1024 * 1024);
+    // (Whether those zeros became holes is the file system's call: APFS zero-fills many small holes itself. The
+    // Linux suite checks it on a file system that keeps them.)
+    expect(count(dest)).toBe(5);
+    expect(new Database(dest, { readonly: true }).query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
   });
 
   test("the copy is capped at the branch's INCIBASE_MAX_DB_BYTES, even with free disk to spare", async () => {
@@ -224,6 +376,30 @@ describe("snapshotDatabase: the snapshot unit copies as the branch, root takes t
       host.sys.own(path, b.os_uid, b.os_uid, 0o600);
     });
     await expect(snapshotDatabase(host, branch, host.layout.snapshot(branch.id, "pre-1"), ROOT_FILE)).rejects.toThrow(/its header says \d+ pages/);
+    expect(strayTemps(host)).toEqual([]);
+  });
+
+  test("a snapshot unit that is killed or fails mid-copy leaves its staging dir empty", async () => {
+    const { host, branch } = await prodBranch();
+    seedDatabase(host, branch, 2);
+    const staging = host.layout.branch(branch.id).snapshot;
+    // What a VACUUM INTO killed halfway leaves (OOM, RuntimeMaxSec, a stop, a crash): a partial
+    // snapshot.db.tmp, as large as the database, and its -journal. The job lives on and must clear them.
+    const killedMidCopy = (outcome: { oom: true } | { exit: number }) => (run: FakeRun) => {
+      if (run.kind !== "snapshot") return {};
+      for (const [name, size] of [["snapshot.db.tmp", 1024 * 1024], ["snapshot.db.tmp-journal", 512]] as const) {
+        const p = join(staging, name);
+        writeFileSync(p, Buffer.alloc(size, 0x41));
+        host.sys.own(p, branch.os_uid, branch.os_uid, 0o644);
+      }
+      return outcome;
+    };
+    host.driver.behavior = killedMidCopy({ oom: true });
+    await expect(snapshotDatabase(host, branch, host.layout.snapshot(branch.id, "pre-1"), ROOT_FILE)).rejects.toThrow(/ran out of memory/);
+    expect(readdirSync(staging)).toEqual([]);
+    host.driver.behavior = killedMidCopy({ exit: 1 });
+    await expect(snapshotDatabase(host, branch, host.layout.snapshot(branch.id, "pre-1"), ROOT_FILE)).rejects.toThrow(/exited with 1 \(the copy failed\)/);
+    expect(readdirSync(staging)).toEqual([]);
     expect(strayTemps(host)).toEqual([]);
   });
 
@@ -393,6 +569,36 @@ describe("restoreDatabase is failure-safe and never opens what it replaces", () 
     expect(host.sys.lstat(join(kept!, "data.db-shm"))?.type).toBe("symlink");
     expect(readdirSync(data)).toEqual(["data.db"]);
     expect(count(join(data, "data.db"))).toBe(2);
+  });
+});
+
+describe("the by-fd copy (ingestByFd, LinuxSystem.copyFile)", () => {
+  test("gives back the same bytes, zeros anywhere and any length, and keeps a trailing hole", async () => {
+    const { host } = await prodBranch();
+    const from = join(host.dir, "from.bin");
+    const to = join(host.dir, "to.bin");
+    const M = 1024 * 1024;
+    // Zeros at the start, a run of data across a 4 KiB edge, zeros in the middle, a lone non-zero byte, a length
+    // that is no multiple of the block, and a file that ends in a hole.
+    const fd = openSync(from, "w");
+    writeSync(fd, Buffer.alloc(5000, 0x41), 0, 5000, 3 * M + 1234);
+    writeSync(fd, Buffer.from([7]), 0, 1, 5 * M + 4095);
+    writeSync(fd, Buffer.alloc(3333, 0x42), 0, 3333, 6 * M);
+    closeSync(fd);
+    truncateSync(from, 6 * M + 3333 + 12345);
+    const options = { uid: 501, maxBytes: 64 * M, owner: ROOT_FILE };
+    const platform = { uidOf: () => 501, chown: false };
+    expect(ingestByFd(from, to, options, platform)).toBe(statSync(from).size);
+    expect(statSync(to).size).toBe(statSync(from).size);
+    expect(sha256Of(to)).toBe(sha256Of(from));
+    rmSync(to);
+    // All zeros (here a 256 MiB hole) is still that many bytes, and costs the copy no disk.
+    writeFileSync(from, "");
+    truncateSync(from, 256 * M);
+    ingestByFd(from, to, { ...options, maxBytes: 256 * M }, platform);
+    expect(statSync(to).size).toBe(256 * M);
+    expect(allocated(to)).toBeLessThan(M);
+    expect(sha256Of(to)).toBe(sha256Of(from));
   });
 });
 

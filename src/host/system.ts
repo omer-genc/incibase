@@ -10,6 +10,7 @@ import {
   fchownSync,
   fstatSync,
   fsyncSync,
+  ftruncateSync,
   lchownSync,
   lstatSync,
   mkdirSync,
@@ -51,8 +52,6 @@ export interface FileInfo {
   /** Permission bits with setuid, setgid and sticky (`& 0o7777`). */
   mode: number;
   size: number;
-  /** 512-byte blocks the file system actually allocated (st_blocks): the real disk it uses, never the tenant-settable size. */
-  blocks: number;
   mtimeMs: number;
 }
 
@@ -118,7 +117,7 @@ export interface HostSystem {
   readlink(path: string): string | null;
   /** Writes `content` to a temp file next to `path` with the owner and mode, syncs it and renames it over `path`. */
   writeFile(path: string, content: string, owner: { uid: number; gid: number; mode: number }): void;
-  /** Copies the file `from` (not following a link) the same way, by fd: temp file with owner and mode, fsync, rename. */
+  /** Copies the file `from` (not following a link) the same way, by fd and sparse-preserving: temp file with owner and mode, fsync, rename. */
   copyFile(from: string, to: string, owner: { uid: number; gid: number; mode: number }): void;
   /**
    * Takes in a file a branch controls without trusting its directory entry
@@ -127,8 +126,10 @@ export interface HostSystem {
    * cannot block), checks from that fd that it is a regular file owned by
    * `uid` with one link and at most `maxBytes`, and copies its bytes by fd
    * into `to`, a new file (O_CREAT|O_EXCL|O_NOFOLLOW) that gets `owner` and
-   * an fsync. Throws IngestError and leaves no `to` when it refuses. Returns
-   * the bytes copied.
+   * an fsync. The copy is sparse-preserving (blocks of zeros stay holes), so
+   * a sparse or zero-filled file costs `to` no disk; `maxBytes` bounds how
+   * much root reads. Throws IngestError and leaves no `to` when it refuses.
+   * Returns the bytes copied.
    */
   ingestFile(from: string, to: string, options: IngestOptions): number;
   /** Removes one directory entry with unlink(2): never follows it, never recurses. Missing is fine; a directory throws. */
@@ -198,7 +199,7 @@ function fileInfo(path: string): FileInfo | null {
     throw err;
   }
   const type = st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : st.isFile() ? "file" : "other";
-  return { type, uid: st.uid, gid: st.gid, mode: st.mode & 0o7777, size: st.size, blocks: Number(st.blocks), mtimeMs: st.mtimeMs };
+  return { type, uid: st.uid, gid: st.gid, mode: st.mode & 0o7777, size: st.size, mtimeMs: st.mtimeMs };
 }
 
 /** Names in `dir`, sorted; empty when it does not exist. */
@@ -249,17 +250,44 @@ function describeType(st: Stats): string {
   return st.isDirectory() ? "a directory" : st.isFIFO() ? "a FIFO" : st.isSocket() ? "a socket" : st.isSymbolicLink() ? "a symlink" : "not a regular file";
 }
 
-/** Copies exactly `size` bytes from `src` to `dst` by fd; a source that shrinks or grows meanwhile is refused. */
+/** Blocks of zeros a copy leaves as holes: the usual file system block (4 KiB on ext4, btrfs, xfs and APFS). */
+const SPARSE_BLOCK = 4096;
+const ZERO_BLOCK = Buffer.alloc(SPARSE_BLOCK);
+
+/** Writes `buffer[from, to)` at `position + from` with positional writes, however many calls that takes. */
+function writeAt(fd: number, buffer: Buffer, from: number, to: number, position: number) {
+  for (let at = from; at < to; ) at += writeSync(fd, buffer, at, to - at, position + at);
+}
+
+/**
+ * Copies exactly `size` bytes from `src` to `dst` (new and empty) by fd; a
+ * source that shrinks or grows meanwhile is refused. Sparse-preserving: each
+ * SPARSE_BLOCK that reads as all zeros is skipped (the writes are positional,
+ * so it stays a hole) and `dst` is truncated to `size` at the end, so a run of
+ * zeros costs the copy no disk, whether it was a hole in the source (a
+ * branch's sparse file), zeros the branch really wrote, or a database's empty
+ * pages. The bytes read back are the same either way.
+ */
 function copyBytes(src: number, dst: number, size: number, what: string) {
   const buffer = Buffer.allocUnsafe(Math.min(COPY_CHUNK, Math.max(size, 1)));
   let done = 0;
   while (done < size) {
     const n = readSync(src, buffer, 0, Math.min(buffer.length, size - done), done);
     if (n === 0) throw new IngestError(`${what} shrank while it was copied`);
-    let written = 0;
-    while (written < n) written += writeSync(dst, buffer, written, n - written);
+    let run = -1; // where the current run of non-zero blocks started
+    for (let at = 0; at < n; at += SPARSE_BLOCK) {
+      const end = Math.min(at + SPARSE_BLOCK, n);
+      const zero = buffer.compare(ZERO_BLOCK, 0, end - at, at, end) === 0;
+      if (!zero && run < 0) run = at;
+      else if (zero && run >= 0) {
+        writeAt(dst, buffer, run, at, done);
+        run = -1;
+      }
+    }
+    if (run >= 0) writeAt(dst, buffer, run, n, done);
     done += n;
   }
+  ftruncateSync(dst, size); // the length, and any trailing zeros as a hole
   if (readSync(src, buffer, 0, 1, size) !== 0) throw new IngestError(`${what} grew while it was copied`);
 }
 
@@ -278,11 +306,6 @@ export function ingestByFd(from: string, to: string, options: IngestOptions, pla
     if (uid !== options.uid) throw new IngestError(`${from} is owned by uid ${uid}, not ${options.uid}; refusing to read it`);
     if (st.nlink !== 1) throw new IngestError(`${from} has ${st.nlink} links; refusing to read it`);
     if (st.size > options.maxBytes) throw new IngestError(`${from} is ${st.size} bytes, more than the ${options.maxBytes} allowed; refusing to copy it`);
-    // VACUUM INTO output is dense; a sparse file (its allocated blocks well below st_size) would still copy as
-    // real zero-filled blocks into backups/. Refuse it before a byte is copied, so a branch cannot spend root's
-    // disk through a cheap hole-punched file. (st_blocks is 512-byte units, independent of the file system's block size.)
-    const allocated = Number(st.blocks) * 512;
-    if (st.size > 0 && allocated * 2 < st.size) throw new IngestError(`${from} is sparse (${allocated} bytes allocated of ${st.size}); refusing to copy it`);
     if (options.check) {
       const head = Buffer.alloc(Math.min(100, st.size));
       const n = head.length ? readSync(src, head, 0, head.length, 0) : 0;
