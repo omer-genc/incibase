@@ -7,7 +7,7 @@ Kanıt etiketleri:
 - **[C]** koddan okundu.
 - **[I]** çıkarım; sürümden önce Linux CI e2e ile doğrulanmalı.
 
-> nginx davranışları (connect hatasının `upstream_connect_time="-"` ile ayırt edilmesi, `Set-Cookie Domain=` boşaltma, path blokları) tasarım sırasında gerçek bir nginx ile çalıştırılmadı. Bu yüzden [I] olarak işaretli ve adım 11'de test edilecek.
+> nginx davranışları (connect hatasının `upstream_connect_time="-"` ile ayırt edilmesi, `Set-Cookie Domain=` boşaltma, path blokları) tasarım sırasında gerçek bir nginx ile çalıştırılmadı. Adım 11'de nginx 1.24 ile doğrulandı [P]; bulunan sapmalar §5.4'teki nginx bloğunun altında.
 
 **Özet**
 - Supervisor systemd.
@@ -21,7 +21,7 @@ Kanıt etiketleri:
 
 1. **Servis anahtarı.** `ik_svc_` artık admin kimliği değil; `{admin:false, service:{keyId, scopes}}` olarak tanımlanır. Varsayılan kapsamı `internal`. İptal SIGHUP ile anında yapılır.
 2. **Sırlar fail-closed.** Hosted modda env sırları zorunlu. Meta'da sır bulunursa exit 64.
-3. **Proxy yerine nginx.** Restart boşluğunu istemci retry'ı kapatır. nginx bağlantının kurulamadığını `$upstream_connect_time="-"` ile ayırt eder [I].
+3. **Proxy yerine nginx.** Restart boşluğunu istemci retry'ı kapatır. nginx bağlantının kurulamadığını `$upstream_connect_time="-"` ile ayırt eder [P].
 4. **Yükleme stream edilir.** Kota ve semafor var. Eskiden iki adet 100 MiB yükleme 512M'lik branch'i OOM'a sokuyordu [P].
 5. **Migration.** Sayfalı doğrulama. Production'da snapshot ve MemoryMax altında preflight. Commit sonrası kod otomatik geri alınmaz.
 6. **Restart davranışı.** `RestartSteps` kaldırıldı; 120 s içinde en fazla 8 başlatma. 78 yalnızca incibase'in tespit ettiği tanım hatalarında.
@@ -73,8 +73,8 @@ Kanıt etiketleri:
 | Konu | Seçim | Gerekçe |
 |---|---|---|
 | Süreç modeli | Branch başına bir OS süreci | `globalThis[ID_TABLE_RESOLVER]` son yazanı kazandırır (engine.ts:155) [P]. ESM cache [P]. Senkron SQLite health'i 1,45 s bekletti [P]. Boştaki branch ≈27 MB PSS. |
-| Ön kapı | nginx, statik `server` bloğu, `proxy_pass http://unix:$ib/http.sock:` | Host routing, XFF üzerine yazma, WS, `limit_req`, path blokları [I]. Reload bağlantıları düşürmez. Worker havuzu var. Proxy için ayrı bir L adımı gerekmez. |
-| Restart boşluğu | `@ib_down` yalnızca `upstream_connect_time="-"` iken `503` döner, `x-incibase-unprocessed: 1` ile. İstemci 15 s boyunca jitter'la tekrar dener. | `-` (connect hatası) ile `0.000` (erken kapanma) ayrışıyor [I]. Mutation'ı tekrarlamak güvenli. |
+| Ön kapı | nginx, statik `server` bloğu, `proxy_pass http://unix:$ib/http.sock:` | Host routing, XFF üzerine yazma, WS, `limit_req`, path blokları [P]. Reload bağlantıları düşürmez. Worker havuzu var. Proxy için ayrı bir L adımı gerekmez. |
+| Restart boşluğu | `@ib_down` yalnızca `upstream_connect_time="-"` iken `503` döner, `x-incibase-unprocessed: 1` ile. İstemci 15 s boyunca jitter'la tekrar dener. | `-` (connect hatası) ile `0.000` (erken kapanma) ayrışıyor [P]. Mutation'ı tekrarlamak güvenli. |
 | Kimlik | `ib-<id>`. uid `uid_next` sayacından (70000+) gelir, asla yeniden kullanılmaz. | uid'ler arası EACCES ve EPERM [P]. |
 | Taşıma | `run/http/http.sock`: 2750, grup `incibase-proxy` (`www-data` bu grupta). `run/admin/admin.sock`: grup `incibase-admin`. İkisinde de açık `chmod 0770` ve `idleTimeout: 0`. | Loopback TCP'ye her uid bağlanabilir [P]. Bun soketi 0755 açıyor [P]. |
 | Admin yüzeyi | `--admin-socket` ile ayrılır. `ik_admin_` public tarafta 401. | Admin anahtarı her rotada geçiyor: http.ts:141,204, auth.ts:201-212, mcp.ts:43. |
@@ -121,7 +121,7 @@ Internet ─:443─▶ nginx (TLS, limit_req/limit_conn, JSON log)
 2. `limit_req` uygulanır. İstemcinin gönderdiği `X-Forwarded-*`, `Forwarded`, `X-Real-IP` başlıkları silinir; yerine `$remote_addr` ve `$request_id` yazılır.
 3. İstek unix soket üzerinden keepalive olmadan iletilir.
 4. Branch bearer'ı çözer. `engine.call` deadline ile yarışır; aşılırsa ROLLBACK ve 504.
-5. Yanıttaki `Set-Cookie Domain=` boşaltılır [I]. RFC 6265 §5.2.3'e göre boş Domain yok sayılır [I].
+5. Yanıttaki `Set-Cookie Domain=` boşaltılır [P]. RFC 6265 §5.2.3'e göre boş Domain yok sayılır [I] (tarayıcıda denenmedi). **Bu bir yalıtım değil, en iyi çaba.** nginx 1.24, `Domain`'den önce ya da sonra sekme (HTAB) olan özelliği olduğu gibi bırakır (`;\tDomain=…`, `Domain\t=…`) [P]; RFC 6265 §5.2 bu boşluğu kırptığı için tarayıcı `Domain=incibase.omergenc.net`'i uygular. Tenant'ın httpAction'ı HTML sunup `document.cookie` ile de üst domain'e cookie yazabilir; bunu nginx hiç görmez. Bütün branch'ler aynı kayıtlı domain'in altında olduğundan birbirleriyle same-site'tır, SameSite da ayırmaz. Gerçek çözüm nginx'in dışında: `incibase.omergenc.net`'i Public Suffix List'in private bölümüne eklemek (ya da tenant'ları ayrı kayıtlı domain'lerde sunmak). O zamana kadar bir branch başka branch'lerin (ve üst domain'in) cookie'lerini ayarlayabilir/gölgeleyebilir; cookie'ye dayalı kimlik doğrulama bu yüzden zaten yasak (§4.1 Korunmayanlar).
 6. Restart sırasında 503-unprocessed döner, istemci tekrar dener.
 
 **B. WebSocket.** nginx bağlantıyı tüneller. Sınırlar: IP başına 200, branch başına 5000, `proxy_read_timeout 130s`. Restart'ta istemciye 1012 ulaşır; istemci jitter'la yeniden bağlanıp yeniden abone olur (client.ts:248).
@@ -173,7 +173,7 @@ Internet ─:443─▶ nginx (TLS, limit_req/limit_conn, JSON log)
 | Kötü niyetli release → root | Root yalnızca JSON okur; preflight branch uid'siyle sandbox'ta | test |
 | İnternet → admin | Yalnızca admin.sock; `ik_admin_` 401; path blokları | test |
 | Sızan servis anahtarı | Tek branch, `internal`; impersonation yok; SIGHUP ile iptal | test |
-| Ön kapı DoS | nginx worker'ları, `limit_conn`, `OOMScoreAdjust=-900`, `MemoryMin=64M` | [I] |
+| Ön kapı DoS | nginx worker'ları, `limit_conn`, `OOMScoreAdjust=-900`, `MemoryMin=64M` | limit_req, drop-in [P]; bellek baskısı [I] |
 
 **Korunmayanlar**
 - Branch içi sırlar (loader.ts:84).
@@ -183,6 +183,7 @@ Internet ─:443─▶ nginx (TLS, limit_req/limit_conn, JSON log)
 - nginx'in bearer'ları görmesi.
 - Düz metin `registry.db` (M3).
 - httpAction'larda ambient cookie auth: dokümanda yasaklanır.
+- Branch'ler arası cookie yalıtımı: domain Public Suffix List'e girene kadar yok (§3.2 A adım 5).
 
 ### 4.2 macOS ve testler
 
@@ -300,7 +301,7 @@ IPAddressAllow=127.0.0.53/32
 - Release olmadan drop-in'de `ExecStart` yok; unit `bad-setting` görünür ve başlamaz [P]. `systemctl reset-failed` yüklenmemiş bir instance için 1 ile çıkar, `stop` 5 ile [P].
 - OrbStack container'ında `/run/systemd/system/service.d/zzz-lxc-service.conf` her servis için ProtectSystem, ProtectHome, PrivateDevices, NoNewPrivileges, ReadWritePaths ve ProtectProc'u kapatıyor; SocketBindDeny etkisiz. Etkili olanlar: IPAddressDeny (127.0.0.1 ve 169.254.169.254 zaman aşımı), TemporaryFileSystem, InaccessiblePaths, boş CapabilityBoundingSet [P]. `test/host-systemd.test.ts` hangi direktifin etkisiz olduğunu ve onu neyin kapattığını raporlar; adım 15'teki gerçek VM'de `INCIBASE_TEST_REQUIRE_SANDBOX=1` ile hepsi zorunludur.
 
-**`/etc/nginx/conf.d/incibase.conf`** (branch başına satır içermez):
+**`/etc/nginx/conf.d/incibase.conf`** (branch başına satır içermez; tasarımdaki hali, render edilen tam metin `test/host-nginx.test.ts`'te, farklar aşağıda):
 ```nginx
 map $http_upgrade $ib_conn { default upgrade; "" close; }
 limit_req_zone  $binary_remote_addr zone=ib_ip:20m rate=50r/s;
@@ -308,7 +309,7 @@ limit_req_zone  $binary_remote_addr zone=ib_auth:10m rate=10r/m;
 limit_conn_zone $binary_remote_addr zone=ib_ipc:10m;
 limit_conn_zone $ib_label zone=ib_br:10m;
 server {
-  listen 443 ssl; http2 on;
+  listen 443 ssl http2;
   server_name ~^(?<ib_label>[a-z0-9-]+--[a-z0-9-]+)\.apps\.example\.net$;
   set $ib /var/lib/incibase/hosts/$ib_label;
   if (!-d $ib) { return 404; }
@@ -326,7 +327,7 @@ server {
   location = /api/storage/upload { client_max_body_size 101m; proxy_request_buffering off; proxy_pass http://unix:$ib/http.sock:; }
   location / { proxy_pass http://unix:$ib/http.sock:; }
   location @ib_down {
-    if ($upstream_connect_time != "-") { return 502; }
+    if ($upstream_connect_time != "-") { add_header Access-Control-Allow-Origin * always; return 502; }
     add_header Access-Control-Allow-Origin * always; add_header Access-Control-Expose-Headers x-incibase-unprocessed always;
     add_header Access-Control-Allow-Headers "authorization, content-type, x-incibase-as-user" always;
     add_header Retry-After 1 always; add_header x-incibase-unprocessed 1 always;
@@ -336,7 +337,7 @@ server {
 }
 ```
 
-`@ib_down` CORS başlıklarını kendisi ekler ve OPTIONS'a 204 döner. Bu olmasa tarayıcı, restart sırasında preflight'ı başarısız sayar ve istemci yalnızca bir `TypeError` görür; 503'ü hiç okuyamaz [I, CI'da test edilecek].
+`@ib_down` CORS başlıklarını kendisi ekler ve OPTIONS'a 204 döner [P]. Bu olmasa tarayıcı, restart sırasında preflight'ı başarısız sayar ve istemci yalnızca bir `TypeError` görür; 503'ü hiç okuyamaz.
 
 Ayrıca render edilenler:
 - Sertifika.
@@ -345,6 +346,31 @@ Ayrıca render edilenler:
 - Cloudflare için `real_ip_header`.
 - Alias `server` blokları.
 - nginx için `OOMScoreAdjust=-900` drop-in'i.
+
+**Adım 11'de doğrulanan sapmalar** (OrbStack Ubuntu 24.04, nginx 1.24.0; `test/host-nginx-linux.test.ts`, kök `/var/lib/incibase-n11`, kendinden imzalı `*.incibase.omergenc.net` sertifikası, gerçek bir dev branch'i, `curl --resolve` ile https):
+- **`@ib_down`'daki `if` bloğu location'ın `add_header`'larını miras alıyor** [P]. Tasarımdaki haliyle, kabul edip erken kapanan bir upstream'in 502'si de `x-incibase-unprocessed: 1` ve `Retry-After: 1` taşıyordu; istemci, işlenmiş olabilecek bir mutation'ı yeniden gönderirdi. `if` bloğuna kendi `add_header`'ı (`Access-Control-Allow-Origin *`) kondu: miras kesilir, tarayıcı 502'yi okuyabilir, unprocessed işareti yok [P].
+- `$upstream_connect_time`: soket dosyası yokken (durdurulmuş branch) ve dosya kalmış ama dinleyen yokken (ECONNREFUSED, SIGKILL sonrası) `-` → 503-unprocessed; kabul edip kapatan upstream `0.000` → 502 [P]. Her ikisinde `$upstream_status` 502.
+- `http2 on;` nginx 1.25.1'de geldi; Ubuntu 24.04'ün 1.24'ü için `listen … ssl http2` yazılıyor (yenilerde yalnızca uyarı) [P].
+- `proxy_cookie_domain ~.+ ""` özelliği silmiyor, boşaltıyor: `sid=1; Domain=; Path=/; HttpOnly` [P]. Boş Domain'in yok sayılması RFC 6265 §5.2.3'e dayanır, tarayıcıda denenmedi [I]. Sekmeli biçimler (`c6=1; Path=/;\tDomain=…`, `c8=1; Path=/; Domain\t=…`) değişmeden geçiyor [P]; Linux testi bunu bilinen açık olarak olduğu gibi doğrular. Yalıtım değil (§3.2 A adım 5).
+- Bilinmeyen SNI, SNI'siz (IP ile) bağlantı, çıplak domain ve `deploy.<domain>`: `ssl_reject_handshake`, curl çıkış 35 "unrecognized name" [P]. Bilinmeyen label (`nope--shop`) 404 JSON [P]. Branch'in SNI'siyle gelip başka Host gönderen istek default server'a düşer ve `444` ile kapanır.
+- Path blokları `$uri` (çözülmüş, birleştirilmiş eğik çizgi) üzerinde eşleştiği için `/%5F/` ve `/api//admin/x` de nginx'te 404 [P]; access log'da upstream boş. `/_foo` branch'e gider.
+- Uygulamanın gördüğü: `X-Forwarded-For: 127.0.0.1` (istemcinin `6.6.6.6`'sı değil), `X-Forwarded-Proto: https`, kendi `Host`'u, 32 hex `x-request-id` (istemcininki değil), `Connection: close`; `X-Real-IP`, `Forwarded`, `X-Forwarded-Host`, `CF-Connecting-IP` yok [P]. Silinen başlıklar listesi genişletildi: `X-Forwarded-Host/Port/Prefix/Server/Scheme/Ssl`, `X-Client-IP`, `True-Client-IP`, `CF-Connecting-IP`. `X-Accel-Redirect` ve benzerleri yok sayılır: tenant nginx'e başka bir şey sundurmaz.
+- nginx'te zone, `map` değişkeni ve `log_format` adları globaldir: önekten türetilir (`incibase_ip`, `$incibase_connection`, `incibase_json`; `incibase-n11` öneki için `incibase_n11_…`), böylece iki host bir nginx'i **yalnızca farklı portlarda** paylaşabilir: her host kendi portu için `ssl_reject_handshake`'li `default_server`'ı render eder, aynı portta ikincisi tüm config testinde "a duplicate default server" ile reddedilir ve eski dosyası kalır. `$ib`/`$ib_label` paylaşılabiliyor.
+- **Log izinleri.** nginx (adayın `nginx -t`'si de) olmayan bir log dosyasını root 0644 açıyor; branch sandbox'ı `/var/log`'u gizlemediği için her tenant başka tenant'ların istek meta verisini (IP, label, path, request id) okuyabiliyordu. Render ve aday testi artık `<önek>.access.log` ve `<önek>.error.log`'u nginx açmadan önce logrotate'in yaptığı gibi `www-data:adm 0640` oluşturuyor, sapınca düzeltiyor; branch unit'ine ayrıca `InaccessiblePaths=-/var/log/nginx` eklendi. Branch uid'si iki log'da da Permission denied alıyor, branch'in mount namespace'inde `/var/log/nginx` boş [P].
+- **Error log'da query string.** Access log query string'i atıyor ama nginx'in error log'u her başarısız connect'te ([crit]/[error]) istek satırını query string'le yazıyordu (yükleme token'ları). Server bloğunun kendi `error_log <önek>.error.log alert;`'i var; bu hatalar access log'da query'siz zaten var (status, upstream, connect). Durdurulmuş branch'e `?token=…` ile yükleme: token hiçbir log'da yok [P]. Uzun vadede token header'a taşınmalı.
+- **nginx'in kendi 429/413'ü.** `limit_req`/`limit_conn` 429'u ve `client_max_body_size` 413'ü nginx'in HTML sayfasıydı, CORS'suz; tarayıcı yalnızca `TypeError` görüyordu. `error_page 429 = @ib_limited` ve `error_page 413 = @ib_too_large`: serve'ün biçiminde JSON (`RATE_LIMITED`, `PAYLOAD_TOO_LARGE`), CORS başlıkları, `x-request-id`, 429'da `Retry-After` (auth yollarında 6, diğerlerinde 1); sınıra takılan bir preflight 204 alır, böylece tarayıcı asıl isteğin 429'unu okuyabilir [P]. Preflight'lar auth zone'unu harcamıyor (`OPTIONS` için anahtar boş): her sign-in'den önce preflight ile 10 deneme yine 6 geçti, 4 × 429 [P].
+- **IPv6 /64.** Zone'lar `$binary_remote_addr` (IPv6'da /128) yerine `map $remote_addr $<önek>_client` ile IPv4 adresine ve IPv6'nın /64'üne göre sayıyor; nginx'in sıkıştırılmış yazımının (`::`) her biçimi için kurallar `CLIENT_KEY_MAP`'te, macOS testi nginx'in `ngx_inet6_ntop`'unu taklit eden 20 000 rastgele adresle doğruluyor. Aynı /64'ten iki adresle dönüşümlü 8 sign-in: 6 geçti, 2 × 429; sonraki /64'ün kendi bütçesi var [P].
+- Yükleme stream'i artık nginx worker'larının `/var/lib/nginx/body/` altında açık tuttuğu (silinmiş) dosyalara bakarak doğrulanıyor (error log artık `alert` seviyesinde): `/api/mutation`'a yavaş 1,5 MB'lık kontrol isteği spool'lanıyor, 50 MB'lık yükleme hiç spool'lanmıyor [P].
+- `limit_conn` (IP başına 200, branch başına 5000) yalnız `/api/ws`'te değil server düzeyinde, `limit_conn_status 429`. Auth location'ında iki zone birden; ardışık 10 sign-in: 6'sı geçti (1 + burst 5), sonrası 429 [P].
+- WebSocket: nginx üzerinden `101 Switching Protocols` ve iki yönlü mesaj [P].
+- 50 MB yükleme 200 döndü, gövde stream edildi (spool kontrolü aşağıda) [P]. Başka bir yola 3 MB gövde 413, JSON `PAYLOAD_TOO_LARGE` ve CORS ile [P].
+- `trust_proxy=cloudflare`: aralıklar kodda sabit (`CLOUDFLARE_RANGES`, cloudflare.com/ips-v4 ve ips-v6'dan 2026-10-23'te alındı; güncelleme komutu sonra, adım 13). Cloudflare dışından gelen `CF-Connecting-IP`'ye inanılmıyor [P]; Cloudflare üzerinden gerçek istek adım 15'te.
+- Render sırası: aday dosya, yalnızca onu içeren küçük bir ana config ile `nginx -t -c` (control/nginx/ altında); geçerse atomik olarak yerine konur ve tüm config `nginx -t`; o da geçmezse eski dosya (ve `setFrontDoor`'da registry) geri gelir [P]: port 80 denemesi "a duplicate default server for 0.0.0.0:80" ile reddedildi, nginx eski dosyayla sundu. nginx yalnızca dosya (ya da www-data'nın grupları) değiştiğinde reload edilir; değişiklik yoksa worker PID'leri aynı [P].
+- `www-data` `incibase-proxy` grubuna `usermod --append` ile girer; reload'da master yeni worker'lar için `initgroups()` çağırdığından restart gerekmez (worker'ların `Groups:` satırında gid var) [P].
+- nginx drop-in'i `nginx.service.d/50-<önek>.conf`: `OOMScoreAdjust=-900`, `MemoryMin=64M`. OOMScoreAdjust master başlarken uygulanır; drop-in değişince nginx restart edilir (bir kez, init'te). OrbStack'te master'ın `oom_score_adj`'ı -900 oldu [P].
+- TLS (reçete A): `host init --tls-cert/--tls-key` (ops `initHost` `tlsCert`/`tlsKey`, sonra `setTls`). Sertifika `*.<domain>`'i kapsamalı, anahtar eşleşmeli, süresi geçerli olmalı. `<kök>/tls/` (root 0700) altına çiftin sha256'sından `<sha16>.crt` (0644) ve `.key` (0600) olarak kopyalanır; registry `tls_cert`/`tls_key` ancak aday nginx testinden geçince değişir. Rotation = yeni çift + test + reload, sonra eski çift silinir; nginx yarım bir rotation görmez [P] (yeni parmak izi sunuldu, worker'lar yenilendi).
+- Alias `server` blokları bu adımda yok: registry'de alias tablosu yok (§11'deki kesme listesinde).
+- Ayarlar: `domain`, `trust_proxy` (`none`|`cloudflare`), `tls_cert`, `tls_key`, `https_port` (varsayılan 443; testler kendi portunu kullanır). Op'lar: `setTls`, `setFrontDoor`, `renderNginx`; `render` sonda nginx'i de render eder, hatası raporda `nginx.error` olur.
 
 ---
 
@@ -364,6 +390,7 @@ Ayrıca render edilenler:
       run/http/   ib-<id>:incibase-proxy 2750;  run/admin/  ib-<id>:incibase-admin 2750
   backups/<id>/pre-<seq>.db  root 0600    (production, son 3)
   trash/     root 0700                    yalnızca production silmeleri, 7 gün
+  tls/       root 0700                    <sha16>.crt 0644, <sha16>.key 0600 (nginx'in sunduğu çift)
 ```
 
 ---

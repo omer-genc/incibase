@@ -29,6 +29,7 @@ import {
   NameError,
   randomBytes,
 } from "./names.ts";
+import * as nginx from "./nginx.ts";
 import * as provision from "./provision.ts";
 import { currentActor, RegistryLockedError, type BranchRow, type ReleaseRow, type ServiceKeyRow } from "./registry.ts";
 import { cleanupPreflight, followJob, gateBranch, newGeneration, recoverSwitchedBranch, stageRelease, startJob, type GateResult } from "./release.ts";
@@ -148,17 +149,61 @@ const initSchema = z.strictObject({
   tunnelPortBase: z.number().int().optional(),
   /** incibase.slice MemoryMax; default: the machine's memory less 1 GiB (at least 512 MiB). */
   sliceMemoryMax: z.number().int().min(256 * MiB).optional(),
+  ...frontDoorFields(),
 });
 
-/** The registry settings, host tree and units of `host init` (the parts this layer owns); safe to run again. */
+/** The front door's inputs (nginx.ts): the certificate pair to copy, a proxy to trust, the port. */
+function frontDoorFields() {
+  return {
+    tlsCert: z.string().min(1).max(4096).optional(),
+    tlsKey: z.string().min(1).max(4096).optional(),
+    trustProxy: z.enum(nginx.TRUST_PROXY).optional(),
+    httpsPort: z.number().int().min(1).max(65535).optional(),
+  };
+}
+
+/** nginx.ts refuses with FrontDoorError; ops speak OpError. */
+async function frontDoor<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof nginx.FrontDoorError) throw new OpError(err.code, err.message);
+    throw err;
+  }
+}
+
+/** The registry settings, host tree and units of `host init` (the parts this layer owns), and the front door with TLS; safe to run again. */
 export async function initHost(ctx: OpsContext, input: z.input<typeof initSchema>) {
-  const settings = parse(initSchema, input);
+  const { tlsCert, tlsKey, trustProxy, httpsPort, ...settings } = parse(initSchema, input);
+  if ((tlsCert === undefined) !== (tlsKey === undefined)) throw new OpError("INVALID", "tlsCert and tlsKey go together");
   return audited(ctx, "host.init", null, async () => {
     const sliceMemoryMax = settings.sliceMemoryMax ?? Math.max(512 * MiB, Math.floor((totalmem() - 1024 * MiB) / MiB) * MiB);
     await provision.initHost(ctx, { ...settings, sliceMemoryMax });
     await ctx.registry.withLock(() => ctx.registry.audit({ actor: actor(ctx), action: "host.init", detail: { domain: settings.domain }, ok: true }, now(ctx)));
-    return { domain: ctx.registry.getSetting("domain"), layout: ctx.layout.saved() };
+    const front = await frontDoor(() => nginx.initFrontDoor(ctx, { tlsCert, tlsKey, trustProxy, httpsPort }));
+    return { domain: ctx.registry.getSetting("domain"), layout: ctx.layout.saved(), ...(front ? { frontDoor: front } : {}) };
   });
+}
+
+const tlsSchema = z.strictObject({ cert: z.string().min(1).max(4096), key: z.string().min(1).max(4096) });
+
+/** Installs or rotates the front door's certificate: copied, tested with nginx, then nginx reloads (nginx.ts). */
+export async function setTls(ctx: OpsContext, input: z.input<typeof tlsSchema>) {
+  const data = parse(tlsSchema, input);
+  return audited(ctx, "nginx.tls", null, () => frontDoor(() => nginx.setTls(ctx, data)));
+}
+
+const frontDoorSchema = z.strictObject({ trustProxy: frontDoorFields().trustProxy, httpsPort: frontDoorFields().httpsPort });
+
+/** Changes trust_proxy or the HTTPS port and renders the front door; nginx refusing it changes nothing. */
+export async function setFrontDoor(ctx: OpsContext, input: z.input<typeof frontDoorSchema>) {
+  const data = parse(frontDoorSchema, input);
+  return audited(ctx, "nginx.set", null, () => frontDoor(() => nginx.setFrontDoor(ctx, data)));
+}
+
+/** Renders the nginx front door alone (also part of `render`). */
+export async function renderNginx(ctx: OpsContext, _input: Record<string, never> = {}) {
+  return audited(ctx, "nginx.render", null, () => frontDoor(() => nginx.renderNginx(ctx)));
 }
 
 /**
@@ -199,18 +244,20 @@ export async function render(ctx: OpsContext, _input: Record<string, never> = {}
       if (current && current.status === "interrupted" && current.generation) await recoverSwitchedBranch(ctx, id);
     }
     const report = await provision.renderHost(ctx);
+    // The front door last: nginx keeps its previous file when the new one fails.
+    const front: nginx.NginxReport | { error: string } = await nginx.renderNginx(ctx).catch((err: Error) => ({ error: err.message }));
     await ctx.registry.withLock(() =>
       ctx.registry.audit(
         {
           actor: actor(ctx),
           action: "host.render",
-          detail: { ...report, rendered: report.rendered.length, interrupted },
-          ok: report.failed.length === 0,
+          detail: { ...report, rendered: report.rendered.length, interrupted, nginx: "error" in front ? { error: front.error.slice(0, 500) } : front.action },
+          ok: report.failed.length === 0 && !("error" in front),
         },
         now(ctx),
       ),
     );
-    return { ...report, interrupted };
+    return { ...report, interrupted, nginx: front };
   });
 }
 
@@ -861,6 +908,9 @@ export async function logs(ctx: OpsContext, input: z.input<typeof logsSchema>) {
 export const OPS = {
   initHost,
   render,
+  renderNginx,
+  setTls,
+  setFrontDoor,
   installRuntime,
   gcTrash,
   createProject,
