@@ -37,7 +37,7 @@ describe("registry database", () => {
     expect(statSync(registry.layout.control).mode & 0o777).toBe(0o700);
     expect((registry.db.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("wal");
     const tables = (registry.db.query(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`).all() as { name: string }[]).map((r) => r.name);
-    expect(tables).toEqual(["alerts", "audit_log", "branches", "env", "projects", "releases", "service_keys", "settings"]);
+    expect(tables).toEqual(["alerts", "audit_log", "branches", "env", "projects", "releases", "runtimes", "service_keys", "settings"]);
     const columns = (registry.db.query(`PRAGMA table_info(branches)`).all() as { name: string }[]).map((r) => r.name);
     for (const c of ["phase", "desired_state", "release_seq", "runtime_version", "busy_unit", "s3_prefix", "limits_json", "config_json", "os_uid", "tunnel_port", "label"]) {
       expect(columns).toContain(c);

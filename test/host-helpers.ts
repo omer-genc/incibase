@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { manifestLine, sha256Hex, type BundleManifest } from "../src/engine/manifest.ts";
@@ -109,8 +109,11 @@ export async function fakeOpsHost(options: { unitPrefix?: string } = {}): Promis
     root: join(dir, "root"),
     runtimeRoot: join(dir, "runtime"),
     systemdDir: join(dir, "systemd"),
+    // Never the machine's own incibase on PATH.
+    cliLink: join(dir, "bin", "incibase"),
     ...(options.unitPrefix ? { unitPrefix: options.unitPrefix } : {}),
   });
+  mkdirSync(join(dir, "bin"));
   const sys = new FakeSystem();
   const driver = new FakeDriver(layout);
   let t = 1_800_000_000_000;
@@ -136,7 +139,7 @@ export async function fakeOpsHost(options: { unitPrefix?: string } = {}): Promis
   await ops.initHost(ctx, { domain: "incibase.example.net", timezone: "Europe/Istanbul", uidBase: 70000, sliceMemoryMax: 3 * 1024 ** 3 });
   const binary = join(dir, "incibase-bin");
   writeFileSync(binary, `#!/bin/sh\necho ${VERSION}\n`, { mode: 0o755 });
-  await ops.installRuntime(ctx, { binary, version: VERSION });
+  await ops.installRuntime(ctx, { binary, version: VERSION, sha256: sha256Hex(readFileSync(binary)) });
   Object.assign(ctx, {
     dir,
     lines,

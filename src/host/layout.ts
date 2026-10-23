@@ -18,8 +18,10 @@
 //     trash/                      root 0700
 //
 // Outside the root: the runtimes (`<runtime root>/<version>/incibase`, root
-// 0755) and the systemd units (design section 5.4), named after a unit
-// prefix: `incibase-branch@.service`, `incibase-preflight@.service`,
+// 0755, recorded with their sha256 in the registry), the CLI link
+// (`/usr/local/bin/incibase` -> one of them, `host use-cli`) and the
+// systemd units (design section 5.4), named after a unit prefix:
+// `incibase-branch@.service`, `incibase-preflight@.service`,
 // `incibase.slice`, per-branch drop-ins and the transient
 // `incibase-release-<id>-<seq>` jobs. A test host picks its own prefix, so
 // hosts sharing a machine never touch each other's units.
@@ -29,6 +31,8 @@ import { branchUser, checkBranchId, checkLabel, NameError } from "./names.ts";
 export const DEFAULT_ROOT = "/var/lib/incibase";
 export const DEFAULT_RUNTIME_ROOT = "/usr/local/lib/incibase";
 export const DEFAULT_SYSTEMD_DIR = "/etc/systemd/system";
+/** The `incibase` on PATH; `host use-cli` points it at an installed runtime. */
+export const DEFAULT_CLI_LINK = "/usr/local/bin/incibase";
 export const DEFAULT_UNIT_PREFIX = "incibase";
 export const DEFAULT_GROUPS = { proxy: "incibase-proxy", admin: "incibase-admin" } as const;
 /** Runtime versions as `incibase --version` prints them; they name directories. */
@@ -56,6 +60,8 @@ export interface LayoutOptions {
   systemdDir?: string;
   /** What unit names start with (default `incibase`). */
   unitPrefix?: string;
+  /** The `incibase` command `host use-cli` points at a runtime (default /usr/local/bin/incibase). */
+  cliLink?: string;
 }
 
 /** The layout options a host keeps in its registry, so every later command (and job) builds the same layout. */
@@ -64,6 +70,8 @@ export interface SavedLayout {
   systemdDir: string;
   unitPrefix: string;
   groups: { proxy: string; admin: string };
+  /** Only when it is not the default, so layouts saved before it existed still compare equal. */
+  cliLink?: string;
 }
 
 export function checkRuntimeVersion(value: unknown): string {
@@ -142,12 +150,14 @@ export class HostLayout {
   /** Held by a running `host check`, so a manual run never overlaps the timer's. */
   readonly checkLock: string;
   readonly systemdDir: string;
+  readonly cliLink: string;
   readonly units: UnitNames;
 
   constructor(options: LayoutOptions = {}) {
     this.root = checkRoot(options.root ?? DEFAULT_ROOT, "The host root");
     this.runtimeRoot = checkRoot(options.runtimeRoot ?? DEFAULT_RUNTIME_ROOT, "The runtime root");
     this.systemdDir = checkRoot(options.systemdDir ?? DEFAULT_SYSTEMD_DIR, "The systemd unit directory");
+    this.cliLink = checkRoot(options.cliLink ?? DEFAULT_CLI_LINK, "The CLI link");
     const prefix = checkUnitPrefix(options.unitPrefix ?? DEFAULT_UNIT_PREFIX);
     this.units = {
       prefix,
@@ -186,7 +196,13 @@ export class HostLayout {
 
   /** What the registry keeps so later commands rebuild this layout from the root alone. */
   saved(): SavedLayout {
-    return { runtimeRoot: this.runtimeRoot, systemdDir: this.systemdDir, unitPrefix: this.units.prefix, groups: { ...this.groups } };
+    return {
+      runtimeRoot: this.runtimeRoot,
+      systemdDir: this.systemdDir,
+      unitPrefix: this.units.prefix,
+      groups: { ...this.groups },
+      ...(this.cliLink === DEFAULT_CLI_LINK ? {} : { cliLink: this.cliLink }),
+    };
   }
 
   /** `<runtime root>/<version>/incibase`. */

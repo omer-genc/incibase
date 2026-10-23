@@ -41,7 +41,15 @@ jobs:
           --target bun-linux-x64 --target bun-linux-arm64
           --target bun-darwin-x64 --target bun-darwin-arm64
           --target bun-windows-x64
+      # `incibase host install-runtime --version` downloads incibase-linux-<arch> and refuses it unless
+      # its entry here matches (sha256sum format, plain file names).
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum incibase-* > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
       - name: GitHub Release
-        run: gh release create "$GITHUB_REF_NAME" dist/incibase-* --generate-notes ${{ steps.channel.outputs.gh_flags }}
+        run: gh release create "$GITHUB_REF_NAME" dist/incibase-* dist/SHA256SUMS --generate-notes ${{ steps.channel.outputs.gh_flags }}
         env:
           GH_TOKEN: ${{ github.token }}

@@ -39,6 +39,10 @@ import { check, ensureCheckTimer } from "./check.ts";
 import { doctor } from "./doctor.ts";
 
 export { check, doctor, setSetting };
+// runtime.ts uses this module's helpers inside its functions only, so the import cycle is safe either way round.
+import { gc, gcRuntimes, installRuntime, listRuntimes, requireInstalled, useCli } from "./runtime.ts";
+
+export { gc, gcRuntimes, installRuntime, listRuntimes, useCli };
 
 /** Why an op refused: `code` for M4's HTTP mapping, the message for people. */
 export class OpError extends Error {
@@ -75,7 +79,7 @@ const confirm = z.string().max(300).optional();
 /** Printable text without control characters. */
 const label = z.string().min(1).max(64).regex(/^[^\u0000-\u001f\u007f-\u009f]+$/, "must not contain control characters");
 
-function parse<S extends z.ZodType>(schema: S, input: unknown): z.output<S> {
+export function parse<S extends z.ZodType>(schema: S, input: unknown): z.output<S> {
   const result = schema.safeParse(input);
   if (!result.success) {
     const issue = result.error.issues[0]!;
@@ -85,7 +89,7 @@ function parse<S extends z.ZodType>(schema: S, input: unknown): z.output<S> {
 }
 
 /** Runs an op; a refusal or failure is audited with ok = 0 (not a bad input or a lock timeout). */
-async function audited<T>(ctx: OpsContext, action: string, branchId: string | null, fn: () => Promise<T>): Promise<T> {
+export async function audited<T>(ctx: OpsContext, action: string, branchId: string | null, fn: () => Promise<T>): Promise<T> {
   try {
     return await fn();
   } catch (err) {
@@ -272,40 +276,6 @@ export async function render(ctx: OpsContext, _input: Record<string, never> = {}
   });
 }
 
-const runtimeSchema = z.strictObject({ binary: z.string().min(1).max(4096), version: checked(checkRuntimeVersion) });
-
-/**
- * Installs an incibase standalone binary as `<runtime root>/<version>/incibase`
- * (root 0755), after checking that it says it is that version.
- */
-export async function installRuntime(ctx: OpsContext, input: z.input<typeof runtimeSchema>) {
-  const { binary, version } = parse(runtimeSchema, input);
-  return audited(ctx, "runtime.install", null, async () => {
-    const { sys, layout } = ctx;
-    if (sys.lstat(binary)?.type !== "file") throw new OpError("INVALID", `${binary} is not a file`);
-    return ctx.registry.withLock(() => {
-      for (const dir of [layout.runtimeRoot, layout.runtimeDir(version)]) {
-        if (!sys.lstat(dir)) sys.mkdir(dir, 0o755);
-        sys.chown(dir, 0, 0);
-        sys.chmod(dir, 0o755);
-      }
-      const path = layout.runtimeBinary(version);
-      const temp = `${path}.new`;
-      sys.copyFile(binary, temp, { uid: 0, gid: 0, mode: 0o755 });
-      // The runtime is the platform's own code (root runs incibase already); it is asked its version before it is used.
-      const result = Bun.spawnSync([temp, "--version"], { stdin: "ignore", stdout: "pipe", stderr: "pipe", env: { PATH: "/usr/bin:/bin" } });
-      const said = result.stdout.toString().trim();
-      if (result.exitCode !== 0 || said !== version) {
-        sys.remove(temp);
-        throw new OpError("INVALID", `${binary} says it is ${JSON.stringify(said || result.stderr.toString().trim())}, not ${version}`);
-      }
-      sys.rename(temp, path);
-      ctx.registry.audit({ actor: actor(ctx), action: "runtime.install", detail: { version, path }, ok: true }, now(ctx));
-      return { version, path };
-    });
-  });
-}
-
 const gcSchema = z.strictObject({ olderThanDays: z.number().min(0).max(3650).default(7) });
 
 /** Removes production data that deleted branches left in trash/ longer ago than `olderThanDays` (7). */
@@ -361,6 +331,7 @@ export async function createBranch(ctx: OpsContext, input: z.input<typeof create
   return audited(ctx, "branch.create", null, async () => {
     if (!ctx.registry.getProject(data.project)) throw new OpError("NOT_FOUND", `No project ${data.project}: create it first`);
     if (ctx.registry.findBranch(data.project, data.name)) throw new OpError("CONFLICT", `Branch ${branchRef(data.project, data.name)} already exists`);
+    if (data.runtimeVersion !== undefined) requireInstalled(ctx, data.runtimeVersion);
     return provision.createBranch(ctx, { ...data, runtimeVersion: data.runtimeVersion ?? VERSION });
   });
 }
@@ -609,12 +580,11 @@ export async function upgradeBranch(ctx: OpsContext, input: z.input<typeof upgra
   const data = parse(upgradeSchema, input);
   const existing = findBranch(ctx, data);
   return audited(ctx, "branch.upgrade", existing.id, async () => {
-    if (ctx.sys.lstat(ctx.layout.runtimeBinary(data.runtimeVersion))?.type !== "file") {
-      throw new OpError("NOT_FOUND", `The runtime ${data.runtimeVersion} is not installed: installRuntime first`);
-    }
+    requireInstalled(ctx, data.runtimeVersion);
     if (existing.runtime_version === data.runtimeVersion) return { branch: existing, unit: null, ok: true };
     if (existing.release_seq === null) {
       const { branch } = await changeBranch(ctx, data, (branch) => {
+        requireInstalled(ctx, data.runtimeVersion);
         ctx.registry.updateBranch(branch.id, { runtime_version: data.runtimeVersion }, now(ctx));
         ctx.registry.audit({ actor: actor(ctx), action: "branch.upgrade", branchId: branch.id, detail: { from: branch.runtime_version, to: data.runtimeVersion }, ok: true }, now(ctx));
       });
@@ -622,6 +592,7 @@ export async function upgradeBranch(ctx: OpsContext, input: z.input<typeof upgra
     }
     const unit = await ctx.registry.withLock(() => {
       const branch = idle(findBranch(ctx, data));
+      requireInstalled(ctx, data.runtimeVersion); // again under the lock: gcRuntimes may have removed it meanwhile
       const n = now(ctx);
       const unit = ctx.layout.units.job("upgrade", branch.id, n);
       ctx.registry.tx(() => {
@@ -923,7 +894,11 @@ export const OPS = {
   setTls,
   setFrontDoor,
   installRuntime,
+  listRuntimes,
+  useCli,
   gcTrash,
+  gcRuntimes,
+  gc,
   createProject,
   createBranch,
   setBranch,
