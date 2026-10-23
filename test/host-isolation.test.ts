@@ -20,12 +20,23 @@
 // InaccessiblePaths, the empty capability set, the file owners and modes and
 // the per-branch keys hold on both and are always required.
 //
+// The network probes have positive controls: a timeout is also what a probe
+// gets when nothing is there and no filter exists, so it proves nothing on
+// its own. For each IPAddressDeny entry root listens on an address in it
+// (127.0.0.1 and ::1, the rest on a dummy interface), the branch's own uid
+// connects from outside the sandbox before and after, and only then does the
+// branch's failure to connect count as ENFORCED; a target the control cannot
+// reach is INCONCLUSIVE (a failure on a VM). The connects go through libc, so
+// the result is the kernel's errno: Bun.connect reports ENETUNREACH as
+// ECONNREFUSED, which would read as a peer answering.
+//
 // Skipped unless INCIBASE_TEST_HOST=1 on Linux as root; needs
 // INCIBASE_TEST_BINARY, a standalone incibase for this machine
 // (`bun scripts/build-binary.ts`). Uses its own host root
 // (INCIBASE_TEST_HOST_ROOT, default /var/lib/incibase-iso15), uid base
-// (INCIBASE_TEST_UID_BASE, default 82000), unit prefix, groups and runtime
-// root named after the root, and removes everything it created.
+// (INCIBASE_TEST_UID_BASE, default 82000), unit prefix, groups, runtime root
+// and dummy interface named after the root and uid base, and removes
+// everything it created.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -35,6 +46,7 @@ import { runDoctor, systemdFeature } from "../src/host/doctor.ts";
 import { DEFAULT_ROOT, HostLayout } from "../src/host/layout.ts";
 import * as ops from "../src/host/ops.ts";
 import { Registry, type BranchRow } from "../src/host/registry.ts";
+import { IP_ADDRESS_DENY } from "../src/host/render.ts";
 import { LinuxSystem } from "../src/host/system.ts";
 
 const enabled = process.env.INCIBASE_TEST_HOST === "1" && process.platform === "linux" && process.getuid?.() === 0;
@@ -56,6 +68,148 @@ const SLOW = 300_000;
 /** zzz-lxc-service.conf turns ProtectSystem/ProtectProc/NoNewPrivileges off; on a VM it is absent. */
 const LXC_OVERRIDE = "/run/systemd/system/service.d/zzz-lxc-service.conf";
 
+/**
+ * The network probes' targets, one or more per IPAddressDeny entry (`range`).
+ * The ones with a `cidr` go on a dummy interface named and numbered after the
+ * uid base, so two test hosts on one machine do not collide; each is a /32 or
+ * /128 (the IPv6 link-local a /64 on the dummy alone), so no route the
+ * machine uses changes. 169.254.250.x stands in for the metadata address.
+ */
+const NET_IF = `ibnet${UID_BASE}`.slice(0, 15);
+const NET_N = Math.floor(UID_BASE / 1000) % 256;
+const NET_HEX = NET_N.toString(16);
+const NET_TARGETS: { key: string; range: string; host: string; cidr?: string }[] = [
+  { key: "loopback4", range: "localhost", host: "127.0.0.1" },
+  { key: "loopback6", range: "localhost", host: "::1" },
+  { key: "private10", range: "10.0.0.0/8", host: `10.250.${NET_N}.1`, cidr: `10.250.${NET_N}.1/32` },
+  { key: "private172", range: "172.16.0.0/12", host: `172.31.250.${NET_N}`, cidr: `172.31.250.${NET_N}/32` },
+  { key: "private192", range: "192.168.0.0/16", host: `192.168.250.${NET_N}`, cidr: `192.168.250.${NET_N}/32` },
+  { key: "cgnat", range: "100.64.0.0/10", host: `100.127.${NET_N}.1`, cidr: `100.127.${NET_N}.1/32` },
+  { key: "linkLocal4", range: "169.254.0.0/16", host: `169.254.250.${NET_N}`, cidr: `169.254.250.${NET_N}/32` },
+  { key: "ula", range: "fc00::/7", host: `fd00:1b5e:${NET_HEX}::1`, cidr: `fd00:1b5e:${NET_HEX}::1/128` },
+  { key: "linkLocal6", range: "fe80::/10", host: `fe80::1b5e:${NET_HEX}%${NET_IF}`, cidr: `fe80::1b5e:${NET_HEX}/64` },
+];
+/** How long a probe or control waits for a connect; a local listener answers in well under a millisecond. */
+const CONNECT_MS = 2000;
+
+/**
+ * `tcpConnect(host, port, ms)` as plain JS, shared by the hostile app and the
+ * positive control: a non-blocking connect through libc, polled, giving
+ * "open", "timeout" or "error <the kernel's errno>". Bun.connect (and
+ * node:net) report a connect that failed with ENETUNREACH as ECONNREFUSED
+ * (errno -111, Bun 1.4.3), which reads as "a peer answered". The numbers
+ * are Linux's generic ones, the same on x86-64 and arm64, both little-endian.
+ */
+const TCP_CONNECT_JS = `
+import { dlopen, FFIType, read } from "bun:ffi";
+const ERRNO = { 1: "EPERM", 13: "EACCES", 22: "EINVAL", 97: "EAFNOSUPPORT", 99: "EADDRNOTAVAIL", 101: "ENETUNREACH", 104: "ECONNRESET", 110: "ETIMEDOUT", 111: "ECONNREFUSED", 113: "EHOSTUNREACH" };
+let libc;
+async function tcpConnect(host, port, ms) {
+  try {
+    const T = FFIType;
+    libc ??= dlopen("libc.so.6", {
+      socket: { args: [T.i32, T.i32, T.i32], returns: T.i32 },
+      connect: { args: [T.i32, T.ptr, T.u32], returns: T.i32 },
+      poll: { args: [T.ptr, T.u64, T.i32], returns: T.i32 },
+      getsockopt: { args: [T.i32, T.i32, T.i32, T.ptr, T.ptr], returns: T.i32 },
+      close: { args: [T.i32], returns: T.i32 },
+      inet_pton: { args: [T.i32, T.ptr, T.ptr], returns: T.i32 },
+      if_nametoindex: { args: [T.ptr], returns: T.u32 },
+      __errno_location: { args: [], returns: T.ptr },
+    }).symbols;
+    const errno = () => read.i32(libc.__errno_location(), 0);
+    const name = (n) => ERRNO[n] || "errno " + n;
+    const cstr = (s) => Buffer.concat([Buffer.from(s), Buffer.alloc(1)]);
+    const [addr, scope] = String(host).split("%");
+    const v6 = addr.includes(":");
+    const family = v6 ? 10 : 2; // AF_INET6, AF_INET
+    const sa = Buffer.alloc(v6 ? 28 : 16); // sockaddr_in6 { family, port, flowinfo, addr[16], scope_id }, sockaddr_in { family, port, addr[4], zero[8] }
+    sa.writeUInt16LE(family, 0);
+    sa.writeUInt16BE(port, 2);
+    if (libc.inet_pton(family, cstr(addr), sa.subarray(v6 ? 8 : 4)) !== 1) return "error probe: bad address " + host;
+    if (scope) {
+      const index = libc.if_nametoindex(cstr(scope));
+      if (!index) return "error probe: no interface " + scope;
+      sa.writeUInt32LE(index, 24);
+    }
+    const fd = libc.socket(family, 1 | 0o4000 | 0o2000000, 0); // SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC
+    if (fd < 0) return "error " + name(errno()) + " (socket)";
+    try {
+      if (libc.connect(fd, sa, sa.length) === 0) return "open";
+      const e = errno();
+      // Anything but EINPROGRESS failed at once: no route, refused on this host, or denied.
+      if (e !== 115) return "error " + name(e);
+      const pfd = Buffer.alloc(8); // struct pollfd { int fd; short events; short revents; }
+      pfd.writeInt32LE(fd, 0);
+      pfd.writeInt16LE(4, 4); // POLLOUT
+      const end = Date.now() + ms;
+      while (Date.now() < end) {
+        if (libc.poll(pfd, 1, 0) > 0) {
+          const err = new Int32Array(1);
+          libc.getsockopt(fd, 1, 4, err, new Uint32Array([4])); // SOL_SOCKET, SO_ERROR
+          return err[0] === 0 ? "open" : "error " + name(err[0]);
+        }
+        await Bun.sleep(20);
+      }
+      return "timeout";
+    } finally {
+      libc.close(fd);
+    }
+  } catch (e) {
+    return "error probe: " + ((e && e.message) || e);
+  }
+}
+`;
+
+/** The positive control, run as the branch's uid outside the sandbox: `tcpConnect` on each target, one CONTROL line of JSON. */
+const CONTROL_JS = `${TCP_CONNECT_JS}
+const out = {};
+await Promise.all(JSON.parse(process.argv[2]).map(async (t) => { out[t.key] = await tcpConnect(t.host, t.port, t.ms); }));
+console.log("CONTROL " + JSON.stringify(out));
+process.exit(0);
+`;
+
+/** Run in a network namespace with only loopback up: the kernel's errno and Bun.connect's for a ULA with no route, and a closed loopback port. */
+const ERRNO_JS = `${TCP_CONNECT_JS}
+const viaBun = (host, port) => new Promise((done) => {
+  const t = setTimeout(() => done("timeout"), 2000);
+  Bun.connect({ hostname: host, port, socket: { open(s) { clearTimeout(t); s.end(); done("open"); }, data() {}, connectError(_s, e) { clearTimeout(t); done("error " + (e.code || e.message)); } } })
+    .catch((e) => { clearTimeout(t); done("error " + (e.code || e.message)); });
+});
+const out = { ula: await tcpConnect("fd00::1", 80, 2000), ulaBun: await viaBun("fd00::1", 80), closed: await tcpConnect("127.0.0.1", 1, 2000) };
+console.log("ERRNO " + JSON.stringify(out));
+process.exit(0);
+`;
+
+type NetVerdict = "ENFORCED" | "VIOLATED" | "INCONCLUSIVE (no positive control)" | "INCONCLUSIVE (unexplained)";
+
+/**
+ * One controlled network probe. `setup` is why its listener could not be
+ * set up (null when it was); `control` what the branch's own uid got from
+ * outside the sandbox just before and just after the probe; `sandboxed` what
+ * the hostile branch got; `accepted` how many connections the listener took
+ * while the branch probed. Results are "open", "timeout" or "error <errno>".
+ * A connection or a peer's answer is a violation whatever the control says;
+ * a block counts only when the control reached the same listener.
+ */
+function netVerdict(p: { setup: string | null; control: string[]; sandboxed: string; accepted: number }): { verdict: NetVerdict; why: string } {
+  if (p.accepted > 0) return { verdict: "VIOLATED", why: `the listener took ${p.accepted} connection(s) while the branch probed` };
+  if (p.sandboxed === "open") return { verdict: "VIOLATED", why: "the sandboxed connect succeeded" };
+  if (p.sandboxed.startsWith("error ECONNREFUSED")) return { verdict: "VIOLATED", why: "a peer answered (ECONNREFUSED): the SYN left the sandbox" };
+  if (p.setup !== null) return { verdict: "INCONCLUSIVE (no positive control)", why: `the target could not be set up: ${p.setup}` };
+  if (p.control.length === 0 || p.control.some((c) => c !== "open")) {
+    return {
+      verdict: "INCONCLUSIVE (no positive control)",
+      why: `outside the sandbox the branch's uid did not reach it either (${p.control.join(", ") || "no control ran"}), so a failure inside proves nothing`,
+    };
+  }
+  if (p.sandboxed === "timeout" || /^error (EPERM|EACCES|ENETUNREACH)$/.test(p.sandboxed)) return { verdict: "ENFORCED", why: "reachable outside the sandbox, not from inside it" };
+  return {
+    verdict: "INCONCLUSIVE (unexplained)",
+    why: `reachable outside the sandbox, but ${JSON.stringify(p.sandboxed)} from inside is neither a block (timeout, EPERM, EACCES, ENETUNREACH) nor a peer`,
+  };
+}
+
 const sys = new LinuxSystem();
 let ctx: OpsContext;
 
@@ -66,8 +220,9 @@ function run(command: string[], options: { ok?: number[] } = {}) {
   return { code, stdout: result.stdout.toString(), stderr: result.stderr.toString() };
 }
 
-/** Removes every unit, user, group and directory this test host made. */
+/** Removes every unit, user, group, directory, listener and interface this test host made. */
 function cleanup() {
+  netDown();
   const prefix = LAYOUT.unitPrefix;
   const units = run(["systemctl", "list-units", "--all", "--plain", "--no-legend", `${prefix}-*`]).stdout
     .split("\n")
@@ -101,6 +256,136 @@ function cleanup() {
   rmSync(APPS, { recursive: true, force: true });
 }
 
+// ---- the network probes' targets and controls ----------------------------------
+
+interface NetTarget {
+  key: string;
+  /** The table row: address, port and the IPAddressDeny entry it is in. */
+  probe: string;
+  host: string;
+  /** The listener's port; 0 when it could not be set up. */
+  port: number;
+  /** Why the target could not be set up, or null. */
+  setup: string | null;
+}
+
+/** Root's listeners for the network probes, by target, each counting the connections it took. */
+const listeners = new Map<string, { accepted: number; stop(): void }>();
+
+/** Stops the probe listeners and removes the dummy interface and the network namespace (both named NET_IF). */
+function netDown() {
+  for (const listener of listeners.values()) listener.stop();
+  listeners.clear();
+  if (existsSync(`/sys/class/net/${NET_IF}`)) run(["ip", "link", "del", NET_IF]);
+  if (existsSync(`/run/netns/${NET_IF}`)) run(["ip", "netns", "del", NET_IF]);
+}
+
+/**
+ * Puts the targets up: the dummy interface and its addresses, and on each
+ * target a listener of root's that counts what it accepts and closes it. A
+ * target that cannot be set up keeps the reason; its probe is INCONCLUSIVE.
+ */
+function netUp(): NetTarget[] {
+  netDown();
+  const failure = (fn: () => void): string | null => {
+    try {
+      fn();
+      return null;
+    } catch (err) {
+      return (err as Error).message.trim().split("\n")[0]!;
+    }
+  };
+  const link = failure(() => {
+    run(["ip", "link", "add", NET_IF, "type", "dummy"]);
+    // A machine may start new links with IPv6 off (net.ipv6.conf.default.disable_ipv6); only this one is switched on.
+    const v6 = `/proc/sys/net/ipv6/conf/${NET_IF}/disable_ipv6`;
+    if (existsSync(v6)) writeFileSync(v6, "0");
+    run(["ip", "link", "set", NET_IF, "up"]);
+  });
+  return NET_TARGETS.map((t) => {
+    let setup = t.cidr && link ? `the dummy interface ${NET_IF}: ${link}` : null;
+    // nodad: an IPv6 address is usable at once instead of after duplicate address detection.
+    if (t.cidr && !setup) setup = failure(() => run(["ip", "addr", "add", t.cidr!, "dev", NET_IF, ...(t.cidr!.includes(":") ? ["nodad"] : [])]));
+    let port = 0;
+    if (!setup) {
+      setup = failure(() => {
+        const entry = { accepted: 0, stop: () => {} };
+        const listener = Bun.listen({
+          hostname: t.host,
+          port: 0,
+          socket: {
+            open(socket) {
+              entry.accepted++;
+              socket.end();
+            },
+            data() {},
+          },
+        });
+        entry.stop = () => listener.stop(true);
+        listeners.set(t.key, entry);
+        port = listener.port;
+      });
+    }
+    const where = port === 0 ? t.host : t.host.includes(":") ? `[${t.host}]:${port}` : `${t.host}:${port}`;
+    return { key: t.key, probe: `TCP to ${where} (${t.range})`, host: t.host, port, setup };
+  });
+}
+
+const accepted = () => new Map([...listeners].map(([key, l]) => [key, l.accepted]));
+
+/**
+ * The positive control: CONTROL_JS with the installed runtime as the
+ * branch's own uid and group, outside any sandbox; what it got per target.
+ * Returns once each listener has counted the connections the control made.
+ */
+async function netControl(b: BranchRow, targets: NetTarget[]): Promise<Record<string, string>> {
+  const live = targets.filter((t) => t.port !== 0);
+  const before = accepted();
+  const file = join(APPS, "net-control.mjs");
+  writeFileSync(file, CONTROL_JS, { mode: 0o644 });
+  const argv = ["setpriv", `--reuid=${b.os_uid}`, `--regid=${b.os_uid}`, "--clear-groups", "--", ctx.layout.runtimeBinary(VERSION), file];
+  argv.push(JSON.stringify(live.map((t) => ({ key: t.key, host: t.host, port: t.port, ms: CONNECT_MS }))));
+  const env = { PATH: process.env.PATH ?? "/usr/sbin:/usr/bin:/sbin:/bin", HOME: "/nonexistent", NO_COLOR: "1", BUN_BE_BUN: "1", BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0" };
+  const proc = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "pipe", env });
+  const timer = setTimeout(() => proc.kill("SIGKILL"), 30_000);
+  const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  clearTimeout(timer);
+  const line = stdout.split("\n").find((l) => l.startsWith("CONTROL "));
+  if (!line) {
+    const why = (stderr.trim() || stdout.trim() || `exit ${proc.exitCode}`).split("\n").at(-1);
+    return Object.fromEntries(live.map((t) => [t.key, `error control did not run: ${why}`]));
+  }
+  const got = JSON.parse(line.slice("CONTROL ".length)) as Record<string, string>;
+  // Each "open" is one connection its listener accepts; wait for those so none is counted as the branch's later.
+  await waitFor(
+    "the listeners to count the control's connections",
+    () => live.every((t) => (accepted().get(t.key) ?? 0) >= (before.get(t.key) ?? 0) + (got[t.key] === "open" ? 1 : 0)),
+    5000,
+  );
+  return got;
+}
+
+/** What explains a network verdict in a CI log: the branch's filter as systemd parsed it, and this machine's IPv6 addresses and routes. */
+function netDiagnostics(unit: string) {
+  const lines = ["", "  network diagnostics:"];
+  for (const argv of [
+    ["systemctl", "show", "-p", "IPAddressDeny", "-p", "IPAddressAllow", unit],
+    ["ip", "-6", "addr"],
+    ["ip", "-6", "route"],
+    ["ip", "-6", "route", "get", "fd00::1"],
+  ]) {
+    let text: string;
+    try {
+      const result = Bun.spawnSync(argv, { stdout: "pipe", stderr: "pipe" });
+      text = `${result.stdout.toString()}${result.stderr.toString()}`.trimEnd() + (result.exitCode ? ` (exit ${result.exitCode})` : "");
+    } catch (err) {
+      text = `(cannot run: ${(err as Error).message})`;
+    }
+    lines.push(`    $ ${argv.join(" ")}`, ...text.split("\n").map((l) => `      ${l}`));
+  }
+  console.log(lines.join("\n"));
+}
+
 /**
  * The hostile app: the example app plus two httpActions. `/probe` runs, as
  * the beta/dev tenant, every attempt in the threat table against alpha's
@@ -111,7 +396,7 @@ function cleanup() {
 const PROBE_ROUTES = `
 import { closeSync, openSync, readdirSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { lookup } from "node:dns";
-
+${TCP_CONNECT_JS}
 const code = (e: any) => "error " + ((e && (e.code || e.message)) || "unknown");
 const attempt = (fn: () => unknown) => { try { const r = fn(); return "ok" + (r === undefined ? "" : " " + String(r)); } catch (e) { return code(e); } };
 const connect = (opts: any) => new Promise<string>((done) => {
@@ -155,12 +440,19 @@ http.route({
       try { const buf = Buffer.alloc(1024 * 1024, 7); for (let i = 0; i < 128; i++) writeSync(fd, buf); } finally { closeSync(fd); }
       return "wrote 128M";
     });
-    // The network: local and private peers are dropped, the DNS stub is reachable, names resolve.
-    out.loopback = await connect({ hostname: "127.0.0.1", port: 22 });
-    out.metadata = await connect({ hostname: "169.254.169.254", port: 80 });
-    out.privateV4 = await connect({ hostname: "10.0.0.1", port: 80 });
-    out.ulaV6 = await connect({ hostname: "fd00::1", port: 80 });
-    out.stub = await connect({ hostname: "127.0.0.53", port: 53 });
+    // The network: root's listeners on loopback, private, CGNAT, link-local and IPv6 addresses (t.net) are not
+    // reachable, the DNS stub is, names resolve. All at once: each waits up to its own timeout.
+    const net = await Promise.all(t.net.map(async (n: any) => [n.key, await tcpConnect(n.host, n.port, n.ms)]));
+    out.net = Object.fromEntries(net);
+    // Addresses nothing of ours listens on (no positive control); Bun.connect's view kept beside the kernel's.
+    const bare = await Promise.all(
+      [["metadata", "169.254.169.254"], ["privateV4", "10.0.0.1"], ["ulaV6", "fd00::1"]].map(async ([key, host]) => {
+        const [libc, bun] = await Promise.all([tcpConnect(host, 80, 1500), connect({ hostname: host, port: 80 })]);
+        return [key, { libc, bun }];
+      }),
+    );
+    out.noControl = Object.fromEntries(bare);
+    out.stub = await tcpConnect("127.0.0.53", 53, 1500);
     out.resolve = await new Promise<string>((done) => { const to = setTimeout(() => done("timeout"), 5000); try { lookup("example.com", (e, addr) => { clearTimeout(to); done(e ? code(e) : "ok " + addr); }); } catch (e) { clearTimeout(to); done(code(e)); } });
     // A TCP listener (SocketBindDeny).
     out.bind = attempt(() => { const s = Bun.listen({ hostname: "0.0.0.0", port: 0, socket: { data() {} } }); const p = s.port; s.stop(true); return "bound:" + p; });
@@ -269,8 +561,12 @@ describe.skipIf(!enabled)("isolation between branches", () => {
   }, SLOW);
 
   afterAll(() => {
-    ctx?.registry.close();
-    if (enabled) cleanup();
+    try {
+      ctx?.registry.close();
+    } finally {
+      // The listeners and the dummy interface go too, whatever failed before.
+      if (enabled) cleanup();
+    }
   });
 
   test("a hostile branch cannot cross into another branch, the host, or the network (the threat table)", async () => {
@@ -293,11 +589,22 @@ describe.skipIf(!enabled)("isolation between branches", () => {
       control: ctx.layout.control,
       selfPreflight: paths(beta).preflight,
       selfData: paths(beta).data,
+      net: [] as { key: string; host: string; port: number; ms: number }[],
     };
+    // The network targets, each reached by beta's uid from outside the sandbox just before and just after the probe.
+    netDiagnostics(unitOf(beta));
+    const targets = netUp();
+    body.net = targets.filter((t) => t.port !== 0).map((t) => ({ key: t.key, host: t.host, port: t.port, ms: CONNECT_MS }));
+    const controlBefore = await netControl(beta, targets);
+    const acceptedBefore = accepted();
     const res = await call(paths(beta).httpSock, "/probe", { body });
+    // A connection the probe made reaches the listener's callback on a later tick.
+    await Bun.sleep(250);
+    const acceptedDuring = accepted();
+    const controlAfter = await netControl(beta, targets);
     expect(res.status).toBe(200);
-    // The probe's JSON blob: each field is a string ("ok …" / "error …" / "timeout" / "open"), except uid.
-    const out = res.json.out as Record<string, string> & { uid: number };
+    // The probe's JSON blob: each field is a string ("ok …" / "error …" / "timeout" / "open"), except uid and the network results.
+    const out = res.json.out as Record<string, unknown> & { uid: number; net: Record<string, string>; noControl: Record<string, { libc: string; bun: string }> };
     const field = (key: string): string => String(out[key] ?? "");
     expect(out.uid).toBe(beta.os_uid);
 
@@ -308,6 +615,7 @@ describe.skipIf(!enabled)("isolation between branches", () => {
     // Each probe: what must hold everywhere, and the directives a platform may switch off.
     const table: { probe: string; verdict: string; detail: string }[] = [];
     const violations: string[] = [];
+    const undecided: string[] = [];
     const isError = (v: string) => v.startsWith("error");
     const required = (probe: string, ok: boolean, detail: string) => {
       table.push({ probe, verdict: ok ? "ENFORCED" : "VIOLATED", detail });
@@ -336,11 +644,24 @@ describe.skipIf(!enabled)("isolation between branches", () => {
     required("write own data dir", field("ownData").startsWith("ok"), field("ownData"));
     // The /tmp size limit.
     required("exceed /tmp size limit", field("tmpLimit").includes("ENOSPC"), field("tmpLimit"));
-    // The network filter (cgroup BPF: effective on a VM and in a container).
-    required("TCP to 127.0.0.1 (another branch)", field("loopback") === "timeout", field("loopback"));
-    required("TCP to 169.254.169.254 (metadata)", field("metadata") === "timeout", field("metadata"));
-    required("TCP to 10.0.0.1 (private)", field("privateV4") === "timeout", field("privateV4"));
-    required("TCP to an IPv6 ULA", field("ulaV6") === "timeout", field("ulaV6"));
+    // The network filter (cgroup BPF: effective on a VM and in a container), against root's listeners. A target the
+    // control could not reach is INCONCLUSIVE: a failure where every directive must hold (a VM), reported elsewhere;
+    // a sandboxed result that is neither a block nor a peer although the control got through fails everywhere.
+    for (const t of targets) {
+      const control = t.port === 0 ? [] : [controlBefore[t.key] ?? "missing", controlAfter[t.key] ?? "missing"];
+      const sandboxed = out.net?.[t.key] ?? (t.port === 0 ? "not probed" : "missing");
+      const took = (acceptedDuring.get(t.key) ?? 0) - (acceptedBefore.get(t.key) ?? 0);
+      const { verdict, why } = netVerdict({ setup: t.setup, control, sandboxed, accepted: took });
+      const detail = `${why}; sandboxed: ${sandboxed}; outside, before and after: ${control.join(", ") || "-"}; listener took ${took} while probed`;
+      table.push({ probe: t.probe, verdict, detail });
+      if (verdict === "VIOLATED") violations.push(`${t.probe}: ${detail}`);
+      else if (verdict === "INCONCLUSIVE (unexplained)" || (verdict !== "ENFORCED" && REQUIRE_SANDBOX)) undecided.push(`${t.probe}: ${verdict}: ${detail}`);
+    }
+    // Nothing of ours listens on these, so a timeout is also what no filter gives: shown, never a verdict.
+    for (const [key, probe] of [["metadata", "169.254.169.254:80 (metadata)"], ["privateV4", "10.0.0.1:80"], ["ulaV6", "[fd00::1]:80"]] as const) {
+      const got = out.noControl?.[key];
+      table.push({ probe: `TCP to ${probe}`, verdict: "INFO (no control)", detail: `kernel: ${got?.libc ?? "missing"}; Bun.connect: ${got?.bun ?? "missing"}` });
+    }
     required("TCP to 127.0.0.53 (DNS stub, allowed)", field("stub") !== "timeout", field("stub"));
     required("resolve a name (allowed)", field("resolve").startsWith("ok"), field("resolve"));
     // No capabilities at all.
@@ -359,10 +680,28 @@ describe.skipIf(!enabled)("isolation between branches", () => {
     for (const row of table) console.log(`    ${row.verdict.padEnd(40)} ${row.probe}: ${row.detail}`);
 
     expect(violations).toEqual([]);
+    expect(undecided).toEqual([]);
     if (REQUIRE_SANDBOX) {
       // On a VM every directive takes effect except SocketBindDeny where this systemd cannot apply it.
       const allowed = noBpf() ? ["SocketBindDeny (bind a listener)"] : [];
       expect(table.filter((r) => r.verdict.startsWith("NOT ENFORCED")).map((r) => r.probe)).toEqual(allowed);
+    }
+  }, SLOW);
+
+  test("the probes' connect reports the kernel's errno, where Bun.connect calls no route a refusal", () => {
+    // Only loopback up, so no route to an IPv6 ULA: what a machine without IPv6 routing (a CI runner) gives for fd00::1.
+    run(["ip", "netns", "add", NET_IF]);
+    try {
+      run(["ip", "-n", NET_IF, "link", "set", "lo", "up"]);
+      const file = join(APPS, "net-errno.mjs");
+      writeFileSync(file, ERRNO_JS, { mode: 0o644 });
+      const { stdout } = run(["ip", "netns", "exec", NET_IF, "env", "BUN_BE_BUN=1", "HOME=/nonexistent", "NO_COLOR=1", ctx.layout.runtimeBinary(VERSION), file]);
+      const got = JSON.parse(stdout.split("\n").find((l) => l.startsWith("ERRNO "))?.slice("ERRNO ".length) ?? "null") as Record<string, string>;
+      console.log(`  no route to [fd00::1]:80: kernel ${got.ula}, Bun.connect ${got.ulaBun}; closed 127.0.0.1:1: kernel ${got.closed}`);
+      expect(got.ula).toBe("error ENETUNREACH");
+      expect(got.closed).toBe("error ECONNREFUSED");
+    } finally {
+      run(["ip", "netns", "del", NET_IF]);
     }
   }, SLOW);
 
@@ -438,4 +777,39 @@ describe.skipIf(!enabled)("isolation between branches", () => {
     // beta serves again once it comes back.
     expect((await waitFor("beta healthy again", async () => ((await health(beta)).json?.ok ? true : null), 60_000))).toBe(true);
   }, SLOW);
+});
+
+// How a controlled network probe is judged; runs everywhere.
+describe("network probe verdicts", () => {
+  const open = ["open", "open"];
+  const verdict = (sandboxed: string, control = open, accepted = 0, setup: string | null = null) => netVerdict({ setup, control, sandboxed, accepted }).verdict;
+
+  test("every IPAddressDeny entry has a target with a listener", () => {
+    expect([...new Set(NET_TARGETS.map((t) => t.range))].sort()).toEqual(IP_ADDRESS_DENY.split(" ").sort());
+    expect(NET_IF.length).toBeLessThanOrEqual(15);
+    expect(new Set(NET_TARGETS.map((t) => t.host)).size).toBe(NET_TARGETS.length);
+  });
+
+  test("a block counts only when the branch's uid reached the listener outside the sandbox", () => {
+    for (const blocked of ["timeout", "error EPERM", "error EACCES", "error ENETUNREACH"]) expect(verdict(blocked)).toBe("ENFORCED");
+    expect(verdict("timeout", ["open", "timeout"])).toBe("INCONCLUSIVE (no positive control)");
+    expect(verdict("timeout", ["error ENETUNREACH", "open"])).toBe("INCONCLUSIVE (no positive control)");
+    expect(verdict("timeout", [])).toBe("INCONCLUSIVE (no positive control)");
+    expect(verdict("not probed", [], 0, "RTNETLINK answers: Permission denied")).toBe("INCONCLUSIVE (no positive control)");
+  });
+
+  test("a connection, a peer's answer, or a connection the listener saw is a violation whatever the control says", () => {
+    expect(verdict("open")).toBe("VIOLATED");
+    expect(verdict("open", ["timeout", "timeout"])).toBe("VIOLATED");
+    expect(verdict("error ECONNREFUSED")).toBe("VIOLATED");
+    expect(verdict("error ECONNREFUSED", [], 0, "no dummy interface")).toBe("VIOLATED");
+    // The probe said timeout, but the listener took a connection while it ran.
+    expect(verdict("timeout", open, 1)).toBe("VIOLATED");
+  });
+
+  test("anything else from inside, with the control through, is unexplained rather than a pass", () => {
+    for (const odd of ["error EHOSTUNREACH", "error EADDRNOTAVAIL", "error probe: dlopen failed", "missing", ""]) {
+      expect(verdict(odd)).toBe("INCONCLUSIVE (unexplained)");
+    }
+  });
 });

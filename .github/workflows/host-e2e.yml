@@ -89,6 +89,21 @@ jobs:
           sudo env "PATH=$TEST_PATH" "$BIN" host op installRuntime "{\"binary\":\"$BIN\",\"version\":\"$VER\",\"sha256\":\"$SHA\"}" --root "$ROOT" || true
           sudo env "PATH=$TEST_PATH" "$BIN" host doctor --root "$ROOT" 2>&1 | tee artifacts/doctor.log || true
 
+      - name: Network diagnostics
+        if: always()
+        # What explains a network verdict in the test log: this runner's IPv6 addresses and routes, whether a ULA
+        # has a route at all, any ip6tables rule that could answer for one, and the branch filter as systemd parses
+        # it (from the doctor host's template, which the step above installed). Never fails the job.
+        run: |
+          mkdir -p artifacts
+          {
+            for cmd in "ip -6 addr" "ip -6 route" "ip -6 route get fd00::1" "sudo ip6tables -S" \
+              "systemctl show -p IPAddressDeny -p IPAddressAllow ibdoc-branch@diag.service"; do
+              echo "\$ $cmd"
+              $cmd 2>&1 || echo "(exit $?)"
+            done
+          } | tee artifacts/network.log
+
       - name: Upload the test and doctor output
         if: always()
         uses: actions/upload-artifact@v4
