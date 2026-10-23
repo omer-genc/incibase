@@ -203,6 +203,8 @@ Internet ─:443─▶ nginx (TLS, limit_req/limit_conn, JSON log)
 -- Adım 10: branches.generation (drop-in'deki INCIBASE_GENERATION); releases'ta bytes, preflight,
 -- allow_field_removal, generation, preflight_ms, finished_at, pruned_at (dosyası silinen release'in satırı kalır);
 -- alerts.message; settings'te layout (unit öneki, gruplar, runtime ve systemd dizinleri) ve slice_memory_max.
+-- Adım 14 (user_version=2): runtimes (version PK, sha256, bytes, source, reported, installed_at): kurulu
+-- runtime'lar ve doğrulandıkları sha256; layout'ta varsayılan değilse cliLink.
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   -- domain, timezone, trust_proxy, alert_webhook, cli_version, uid_next (70000+), tunnel_port_next
 CREATE TABLE projects (slug TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -385,6 +387,19 @@ incibase status ; logs <p>/<b> [-f] [--errors] ; tunnel <p>/<b> --ssh user@vps [
 ```
 
 `set` ve `env` yalnızca `--restart` verildiğinde restart eder; böylece değişiklikler tek restart'ta toplanır. `env import`, `manifest.envNames`'te olup eksik kalanlar için uyarır.
+
+**Adım 14'te doğrulanan sapmalar ve ayrıntılar** (runtime pinleme; OrbStack Ubuntu 24.04 arm64, systemd 255):
+- Release workflow'u binary'lerin yanına `SHA256SUMS` (sha256sum biçimi, düz dosya adları) yazar ve GitHub Release'e ekler.
+- `host install-runtime --version <x.y.z> [<binary> (--sums <SHA256SUMS> | --sha256 <hex>)] [--skip-version-check]`:
+  - Yerel dosya her zaman bir checksum ister: `--sums`'taki dosya adı girdisi ya da `--sha256`. Checksum'sız kurulum yok.
+  - Binary verilmezse `https://github.com/omer-genc/incibase/releases/download/v<x.y.z>/` altından önce `SHA256SUMS`, sonra `incibase-linux-<x64|arm64>` indirilir. Girdisi olmayan, 404 veren, eksik inen (Content-Length tutmayan) ya da https dışına yönlenen indirme reddedilir; base URL yalnızca testler için değişir (http yalnızca loopback'te).
+  - Baytlar sürüm dizininde root-only (0700) geçici bir dosyaya iner ya da kopyalanır, hash'lenir; eşleşmezse silinir ve **hiç çalıştırılmaz**. Eşleşince 0755 yapılır, `--version` sorulur, tek bir `rename` ile `<runtime root>/<ver>/incibase` olur ve registry'ye yazılır [P].
+  - Aynı baytlar tekrar: hiçbir şey değişmez, indirme de yapılmaz. Kurulu bir sürüm başka baytlarla asla değiştirilmez (CONFLICT); diskte bozulmuşsa kayıtlı sha256'yla aynı baytlar geri konabilir.
+  - `--skip-version-check` aynı build'i başka bir sürüm adıyla kurar (Linux testi bununla ikinci bir "sürüm" kurar); binary'nin söylediği `runtimes.reported`'da ve audit'te kalır. Binary yine de `--version`'a 0 ile cevap vermelidir.
+- `host use-cli <version> [--replace]`: `/usr/local/bin/incibase`'i (layout'ta `cliLink`) kurulu bir runtime'a atomik symlink yapar; elle kopyalanmış bir dosyanın yerine yalnızca `--replace` ile geçer. settings'te `cli_version` tutulur.
+- Pinleme: `upgradeBranch` ve `runtimeVersion` verilen `createBranch` yalnızca registry'de kayıtlı ve dosyası duran runtime'ları kabul eder (NOT_FOUND); upgrade bunu lock altında bir kez daha kontrol eder. Bozuk bir runtime'a upgrade gate'te düşer ve pin geri alınır [P].
+- `host gc` = trash temizliği + `gcRuntimes`: silinmemiş hiçbir branch'in pinlemediği, CLI link'inin ve çalışan sürecin göstermediği kayıtlı runtime'ları siler (önce registry satırı, sonra dizin). Bir branch upgrade job'ındayken (hedefi henüz pin değil) hiçbir şey silmez. Yalnızca bu host'un registry'sindeki sürümlere dokunur; aynı runtime root'u paylaşan başka bir kurulumun dizinleri silinmez.
+- `host install-runtime | use-cli | runtimes | gc` kendi bayraklarını okur; `host op` aynı op'ları (`installRuntime`, `useCli`, `listRuntimes`, `gcRuntimes`, `gc`) JSON ile çağırır.
 
 ---
 

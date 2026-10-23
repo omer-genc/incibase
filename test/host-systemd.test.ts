@@ -188,7 +188,7 @@ describe.skipIf(!enabled)("the host on systemd", () => {
       console.log(`  | ${line}`);
     };
     await ops.initHost(ctx, { domain: DOMAIN, timezone: "Europe/Istanbul", uidBase: UID_BASE, sliceMemoryMax: 2 * 1024 ** 3 });
-    await ops.installRuntime(ctx, { binary: BINARY, version: VERSION });
+    await ops.installRuntime(ctx, { binary: BINARY, version: VERSION, sha256: new Bun.CryptoHasher("sha256").update(readFileSync(BINARY)).digest("hex") });
     v1 = bundleApp("v1");
   }, SLOW);
 

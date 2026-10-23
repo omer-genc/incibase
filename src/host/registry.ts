@@ -104,6 +104,18 @@ export interface ServiceKeyRow {
   revoked_at: number | null;
 }
 
+/** An installed runtime: `<runtime root>/<version>/incibase`, checked against its sha256 when it was installed. */
+export interface RuntimeRow {
+  version: string;
+  sha256: string;
+  bytes: number;
+  /** Where it came from: `file:<path>` or the download URL. */
+  source: string;
+  /** What `incibase --version` printed (differs from `version` only when the check was skipped). */
+  reported: string;
+  installed_at: number;
+}
+
 export interface AuditEntry {
   actor: string;
   action: string;
@@ -216,6 +228,17 @@ const MIGRATIONS: string[] = [
     ok INTEGER NOT NULL
   );
   CREATE INDEX audit_by_branch ON audit_log(branch_id, at);
+  `,
+  // Step 14: the runtimes installed under the runtime root, with their checksums.
+  `
+  CREATE TABLE runtimes (
+    version TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    bytes INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    reported TEXT NOT NULL,
+    installed_at INTEGER NOT NULL
+  );
   `,
 ];
 
@@ -647,6 +670,45 @@ export class Registry {
 
   revokeServiceKey(id: string, at: number): boolean {
     return this.tx(() => this.db.run(`UPDATE service_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, [at, id]).changes === 1);
+  }
+
+  // ---- runtimes ----------------------------------------------------------
+
+  getRuntime(version: string): RuntimeRow | null {
+    return this.db.query(`SELECT * FROM runtimes WHERE version = ?`).get(version) as RuntimeRow | null;
+  }
+
+  listRuntimes(): RuntimeRow[] {
+    return this.db.query(`SELECT * FROM runtimes ORDER BY installed_at, version`).all() as RuntimeRow[];
+  }
+
+  /** Records an installed runtime (replacing the row of a reinstall). */
+  putRuntime(row: RuntimeRow) {
+    this.tx(() =>
+      this.db
+        .query(
+          `INSERT INTO runtimes (version, sha256, bytes, source, reported, installed_at) VALUES ($version, $sha256, $bytes, $source, $reported, $installed_at)
+           ON CONFLICT (version) DO UPDATE SET sha256 = excluded.sha256, bytes = excluded.bytes, source = excluded.source,
+             reported = excluded.reported, installed_at = excluded.installed_at`,
+        )
+        .run(row as unknown as Record<string, string | number>),
+    );
+  }
+
+  deleteRuntime(version: string): boolean {
+    return this.tx(() => this.db.run(`DELETE FROM runtimes WHERE version = ?`, [version]).changes === 1);
+  }
+
+  /** The runtime versions branches that are not deleted pin, with the branches (`project/name`). */
+  pinnedRuntimes(): Map<string, string[]> {
+    const rows = this.db.query(`SELECT runtime_version, project, name FROM branches WHERE phase <> 'deleted' ORDER BY project, name`).all() as {
+      runtime_version: string;
+      project: string;
+      name: string;
+    }[];
+    const pinned = new Map<string, string[]>();
+    for (const row of rows) pinned.set(row.runtime_version, [...(pinned.get(row.runtime_version) ?? []), `${row.project}/${row.name}`]);
+    return pinned;
   }
 
   // ---- audit -------------------------------------------------------------

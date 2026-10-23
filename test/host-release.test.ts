@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import { sha256Hex } from "../src/engine/manifest.ts";
 import type { FakeOutcome, FakeRun } from "../src/host/fake-driver.ts";
 import * as ops from "../src/host/ops.ts";
 import * as provision from "../src/host/provision.ts";
@@ -375,7 +376,14 @@ describe("bookkeeping", () => {
 
   test("a release needs its runtime installed", async () => {
     const host = await shop([]);
+    // A branch cannot pin a runtime that is not installed.
+    await expect(ops.createBranch(host, { project: "shop", name: "dev", runtimeVersion: "9.9.9" })).rejects.toMatchObject({ code: "NOT_FOUND" });
+    const binary = join(host.dir, "incibase-9.9.9");
+    writeFileSync(binary, "#!/bin/sh\necho 9.9.9\n", { mode: 0o755 });
+    await ops.installRuntime(host, { binary, version: "9.9.9", sha256: sha256Hex(readFileSync(binary)) });
     await ops.createBranch(host, { project: "shop", name: "dev", runtimeVersion: "9.9.9" });
+    // Its file gone after the branch pinned it (by hand): the release refuses before it stages anything.
+    host.sys.remove(host.layout.runtimeBinary("9.9.9"));
     await expect(release(host, "dev", fakeBundle(host.dir, "v1"))).rejects.toThrow(/runtime 9\.9\.9 .* is not installed/);
   });
 });
@@ -433,7 +441,7 @@ describe("runtime upgrades", () => {
   async function withRuntime(host: OpsTestHost, version: string) {
     const binary = join(host.dir, `incibase-${version}`);
     writeFileSync(binary, `#!/bin/sh\necho ${version}\n`, { mode: 0o755 });
-    await ops.installRuntime(host, { binary, version });
+    await ops.installRuntime(host, { binary, version, sha256: sha256Hex(readFileSync(binary)) });
   }
 
   test("switch the pinned runtime with the gate; revert when it fails", async () => {
@@ -457,9 +465,9 @@ describe("runtime upgrades", () => {
     const host = await shop([]);
     const binary = join(host.dir, "liar");
     writeFileSync(binary, "#!/bin/sh\necho 1.0.0\n", { mode: 0o755 });
-    await expect(ops.installRuntime(host, { binary, version: "2.0.0" })).rejects.toThrow(/says it is "1.0.0", not 2.0.0/);
+    await expect(ops.installRuntime(host, { binary, version: "2.0.0", sha256: sha256Hex(readFileSync(binary)) })).rejects.toThrow(/says it is "1.0.0", not 2.0.0/);
     expect(existsSync(host.layout.runtimeBinary("2.0.0"))).toBe(false);
-    await expect(ops.installRuntime(host, { binary, version: "2.0.0; rm -rf /" })).rejects.toMatchObject({ code: "INVALID" });
+    await expect(ops.installRuntime(host, { binary, version: "2.0.0; rm -rf /", sha256: sha256Hex(readFileSync(binary)) })).rejects.toMatchObject({ code: "INVALID" });
     await withRuntime(host, "1.0.0");
     expect(host.sys.lstat(host.layout.runtimeBinary("1.0.0"))).toMatchObject({ type: "file", uid: 0, gid: 0, mode: 0o755 });
   });

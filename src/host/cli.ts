@@ -7,14 +7,18 @@ import { DEFAULT_ROOT, type LayoutOptions } from "./layout.ts";
 import { openHost } from "./context.ts";
 import { OpError, OPS } from "./ops.ts";
 import { runJob } from "./release.ts";
+import { RUNTIME_COMMANDS, RUNTIME_USAGE, runtimeCli } from "./runtime-cli.ts";
 
 const USAGE = `Usage (as root):
   incibase host op <name> [<json input>] [--root <dir>] [--layout <json>]
       Runs an owner operation: ${Object.keys(OPS).join(", ")}
   incibase host _job --root <dir> <release|rollback|upgrade> <branch id> <n> [args]
-      Internal: what a transient job unit runs.`;
+      Internal: what a transient job unit runs.
+${RUNTIME_USAGE}`;
 
 export async function hostCli(argv: string[]): Promise<void> {
+  // These parse their own flags.
+  if (argv[0] !== undefined && RUNTIME_COMMANDS.has(argv[0])) return runtimeCli(argv);
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
