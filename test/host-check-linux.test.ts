@@ -8,7 +8,7 @@
 // and uid base (INCIBASE_TEST_UID_BASE, default 73000), with a unit prefix,
 // groups and runtime root named after the root, and removes all it created.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { DataDirLock } from "../src/engine/store.ts";
 import { VERSION } from "../src/engine/version.ts";
@@ -129,7 +129,7 @@ describe.skipIf(!enabled)("host check and doctor on systemd", () => {
     ctx.actor = "root:test";
     ctx.log = (line) => console.log(`  | ${line}`);
     await ops.initHost(ctx, { domain: "incibase.example.net", timezone: "Europe/Istanbul", uidBase: UID_BASE, sliceMemoryMax: 2 * 1024 ** 3, checkTimer: false });
-    await ops.installRuntime(ctx, { binary: BINARY, version: VERSION });
+    await ops.installRuntime(ctx, { binary: BINARY, version: VERSION, sha256: new Bun.CryptoHasher("sha256").update(readFileSync(BINARY)).digest("hex") });
     await ops.createProject(ctx, { slug: "shop", branches: ["dev"] });
     const { release } = await ops.addRelease(ctx, { project: "shop", branch: "dev", file: bundleExample() });
     expect(release.status).toBe("live");

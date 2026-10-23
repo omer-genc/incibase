@@ -353,7 +353,7 @@ describe.skipIf(!enabled)("the nginx front door", () => {
       httpsPort: PORT,
     });
     expect(init.frontDoor?.nginx).toMatchObject({ changed: true, groupAdded: true, dropInChanged: true });
-    await ops.installRuntime(ctx, { binary: BINARY, version: VERSION });
+    await ops.installRuntime(ctx, { binary: BINARY, version: VERSION, sha256: new Bun.CryptoHasher("sha256").update(readFileSync(BINARY)).digest("hex") });
     await ops.createProject(ctx, { slug: "shop", branches: ["dev"] });
     const { release } = await ops.addRelease(ctx, { project: "shop", branch: "dev", file: bundleApp("v1") });
     expect(release.status).toBe("live");
