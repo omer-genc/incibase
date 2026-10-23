@@ -2,7 +2,7 @@
 // outcome of snapshot, preflight, switch and gate, the revert rules around
 // migration_committed, pruning, rollback and runtime upgrades.
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { sha256Hex } from "../src/engine/manifest.ts";
@@ -109,8 +109,9 @@ describe("a release that goes live", () => {
     const runs: FakeRun[] = [];
     host.driver.behavior = (run) => (runs.push(run), {});
     expect((await release(host, "dev", fakeBundle(host.dir, "v1"))).release).toMatchObject({ preflight: 1, snapshot: null, status: "live" });
-    expect(runs.map((r) => r.kind)).toEqual(["preflight", "branch"]);
-    // A dev preflight copies the live data straight into preflight/, no backup is kept.
+    // Without a kept snapshot the copy for the preflight comes from the snapshot unit, as the branch.
+    expect(runs.map((r) => r.kind)).toEqual(["snapshot", "preflight", "branch"]);
+    // A dev preflight's copy goes into preflight/ only, no backup is kept.
     expect(existsSync(host.layout.branch(dev.id).backups)).toBe(false);
     expect((await release(host, "prod", fakeBundle(host.dir, "v2"), { preflight: false })).release).toMatchObject({ preflight: 0, status: "live" });
   });
@@ -166,6 +167,28 @@ describe("a preflight that fails leaves the live branch alone", () => {
     expect(r).toMatchObject({ status: "failed", snapshot: null });
     expect(r.error).toMatch(/Not enough free space for a snapshot/);
     expect(host.driver.calls.slice(calls).filter((c) => c.startsWith("start") || c.startsWith("restart"))).toEqual([]);
+  });
+
+  test("a staging file root refuses fails the release at the snapshot; the live branch is untouched", async () => {
+    const host = await shop(["prod"]);
+    const prod = branchOf(host, "prod");
+    await release(host, "prod", fakeBundle(host.dir, "v1"));
+    seedDatabase(host, prod);
+    const before = branchOf(host, "prod");
+    // The branch leaves a symlink where the unit's copy should be.
+    host.driver.snapshot = () => {
+      symlinkSync(host.layout.registry, host.layout.branch(prod.id).snapshotFile);
+      return 0;
+    };
+    const calls = host.driver.calls.length;
+    const { release: r } = await release(host, "prod", fakeBundle(host.dir, "v2"));
+    expect(r).toMatchObject({ status: "failed", snapshot: null });
+    expect(r.error).toMatch(/was refused: .*is a symlink; refusing to read it/);
+    expect(branchCalls(host, prod, calls)).toEqual([]);
+    expect(host.driver.calls.slice(calls)).not.toContain(`start ${host.layout.units.preflight(prod.id)}`);
+    expect(branchOf(host, "prod")).toMatchObject({ release_seq: 1, generation: before.generation });
+    expect(readdirSync(host.layout.branch(prod.id).backups)).toEqual([]);
+    expect(readdirSync(host.layout.branch(prod.id).snapshot)).toEqual([]);
   });
 });
 
@@ -372,6 +395,26 @@ describe("bookkeeping", () => {
     expect(branchOf(host, "dev").busy_unit).toBeNull();
     expect(host.registry.getRelease(dev.id, 1)).toMatchObject({ status: "interrupted" });
     expect(actions(host, dev)).toContain("job.interrupted");
+  });
+
+  test("render stops a snapshot unit a dead job left running and discards its staging file", async () => {
+    const host = await shop(["prod"]);
+    const prod = branchOf(host, "prod");
+    seedDatabase(host, prod);
+    host.driver.behavior = (run) => (run.kind === "snapshot" ? { hang: true } : {});
+    host.driver.onTransient = () => new Promise(() => {});
+    const { unit } = await release(host, "prod", fakeBundle(host.dir, "v1"), { wait: false });
+    // The job is killed while its snapshot unit runs; the unit left a partial file behind.
+    const snapshotUnit = host.layout.units.snapshot(prod.id);
+    provision.renderBranchFiles(host, prod);
+    const { renderSnapshotUnit } = await import("../src/host/render.ts");
+    renderSnapshotUnit(host, prod);
+    host.driver.start(snapshotUnit);
+    writeFileSync(host.layout.branch(prod.id).snapshotFile, "partial");
+    host.driver.stop(unit);
+    expect((await ops.render(host)).interrupted).toEqual([prod.id]);
+    expect(host.driver.isActive(snapshotUnit)).toBe(false);
+    expect(readdirSync(host.layout.branch(prod.id).snapshot)).toEqual([]);
   });
 
   test("a release needs its runtime installed", async () => {

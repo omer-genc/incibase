@@ -115,7 +115,7 @@ export async function fakeOpsHost(options: { unitPrefix?: string } = {}): Promis
   });
   mkdirSync(join(dir, "bin"));
   const sys = new FakeSystem();
-  const driver = new FakeDriver(layout);
+  const driver = new FakeDriver(layout, sys);
   let t = 1_800_000_000_000;
   const lines: string[] = [];
   const ctx = {

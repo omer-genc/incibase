@@ -112,7 +112,7 @@ Internet ─:443─▶ nginx (TLS, limit_req/limit_conn, JSON log)
 | `storage.ts` | `INCIBASE_STORAGE_SECRET`, `INCIBASE_S3_PREFIX`. `.tmp-<id>` dosyasına stream, artımlı sha256. Bugün dosya üç kez kopyalanıyor: http.ts:212, storage.ts:218,229. Semafor 2. Kota için meta'da `storage_bytes`. |
 | `bundle.ts`, `loader.ts` | Manifest: sha256, sürüm, `describeApp`, `envNames`. Birden fazla çıktı veya `.node` varsa hata. `--check`. |
 | `src/client.ts` | `incibase:token:<baseUrl>`, full jitter (client.ts:266-267), unprocessed retry. |
-| `src/host/*` | `registry`, `names`, `ops`, `driver` (testler için sahte driver), `systemd`, `render`, `nginx`, `release`, `snapshot`, `check`, `doctor`, `tunnel`, `cli`. |
+| `src/host/*` | `registry`, `names`, `ops`, `driver` (testler için sahte driver), `systemd`, `render`, `nginx`, `release`, `snapshot` (+ `snapshot-command`: branch olarak koşan `incibase _snapshot`), `check`, `doctor`, `tunnel`, `cli`. |
 
 ### 3.2 Akışlar
 
@@ -144,8 +144,8 @@ Internet ─:443─▶ nginx (TLS, limit_req/limit_conn, JSON log)
    - Yarım kalan işi `host render` tamamlar ya da geri alır.
 2. Deploy: `incibase bundle --out app.ib`, `scp app.ib vps:`, ardından `ssh -t vps sudo incibase release add shop/prod ~/app.ib`. Root manifest'i doğrular ve sha256 hesaplar. Release `releases/<seq>/app.ib` yoluna (root:ib-<id> 0640) `staged` olarak yazılır.
 3. Gerisi `systemd-run --unit=incibase-release-<id>-<seq> --collect` içinde koşar; CLI journal'ı izler.
-   1. **Snapshot:** root, `mode=ro` ile `VACUUM INTO backups/<id>/pre-<seq>.db` çalıştırır (LOCK tutulurken çalıştığı doğrulandı [P]), ardından 0600. 2×DB + 100 MB boş alan yoksa iptal.
-   2. **Preflight:** kopya üzerinde `incibase-preflight@<id>` aynı sandbox ve MemoryMax ile `serve --migrate-only` çalıştırır. 64, 65, 78 veya OOM gelirse canlı branch'e dokunulmaz. Süre gate timeout'unu belirler. Kopyada `data.db` yoksa 64 döner; henüz verisi olmayan yeni bir branch'in ilk release'i `--allow-empty` ile geçer.
+   1. **Snapshot (ayrıcalık ayrımı, §3.2 D.3.1):** root branch'in veritabanı dosyalarını (data.db, -wal, -shm) **hiçbir zaman** ne SQLite ile ne de adıyla açmaz. Bunun yerine `incibase-snapshot@<id>` birimi, branch'in **kendi uid'siyle** ve kendi sandbox'ında (control/, backups/, trash/ erişilemez; MemoryMax; RuntimeMaxSec=900) branch'in sabitlenmiş runtime'ını `incibase _snapshot --data … --out …` olarak çalıştırır: read-only bağlantıda `trusted_schema=OFF` ile `VACUUM INTO` kopyasını branch'e ait staging dizinine (`branches/<id>/snapshot/snapshot.db`, ib-<id> 0700) yazar ve `quick_check` ile doğrular. Branch olarak koştuğu için data/'ya konan bir symlink, swap'lı -wal/-shm ya da FIFO yalnızca branch'in zaten okuyabildiğine işaret edebilir. Ardından root staging dosyasını **fd ile** içeri alır (`ingestFile`): `O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC` ile bir kez açar, fd'den düzenli dosya / branch uid'si / tek link / boyut / SQLite başlığı kontrol eder, backups/ altındaki root'a ait bir temp'e bayt bayt kopyalar, fsync'ler, sahip ve modu verir, yerine rename eder; staging dosyasını (tek dirent, izlenmez) unlink eder. 2×DB + 100 MB boş alan yoksa birim hiç koşmadan iptal.
+   2. **Preflight:** kopya üzerinde `incibase-preflight@<id>` aynı sandbox ve MemoryMax ile `serve --migrate-only` çalıştırır. Kopya her zaman backups/ altında yapılıp preflight/'e **rename** edilir (root, branch'in kontrol ettiği bir ada asla yazmaz; tutulan snapshot varsa ondan, yoksa yukarıdaki snapshot biriminden). 64, 65, 78 veya OOM gelirse canlı branch'e dokunulmaz. Süre gate timeout'unu belirler. Kopyada `data.db` yoksa 64 döner; henüz verisi olmayan yeni bir branch'in ilk release'i `--allow-empty` ile geçer.
    3. Drop-in'e `--bundle` ve `INCIBASE_GENERATION=<seq>.<nonce>` yazılır, restart edilir. Gate generation birebir eşleşene kadar bekler.
    4. Başarılıysa `live`, son 5 release tutulur.
    5. Başarısızsa ve `migration_committed` yoksa önceki release'e dönülür. Commit varsa release kalır, alarm gider ve `release rollback --restore pre-<seq>` önerilir; snapshot sonrası yazılanlar kaybolur.
@@ -293,6 +293,7 @@ IPAddressAllow=127.0.0.53/32
   - `ExecStart=/usr/local/lib/incibase/<runtime_version>/incibase serve --bundle …/releases/<seq>/app.ib …`
   - `MemoryMax=512M`, `MemoryHigh=460M`, `MemorySwapMax=0`, `CPUQuota`, `TasksMax`, `TimeoutStopSec=25`.
 - **`incibase-preflight@.service`**: aynı sandbox ve `RestartForceExitStatus=SIGHUP`; yalnızca `…/%i/preflight` yazılabilir.
+- **`incibase-snapshot@.service`**: aynı sandbox, EnvironmentFile yok, `RuntimeMaxSec=900`; yalnızca `…/%i/data` ve `…/%i/snapshot` yazılabilir. Drop-in `ExecStart=… incibase _snapshot --data …/%i/data --out …/%i/snapshot/snapshot.db`, branch User/Group ve limitleriyle.
 - **Env dosyası** (0600):
   - `INCIBASE_ADMIN_KEY`, `INCIBASE_STORAGE_SECRET`.
   - `INCIBASE_SERVICE_KEYS_FILE`: `branches/<id>/service-keys.json` dosyasını gösterir (root:ib-<id> 0640; yalnızca sha256 ve kapsamlar).
@@ -302,7 +303,8 @@ IPAddressAllow=127.0.0.53/32
 
 **Adım 10'da doğrulanan sapmalar** (OrbStack Ubuntu 24.04, systemd 255):
 - `TemporaryFileSystem=/tmp:size=64M,mode=1777` [P]. Seçeneksiz tmpfs root 0755 bağlanıyor; branch kullanıcısı `/tmp`'ye yazamıyordu.
-- `incibase-preflight@.service` `Type=exec`, oneshot değil [P]: systemd `Type=oneshot` ile `RestartForceExitStatus=` kabul etmiyor ("isn't allowed for Type=oneshot services. Refusing"). Job, unit bitene kadar `systemctl show`'u yoklar; asılı kalan preflight'ı `RuntimeMaxSec=900` durdurur. Başarılı bir `Type=exec` unit'i bittikten sonra `ExecMainCode=0` gösterir, 1 değil [P].
+- **Ayrıcalık ayrımlı snapshot (m1b).** Eski akışta root, `openPinned` (O_NOFOLLOW) ile data.db inode'unu sabitleyip SQLite'a `/proc/self/fd/N` yolunu veriyordu; ancak SQLite'ın unix VFS'i veritabanı yolundaki symlink'i çözüp (`unixFullPathname`) **adıyla** yeniden açıyor ve `-wal`/`-shm`'yi de adıyla açıyordu, dolayısıyla bir tenant root'un okumasını başka bir branch'e ya da kontrol düzlemine yönlendirebiliyordu (gerçek VM'de `leaked=5`; container'da data.db flip yarışı `leaked≥1` [P]). Artık kopya `incibase-snapshot@<id>` biriminde branch uid'siyle alınır ve root staging dosyasını yalnızca fd ile içeri alır (yukarıda §3.2 D.3.1). `openPinned` kaldırıldı. Birim `Type=exec`, `RuntimeMaxSec=900`, EnvironmentFile yok (kopya sır istemez), yalnızca `data/` ve `snapshot/` yazılabilir. `data/` yazılabilir çünkü SQLite'ın okuyucusu WAL modunda `-shm`'yi map'ler. `provision`/`render` branch ağacına `snapshot/` (ib-<id> 0700) ekler; eski branch'lerde `host render` onu oluşturur. `host-snapshot-linux.test.ts` branch uid'siyle root'a karşı yarışan bir saldırı paketidir (data.db/-wal/-shm symlink'leri, staging çıktısının /etc/shadow'a / registry'ye / başka branch'e symlink'i, FIFO, hard link, dev sparse dosya, SQLite olmayan dosya): benzersiz bir sır markerının hiç sızmadığını, asılı kalınmadığını ve gerçek snapshot + restore'un hâlâ çalıştığını doğrular; VM'ye bağlı değildir (container'da da 4/4 geçer).
+- `incibase-preflight@.service` `Type=exec`, oneshot değil [P]: systemd `Type=oneshot` ile `RestartForceExitStatus=` kabul etmiyor ("isn't allowed for Type=oneshot services. Refusing"). Job, unit bitene kadar `systemctl show`'u yoklar; asılı kalan preflight'ı `RuntimeMaxSec=900` durdurur. Başarılı bir `Type=exec` unit'i bittikten sonra `ExecMainCode=0` gösterir, 1 değil [P]. Aynısı `incibase-snapshot@.service` için de geçerli.
 - `INCIBASE_GENERATION` env dosyasında değil, drop-in'de `Environment=` olarak durur; env dosyası release'ler arasında değişmez.
 - Unit adları bir önekten gelir (varsayılan `incibase`): test host'ları `incibase-s10-branch@<id>.service` gibi kendi adlarını kullanır. `incibase-s10.slice` systemd'nin ad hiyerarşisi yüzünden `incibase.slice`'ın altına düşer.
 - Gate, generation'ı en az 1 s arayla iki kez ve arada restart olmadan görmeden geçmez: hazır olup hemen çöken bir release'i yakalar. `migration_committed`, restart'tan önce alınan journal cursor'ından sonraki ve sürecin kendisinin yazdığı (`_SYSTEMD_INVOCATION_ID` olan) satırlarda, en üst düzeyde `ev` olarak aranır; uygulamanın `console` çıktısı sayılmaz. `journalctl -o json` 4096 byte'tan uzun alanları `--all` olmadan `null` basıyor [P].
@@ -398,6 +400,7 @@ Ayrıca render edilenler:
       data/       ib-<id> 0700            LOCK, data.db*, storage/
       releases/<seq>/app.ib               root:ib-<id> 0640 (son 5)
       preflight/  ib-<id> 0700            geçici
+      snapshot/   ib-<id> 0700            incibase-snapshot@<id>'nin yazdığı staging kopyası (snapshot.db)
       run/http/   ib-<id>:incibase-proxy 2750;  run/admin/  ib-<id>:incibase-admin 2750
   backups/<id>/pre-<seq>.db  root 0600    (production, son 3)
   trash/     root 0700                    yalnızca production silmeleri, 7 gün

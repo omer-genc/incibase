@@ -7,7 +7,7 @@ import { HostLayout } from "../src/host/layout.ts";
 import * as ops from "../src/host/ops.ts";
 import { renderBranchFiles } from "../src/host/provision.ts";
 import type { BranchRow } from "../src/host/registry.ts";
-import { branchDropIn, branchTemplateUnit, envFileContent, preflightDropIn, preflightTemplateUnit, sliceUnit } from "../src/host/render.ts";
+import { branchDropIn, branchTemplateUnit, envFileContent, preflightDropIn, preflightTemplateUnit, sliceUnit, snapshotDropIn, snapshotTemplateUnit } from "../src/host/render.ts";
 import { closeOpsHosts, fakeBundle, fakeOpsHost, parseEnvFile } from "./host-helpers.ts";
 
 afterEach(closeOpsHosts);
@@ -103,6 +103,23 @@ RuntimeMaxSec=900
 ${SANDBOX("/var/lib/incibase/branches/%i/preflight")}`);
   });
 
+  test("the snapshot template: the same sandbox, no env file, only data/ and snapshot/ writable", () => {
+    expect(snapshotTemplateUnit(layout)).toBe(`${HEADER}[Unit]
+Description=incibase snapshot %i
+RequiresMountsFor=/var/lib/incibase
+
+[Service]
+Type=exec
+Slice=incibase.slice
+WorkingDirectory=/var/lib/incibase/branches/%i
+Environment=HOME=/nonexistent NO_COLOR=1 BUN_RUNTIME_TRANSPILER_CACHE_PATH=0
+# A copy that runs this long is stopped (Result=timeout).
+RuntimeMaxSec=900
+${SANDBOX("/var/lib/incibase/branches/%i/data /var/lib/incibase/branches/%i/snapshot")}`);
+    // The control plane, the snapshots and the trash are out of its reach like a branch's.
+    expect(snapshotTemplateUnit(layout)).toContain("InaccessiblePaths=-/var/lib/incibase/control -/var/lib/incibase/trash -/var/lib/incibase/backups\n");
+  });
+
   test("the slice caps all branches together", () => {
     expect(sliceUnit(3 * 1024 * MiB)).toBe(`${HEADER}[Unit]\nDescription=incibase branches\n\n[Slice]\nMemoryMax=3G\n`);
     expect(sliceUnit(null)).toBe(`${HEADER}[Unit]\nDescription=incibase branches\n\n[Slice]\n`);
@@ -159,6 +176,22 @@ TimeoutStopSec=25
 `);
   });
 
+  test("the snapshot drop-in runs the pinned runtime's _snapshot as the branch, with its limits", () => {
+    expect(snapshotDropIn(layout, branch)).toBe(`${HEADER}[Service]
+User=ib-b7k2m9q4
+Group=ib-b7k2m9q4
+ExecStart=
+ExecStart=/usr/local/lib/incibase/0.3.1/incibase _snapshot --data /var/lib/incibase/branches/b7k2m9q4/data --out /var/lib/incibase/branches/b7k2m9q4/snapshot/snapshot.db
+MemoryMax=512M
+MemoryHigh=460M
+MemorySwapMax=0
+CPUQuota=100%
+TasksMax=256
+TimeoutStopSec=25
+`);
+    expect(() => snapshotDropIn(layout, { ...branch, runtime_version: "0.3.1 --evil" })).toThrow(/Invalid runtime version/);
+  });
+
   test("nothing that systemd would expand or split reaches a unit file", () => {
     const render = (patch: Partial<BranchRow>, domain = "incibase.omergenc.net") =>
       branchDropIn({ layout, branch: { ...branch, ...patch }, domain, release: { seq: 7, status: "live", allow_field_removal: 0 } });
@@ -176,6 +209,7 @@ TimeoutStopSec=25
     const test = new HostLayout({ root: "/var/lib/incibase-s10", unitPrefix: "incibase-s10" });
     expect(test.units.branch("b7k2m9q4")).toBe("incibase-s10-branch@b7k2m9q4.service");
     expect(test.units.preflight("b7k2m9q4")).toBe("incibase-s10-preflight@b7k2m9q4.service");
+    expect(test.units.snapshot("b7k2m9q4")).toBe("incibase-s10-snapshot@b7k2m9q4.service");
     expect(test.units.job("release", "b7k2m9q4", 3)).toBe("incibase-s10-release-b7k2m9q4-3.service");
     expect(test.units.slice).toBe("incibase-s10.slice");
     expect(branchTemplateUnit(test)).toContain("Slice=incibase-s10.slice\n");
@@ -236,9 +270,10 @@ describe("the env file", () => {
 describe("rendering on a host", () => {
   test("init writes the host's units; a second render writes nothing and reloads nothing", async () => {
     const host = await fakeOpsHost();
-    for (const name of ["incibase-branch@.service", "incibase-preflight@.service", "incibase.slice"]) {
+    for (const name of ["incibase-branch@.service", "incibase-preflight@.service", "incibase-snapshot@.service", "incibase.slice"]) {
       expect(host.sys.lstat(host.layout.unitFile(name))).toMatchObject({ type: "file", uid: 0, gid: 0, mode: 0o644 });
     }
+    expect(readFileSync(host.layout.unitFile("incibase-snapshot@.service"), "utf8")).toBe(snapshotTemplateUnit(host.layout));
     expect(readFileSync(host.layout.unitFile("incibase-branch@.service"), "utf8")).toBe(branchTemplateUnit(host.layout));
     await ops.createProject(host, { slug: "shop" });
     await ops.addRelease(host, { project: "shop", branch: "dev", file: fakeBundle(host.dir, "v1") });

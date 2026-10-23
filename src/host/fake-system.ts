@@ -4,7 +4,18 @@
 // that provisioning resumes from every point.
 import { copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { checkAccountName, listDir, SystemCommandError, type FileInfo, type GroupEntry, type HostSystem, type NewUser, type PasswdEntry, type PinnedFile } from "./system.ts";
+import {
+  checkAccountName,
+  ingestByFd,
+  listDir,
+  SystemCommandError,
+  type FileInfo,
+  type GroupEntry,
+  type HostSystem,
+  type IngestOptions,
+  type NewUser,
+  type PasswdEntry,
+} from "./system.ts";
 
 export class SimulatedCrash extends Error {
   constructor(readonly op: string) {
@@ -116,15 +127,6 @@ export class FakeSystem implements HostSystem {
     return { type, uid: meta?.uid ?? 0, gid: meta?.gid ?? 0, mode: meta?.mode ?? st.mode & 0o7777, size: st.size, mtimeMs: st.mtimeMs };
   }
 
-  openPinned(path: string): PinnedFile | null {
-    const info = this.lstat(path);
-    if (!info) return null;
-    if (info.type === "symlink") throw new Error(`${path} is a symlink; refusing to open it`);
-    // No TOCTOU to simulate on a single-threaded fake: the real file under the
-    // temp root is handed back by its own path, with the recorded owner.
-    return { path, info, close: () => {} };
-  }
-
   mkdir(path: string, mode: number) {
     this.change(`mkdir ${path}`);
     try {
@@ -193,6 +195,28 @@ export class FakeSystem implements HostSystem {
       throw err;
     }
     this.meta.set(to, { ...owner });
+  }
+
+  /**
+   * The real by-fd checks and copy (O_NOFOLLOW, O_NONBLOCK, fstat type, link
+   * count and size), with the owner taken from this system's records of the
+   * path, since the files are really the test user's.
+   */
+  ingestFile(from: string, to: string, options: IngestOptions) {
+    this.change(`ingest ${from} ${to}`);
+    const size = ingestByFd(from, to, options, { uidOf: () => this.meta.get(from)?.uid ?? 0, chown: false });
+    this.meta.set(to, { ...options.owner });
+    return size;
+  }
+
+  unlink(path: string) {
+    this.change(`unlink ${path}`);
+    try {
+      unlinkSync(path);
+    } catch (err) {
+      if ((err as { code?: string }).code !== "ENOENT") throw err;
+    }
+    this.meta.delete(path);
   }
 
   readFile(path: string) {

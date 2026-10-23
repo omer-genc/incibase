@@ -11,6 +11,7 @@
 //         data/                   ib-<id> 0700
 //         releases/               root:ib-<id> 0750   <seq>/app.ib root:ib-<id> 0640
 //         preflight/              ib-<id> 0700
+//         snapshot/               ib-<id> 0700   the snapshot unit's staging file
 //         run/                    root 0711
 //           http/                 ib-<id>:<proxy group> 2750
 //           admin/                ib-<id>:<admin group> 2750
@@ -22,7 +23,7 @@
 // (`/usr/local/bin/incibase` -> one of them, `host use-cli`) and the
 // systemd units (design section 5.4), named after a unit prefix:
 // `incibase-branch@.service`, `incibase-preflight@.service`,
-// `incibase.slice`, per-branch drop-ins and the transient
+// `incibase-snapshot@.service`, `incibase.slice`, per-branch drop-ins and the transient
 // `incibase-release-<id>-<seq>` jobs. A test host picks its own prefix, so
 // hosts sharing a machine never touch each other's units.
 import { isAbsolute, join, normalize, relative } from "node:path";
@@ -105,6 +106,10 @@ export interface BranchPaths {
   data: string;
   releases: string;
   preflight: string;
+  /** Where the snapshot unit (as the branch) writes its copy for root to take in. */
+  snapshot: string;
+  /** The staging file in it: `snapshot/snapshot.db`. */
+  snapshotFile: string;
   run: string;
   runHttp: string;
   httpSock: string;
@@ -120,9 +125,12 @@ export interface UnitNames {
   slice: string;
   branchTemplate: string;
   preflightTemplate: string;
+  snapshotTemplate: string;
   /** `<prefix>-branch@<id>.service`. */
   branch(id: string): string;
   preflight(id: string): string;
+  /** `<prefix>-snapshot@<id>.service`: `VACUUM INTO` as the branch, in its sandbox. */
+  snapshot(id: string): string;
   /** `<prefix>-check.service`, the health check `<prefix>-check.timer` runs every 30 s. */
   checkService: string;
   checkTimer: string;
@@ -164,10 +172,12 @@ export class HostLayout {
       slice: `${prefix}.slice`,
       branchTemplate: `${prefix}-branch@.service`,
       preflightTemplate: `${prefix}-preflight@.service`,
+      snapshotTemplate: `${prefix}-snapshot@.service`,
       checkService: `${prefix}-check.service`,
       checkTimer: `${prefix}-check.timer`,
       branch: (id) => `${prefix}-branch@${checkBranchId(id)}.service`,
       preflight: (id) => `${prefix}-preflight@${checkBranchId(id)}.service`,
+      snapshot: (id) => `${prefix}-snapshot@${checkBranchId(id)}.service`,
       job: (kind, id, n) => {
         if (!Number.isSafeInteger(n) || n < 0) throw new NameError(`Invalid job number ${n}`);
         return `${prefix}-${kind}-${checkBranchId(id)}-${n}.service`;
@@ -278,6 +288,8 @@ export class HostLayout {
       data: join(dir, "data"),
       releases: join(dir, "releases"),
       preflight: join(dir, "preflight"),
+      snapshot: join(dir, "snapshot"),
+      snapshotFile: join(dir, "snapshot", "snapshot.db"),
       run,
       runHttp,
       httpSock: join(runHttp, "http.sock"),
@@ -297,6 +309,7 @@ export class HostLayout {
       spec(b.data, "branch", "branch", 0o700),
       spec(b.releases, "root", "branch", 0o750),
       spec(b.preflight, "branch", "branch", 0o700),
+      spec(b.snapshot, "branch", "branch", 0o700),
       spec(b.run, "root", "root", 0o711),
       // setgid: the sockets serve creates inherit the group, and with its chmod 0770 only that group may connect.
       spec(b.runHttp, "branch", this.groups.proxy, 0o2750),

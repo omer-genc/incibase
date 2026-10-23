@@ -4,7 +4,6 @@
 // tests against LinuxSystem. Commands run from argument arrays, never a
 // shell; every name is checked before it reaches one.
 import {
-  copyFileSync,
   constants as fsConstants,
   closeSync,
   fchmodSync,
@@ -18,6 +17,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  readSync,
   renameSync,
   rmSync,
   statfsSync,
@@ -25,6 +25,7 @@ import {
   unlinkSync,
   writeSync,
   chmodSync,
+  type Stats,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
@@ -62,17 +63,29 @@ export interface NewUser {
   comment: string;
 }
 
-/**
- * A file opened read-only with its inode pinned: `path` reads that inode
- * however the directory entry is swapped afterwards (a branch cannot make a
- * reader follow a symlink planted in its place). The caller must `close()`.
- */
-export interface PinnedFile {
-  /** A path that opens the pinned inode (`/proc/self/fd/<fd>` on Linux). */
-  path: string;
-  /** The inode as fstat reports it (not the directory entry). */
-  info: FileInfo;
-  close(): void;
+export interface Owner {
+  uid: number;
+  gid: number;
+  mode: number;
+}
+
+export interface IngestOptions {
+  /** The only owner the file may have: the branch whose unit wrote it. */
+  uid: number;
+  /** Larger is refused before a byte is copied. */
+  maxBytes: number;
+  /** Owner and mode of the copy. */
+  owner: Owner;
+  /** Sees the file's first bytes (up to 100) and its size before the copy; a string refuses it with that reason. */
+  check?: (head: Uint8Array, size: number) => string | null;
+}
+
+/** A file a branch left for root was refused; nothing was copied. */
+export class IngestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IngestError";
+  }
 }
 
 export interface HostSystem {
@@ -92,12 +105,6 @@ export interface HostSystem {
 
   /** The path itself, never what a symlink points at; null when missing. */
   lstat(path: string): FileInfo | null;
-  /**
-   * Opens `path` read-only without following a symlink and pins the inode;
-   * null when `path` is missing. Throws when `path` is a symlink. The caller
-   * reads `.path` (bound to the inode, race-free) and `close()`s it.
-   */
-  openPinned(path: string): PinnedFile | null;
   /** One directory level; an existing directory is fine. */
   mkdir(path: string, mode: number): void;
   /** Owner of the path itself (lchown). */
@@ -109,8 +116,21 @@ export interface HostSystem {
   readlink(path: string): string | null;
   /** Writes `content` to a temp file next to `path` with the owner and mode, syncs it and renames it over `path`. */
   writeFile(path: string, content: string, owner: { uid: number; gid: number; mode: number }): void;
-  /** Copies the file `from` (not following a link) the same way: temp file with owner and mode, fsync, rename. */
+  /** Copies the file `from` (not following a link) the same way, by fd: temp file with owner and mode, fsync, rename. */
   copyFile(from: string, to: string, owner: { uid: number; gid: number; mode: number }): void;
+  /**
+   * Takes in a file a branch controls without trusting its directory entry
+   * (design section 3.2 D.3.1): opens `from` once with
+   * O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC (a symlink is refused, a FIFO
+   * cannot block), checks from that fd that it is a regular file owned by
+   * `uid` with one link and at most `maxBytes`, and copies its bytes by fd
+   * into `to`, a new file (O_CREAT|O_EXCL|O_NOFOLLOW) that gets `owner` and
+   * an fsync. Throws IngestError and leaves no `to` when it refuses. Returns
+   * the bytes copied.
+   */
+  ingestFile(from: string, to: string, options: IngestOptions): number;
+  /** Removes one directory entry with unlink(2): never follows it, never recurses. Missing is fine; a directory throws. */
+  unlink(path: string): void;
   readFile(path: string): string | null;
   /** Names in a directory, sorted; empty when it is missing. */
   readdir(path: string): string[];
@@ -201,6 +221,86 @@ function removeQuietly(path: string) {
   }
 }
 
+/** Bun opens every file close-on-exec already; this says so explicitly where it matters. */
+const O_CLOEXEC = process.platform === "linux" ? 0o2000000 : process.platform === "darwin" ? 0x1000000 : 0;
+/** Reads a file a branch may control: never through a symlink, never blocking on a FIFO. */
+const OPEN_UNTRUSTED = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK | O_CLOEXEC;
+/** Creates a file that must be new: a planted file or symlink makes it fail (EEXIST). */
+const CREATE_NEW = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW | O_CLOEXEC;
+const COPY_CHUNK = 1024 * 1024;
+
+/** Opens `path` with OPEN_UNTRUSTED; a symlink, a socket or a missing file is an IngestError. */
+function openUntrusted(path: string): number {
+  try {
+    return openSync(path, OPEN_UNTRUSTED);
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === "ENOENT") throw new IngestError(`${path} does not exist`);
+    // O_NOFOLLOW turns a symlink final component into ELOOP (EMLINK on some BSDs): it is never followed.
+    if (code === "ELOOP" || code === "EMLINK") throw new IngestError(`${path} is a symlink; refusing to read it`);
+    if (code === "ENXIO" || code === "EOPNOTSUPP") throw new IngestError(`${path} is not a regular file`);
+    throw err;
+  }
+}
+
+function describeType(st: Stats): string {
+  return st.isDirectory() ? "a directory" : st.isFIFO() ? "a FIFO" : st.isSocket() ? "a socket" : st.isSymbolicLink() ? "a symlink" : "not a regular file";
+}
+
+/** Copies exactly `size` bytes from `src` to `dst` by fd; a source that shrinks or grows meanwhile is refused. */
+function copyBytes(src: number, dst: number, size: number, what: string) {
+  const buffer = Buffer.allocUnsafe(Math.min(COPY_CHUNK, Math.max(size, 1)));
+  let done = 0;
+  while (done < size) {
+    const n = readSync(src, buffer, 0, Math.min(buffer.length, size - done), done);
+    if (n === 0) throw new IngestError(`${what} shrank while it was copied`);
+    let written = 0;
+    while (written < n) written += writeSync(dst, buffer, written, n - written);
+    done += n;
+  }
+  if (readSync(src, buffer, 0, 1, size) !== 0) throw new IngestError(`${what} grew while it was copied`);
+}
+
+/**
+ * HostSystem.ingestFile for both systems: `uidOf` says who owns the opened
+ * inode (fstat on Linux; FakeSystem's records in tests), `chown` whether the
+ * copy's owner can be set (only root can).
+ */
+export function ingestByFd(from: string, to: string, options: IngestOptions, platform: { uidOf: (st: Stats) => number; chown: boolean }): number {
+  const src = openUntrusted(from);
+  let dst: number | null = null;
+  try {
+    const st = fstatSync(src);
+    if (!st.isFile()) throw new IngestError(`${from} is ${describeType(st)}; refusing to read it`);
+    const uid = platform.uidOf(st);
+    if (uid !== options.uid) throw new IngestError(`${from} is owned by uid ${uid}, not ${options.uid}; refusing to read it`);
+    if (st.nlink !== 1) throw new IngestError(`${from} has ${st.nlink} links; refusing to read it`);
+    if (st.size > options.maxBytes) throw new IngestError(`${from} is ${st.size} bytes, more than the ${options.maxBytes} allowed; refusing to copy it`);
+    if (options.check) {
+      const head = Buffer.alloc(Math.min(100, st.size));
+      const n = head.length ? readSync(src, head, 0, head.length, 0) : 0;
+      const problem = options.check(head.subarray(0, n), st.size);
+      if (problem) throw new IngestError(`${from}: ${problem}`);
+    }
+    dst = openSync(to, CREATE_NEW, 0o600);
+    if (platform.chown) fchownSync(dst, checkId(options.owner.uid), checkId(options.owner.gid));
+    fchmodSync(dst, platform.chown ? options.owner.mode : 0o600);
+    copyBytes(src, dst, st.size, from);
+    fsyncSync(dst);
+    closeSync(dst);
+    dst = null;
+    return st.size;
+  } catch (err) {
+    if (dst !== null) {
+      closeSync(dst);
+      removeQuietly(to); // Never a partial copy (e.g. ENOSPC).
+    }
+    throw err;
+  } finally {
+    closeSync(src);
+  }
+}
+
 function fsyncDir(dir: string) {
   const fd = openSync(dir, "r");
   try {
@@ -288,39 +388,6 @@ export class LinuxSystem implements HostSystem {
     return fileInfo(checkPath(path));
   }
 
-  openPinned(path: string): PinnedFile | null {
-    let fd: number;
-    try {
-      fd = openSync(checkPath(path), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    } catch (err) {
-      const code = (err as { code?: string }).code;
-      if (code === "ENOENT") return null;
-      // O_NOFOLLOW turns a symlink final component into ELOOP: the caller never follows it.
-      if (code === "ELOOP") throw new Error(`${path} is a symlink; refusing to open it`);
-      throw err;
-    }
-    try {
-      const st = fstatSync(fd);
-      const type = st.isDirectory() ? "dir" : st.isFile() ? "file" : "other";
-      const info: FileInfo = { type, uid: st.uid, gid: st.gid, mode: st.mode & 0o7777, size: st.size, mtimeMs: st.mtimeMs };
-      // The kernel resolved O_NOFOLLOW at open, so the fd is never a symlink.
-      return {
-        path: `/proc/self/fd/${fd}`,
-        info,
-        close: () => {
-          try {
-            closeSync(fd);
-          } catch {
-            // Already closed.
-          }
-        },
-      };
-    } catch (err) {
-      closeSync(fd);
-      throw err;
-    }
-  }
-
   mkdir(path: string, mode: number) {
     try {
       mkdirSync(checkPath(path), { mode });
@@ -387,27 +454,50 @@ export class LinuxSystem implements HostSystem {
   }
 
   copyFile(from: string, to: string, owner: { uid: number; gid: number; mode: number }) {
-    const info = fileInfo(checkPath(from));
-    if (info?.type !== "file") throw new Error(`${from} is not a regular file`);
     const temp = tempPath(checkPath(to));
     removeQuietly(temp);
-    // COPYFILE_EXCL refuses a planted symlink or a pre-existing temp.
+    // By fd from start to end: the source is opened once without following a link, and the temp is created
+    // new (a planted symlink or file fails) and given its owner and mode before a byte is written.
+    let src: number;
     try {
-      copyFileSync(from, temp, fsConstants.COPYFILE_EXCL);
-      const fd = openSync(temp, "r+");
+      src = openUntrusted(checkPath(from));
+    } catch (err) {
+      if (err instanceof IngestError) throw new Error(`${from} is not a regular file: ${err.message}`);
+      throw err;
+    }
+    try {
+      const st = fstatSync(src);
+      if (!st.isFile()) throw new Error(`${from} is not a regular file`);
+      const dst = openSync(temp, CREATE_NEW, 0o600);
       try {
-        fchownSync(fd, checkId(owner.uid), checkId(owner.gid));
-        fchmodSync(fd, owner.mode);
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
+        fchownSync(dst, checkId(owner.uid), checkId(owner.gid));
+        fchmodSync(dst, owner.mode);
+        copyBytes(src, dst, st.size, from);
+        fsyncSync(dst);
+      } catch (err) {
+        closeSync(dst);
+        removeQuietly(temp); // A partial copy (e.g. ENOSPC) is never left behind.
+        throw err;
       }
+      closeSync(dst);
+    } finally {
+      closeSync(src);
+    }
+    try {
       renameSync(temp, to);
     } catch (err) {
-      removeQuietly(temp); // A partial copy (e.g. ENOSPC) is never left behind.
+      removeQuietly(temp);
       throw err;
     }
     fsyncDir(dirname(to));
+  }
+
+  ingestFile(from: string, to: string, options: IngestOptions) {
+    return ingestByFd(checkPath(from), checkPath(to), options, { uidOf: (st) => st.uid, chown: true });
+  }
+
+  unlink(path: string) {
+    removeQuietly(checkPath(path));
   }
 
   readFile(path: string) {

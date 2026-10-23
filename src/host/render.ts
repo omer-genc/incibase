@@ -1,7 +1,7 @@
 // Files rendered from the registry (design section 5.4): the env file,
-// service-keys.json, admin/index.json and the systemd units: the template
-// `incibase-branch@.service`, `incibase-preflight@.service`, `incibase.slice`
-// and each branch's drop-in. The text builders here are pure; the writers
+// service-keys.json, admin/index.json and the systemd units: the templates
+// `incibase-branch@.service`, `incibase-preflight@.service` and
+// `incibase-snapshot@.service`, `incibase.slice` and each branch's drop-ins. The text builders here are pure; the writers
 // write a file atomically (temp file, fsync, rename, via HostSystem) and only
 // when its content, owner or mode differ, and say whether a unit file changed,
 // so the caller runs `systemctl daemon-reload` once, and only then.
@@ -173,6 +173,33 @@ ${sandbox(layout, [instancePath(layout.branches, "/preflight")])}
 `;
 }
 
+/** How long a snapshot may run before systemd stops it (Result=timeout); the job waits a little longer. */
+export const SNAPSHOT_RUNTIME_MAX_SEC = 900;
+
+/**
+ * `incibase-snapshot@.service`: `incibase _snapshot` as the branch, in the
+ * same sandbox (design section 3.2 D.3.1). Root never opens a branch's
+ * database: this unit copies it with the branch's own rights into its
+ * staging dir, so a symlink or a swapped file can only ever point it at what
+ * the branch could read anyway. data/ is writable because SQLite's reader
+ * maps data.db-shm; nothing else is. No EnvironmentFile: the copy needs no secret.
+ */
+export function snapshotTemplateUnit(layout: HostLayout): string {
+  return `${HEADER}[Unit]
+Description=incibase snapshot %i
+RequiresMountsFor=${word(layout.root)}
+
+[Service]
+Type=exec
+Slice=${layout.units.slice}
+WorkingDirectory=${instancePath(layout.branches)}
+Environment=${BRANCH_ENVIRONMENT}
+# A copy that runs this long is stopped (Result=timeout).
+RuntimeMaxSec=${SNAPSHOT_RUNTIME_MAX_SEC}
+${sandbox(layout, [instancePath(layout.branches, "/data"), instancePath(layout.branches, "/snapshot")])}
+`;
+}
+
 /** `incibase.slice`: all branches together stay under this much memory. */
 export function sliceUnit(memoryMax: number | null): string {
   return `${HEADER}[Unit]
@@ -299,6 +326,22 @@ ${limitLines(limits, config)}
 `;
 }
 
+/** `incibase-snapshot@<id>.service.d/10-incibase.conf`: the branch's user and limits, its pinned runtime's `_snapshot`. */
+export function snapshotDropIn(layout: HostLayout, branch: BranchRow): string {
+  const limits = resolveLimits(parseLimits(branch.limits_json));
+  const config = parseConfig(branch.config_json);
+  const paths = layout.branch(branch.id);
+  const command = [layout.runtimeBinary(branch.runtime_version), "_snapshot", "--data", paths.data, "--out", paths.snapshotFile].map(word).join(" ");
+  const user = branchUser(branch.id);
+  return `${HEADER}[Service]
+User=${user}
+Group=${user}
+ExecStart=
+ExecStart=${command}
+${limitLines(limits, config)}
+`;
+}
+
 /** What the host derives into a branch's env file, next to the registry's rows. */
 export function derivedEnv(layout: HostLayout, branch: BranchRow): Record<string, string> {
   const limits = resolveLimits(parseLimits(branch.limits_json));
@@ -344,6 +387,7 @@ export function renderHostUnits(ctx: HostContext): boolean {
   const sliceMax = Number(registry.getSetting("slice_memory_max"));
   let changed = writeIfChanged(ctx, layout.unitFile(layout.units.branchTemplate), branchTemplateUnit(layout), UNIT_FILE);
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.preflightTemplate), preflightTemplateUnit(layout), UNIT_FILE) || changed;
+  changed = writeIfChanged(ctx, layout.unitFile(layout.units.snapshotTemplate), snapshotTemplateUnit(layout), UNIT_FILE) || changed;
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.slice), sliceUnit(Number.isSafeInteger(sliceMax) && sliceMax > 0 ? sliceMax : null), UNIT_FILE) || changed;
   if (ctx.self) changed = renderCheckUnits(ctx, ctx.self) || changed;
   return changed;
@@ -441,11 +485,25 @@ export function renderPreflightUnit(ctx: HostContext, input: Omit<PreflightUnitI
   return writeIfChanged(ctx, dropIn, preflightDropIn({ ...input, layout, domain: hostDomain(ctx) }), UNIT_FILE);
 }
 
+/**
+ * Writes the snapshot template (a host rendered before it existed gets it
+ * here) and the branch's snapshot drop-in; true when a unit file changed.
+ */
+export function renderSnapshotUnit(ctx: HostContext, branch: BranchRow): boolean {
+  const { layout } = ctx;
+  ensureDir(ctx, layout.systemdDir);
+  let changed = writeIfChanged(ctx, layout.unitFile(layout.units.snapshotTemplate), snapshotTemplateUnit(layout), UNIT_FILE);
+  const dropIn = layout.dropIn(layout.units.snapshot(branch.id));
+  ensureDir(ctx, dropIn.slice(0, dropIn.lastIndexOf("/")));
+  changed = writeIfChanged(ctx, dropIn, snapshotDropIn(layout, branch), UNIT_FILE) || changed;
+  return changed;
+}
+
 /** Removes a branch's drop-ins and boot link; true when something was there. */
 export function removeBranchUnits(ctx: HostContext, id: string): boolean {
   const { layout } = ctx;
   let changed = removeIfPresent(ctx, layout.wantsLink(id).path);
-  for (const unit of [layout.units.branch(id), layout.units.preflight(id)]) {
+  for (const unit of [layout.units.branch(id), layout.units.preflight(id), layout.units.snapshot(id)]) {
     const dropIn = layout.dropIn(unit);
     if (removeIfPresent(ctx, dropIn.slice(0, dropIn.lastIndexOf("/")))) changed = true;
   }
