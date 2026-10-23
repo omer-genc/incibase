@@ -8,13 +8,21 @@
 //                   or a published release: incibase-linux-<arch> and
 //                   SHA256SUMS from GitHub. Nothing unverified is kept: the
 //                   bytes are staged in a root-only temp file, hashed, and only
-//                   renamed into place when they match. Installing the same
-//                   bytes again changes nothing; other bytes under an installed
-//                   version are refused.
+//                   renamed into place when they match; what a killed install
+//                   staged is swept once it is older than any install runs.
+//                   Installing the same bytes again changes nothing; other
+//                   bytes under an installed version, or under one on disk
+//                   without a record, are refused. Every redirect hop of a
+//                   download must be https.
 //   useCli          points /usr/local/bin/incibase at an installed runtime.
 //   gcRuntimes      removes the runtimes nothing uses: no branch pins them,
 //                   the CLI link does not point at them, and this process does
-//                   not run from them.
+//                   not run from them; and what killed installs left.
+//
+// A runtime root belongs to one host (`.incibase-host` in it names the host
+// root): gc counts only its own registry's pins, so two hosts sharing one
+// would remove each other's runtimes. Installs and gc refuse a root another
+// host claimed.
 import { closeSync, fsyncSync, openSync, realpathSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
@@ -53,6 +61,8 @@ export function runtimeAsset(arch: string = process.arch): string {
   throw new OpError("INVALID", `No incibase runtime is published for the ${JSON.stringify(arch)} architecture: only x64 and arm64`);
 }
 
+const isLoopback = (url: URL) => ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+
 /** The releases base URL, checked: https (or http on a loopback host), no credentials, query or fragment. */
 export function releasesBase(raw: string = DEFAULT_RELEASES_URL): string {
   let url: URL;
@@ -61,8 +71,7 @@ export function releasesBase(raw: string = DEFAULT_RELEASES_URL): string {
   } catch {
     throw new OpError("INVALID", `Invalid releases URL ${JSON.stringify(raw)}`);
   }
-  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  if (!(url.protocol === "https:" || (url.protocol === "http:" && loopback)) || url.username || url.password || url.search || url.hash) {
+  if (!(url.protocol === "https:" || (url.protocol === "http:" && isLoopback(url))) || url.username || url.password || url.search || url.hash) {
     throw new OpError("INVALID", `The releases URL must be https (http only on localhost), without credentials, query or fragment: ${JSON.stringify(raw)}`);
   }
   return url.href.replace(/\/+$/, "");
@@ -101,22 +110,48 @@ export async function sha256File(path: string): Promise<{ sha256: string; bytes:
 
 // ---- downloads ----------------------------------------------------------------------
 
-const isLoopback = (url: URL) => ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+/** GitHub sends a release asset on to its object store: one redirect, a few at most. */
+const MAX_REDIRECTS = 5;
 
+/**
+ * GETs `url`, following redirects one by one so that every hop is checked,
+ * not only the last: each must be https, or http on loopback when the
+ * download started there (tests). One plain-http hop in the middle would let
+ * whoever sits on it send the rest of the chain anywhere.
+ */
 async function get(url: string, signal: AbortSignal): Promise<Response> {
-  let res: Response;
-  try {
-    // identity: Content-Length is then the size of the bytes read, so a cut-off download is noticed.
-    res = await fetch(url, { redirect: "follow", signal, headers: { "accept-encoding": "identity", "user-agent": `incibase/${VERSION}` } });
-  } catch (err) {
-    throw new OpError("FAILED", `Could not download ${url}: ${(err as Error).message}`);
+  const start = new URL(url);
+  let current = start;
+  for (let hops = 0; ; hops++) {
+    let res: Response;
+    try {
+      // identity: Content-Length is then the size of the bytes read, so a cut-off download is noticed.
+      res = await fetch(current.href, { redirect: "manual", signal, headers: { "accept-encoding": "identity", "user-agent": `incibase/${VERSION}` } });
+    } catch (err) {
+      throw new OpError("FAILED", `Could not download ${url}: ${(err as Error).message}`);
+    }
+    if ([301, 302, 303, 307, 308].includes(res.status)) {
+      await res.body?.cancel();
+      const location = res.headers.get("location");
+      if (location === null) throw new OpError("FAILED", `${url} answered ${res.status} without a Location`);
+      let next: URL;
+      try {
+        next = new URL(location, current);
+      } catch {
+        throw new OpError("FAILED", `${url} redirected to an invalid URL ${JSON.stringify(location)}`);
+      }
+      if (!(next.protocol === "https:" || (next.protocol === "http:" && isLoopback(start) && isLoopback(next))) || next.username || next.password) {
+        throw new OpError("FAILED", `${url} redirected to ${next.protocol}//${next.host}, which is not https`);
+      }
+      if (hops >= MAX_REDIRECTS) throw new OpError("FAILED", `${url} redirected more than ${MAX_REDIRECTS} times`);
+      current = next;
+      continue;
+    }
+    return checkStatus(url, res);
   }
-  // GitHub redirects release assets to its object store; a redirect must not leave https.
-  const final = new URL(res.url || url);
-  if (final.protocol !== "https:" && !(final.protocol === "http:" && isLoopback(final))) {
-    await res.body?.cancel();
-    throw new OpError("FAILED", `${url} redirected to ${final.protocol}//${final.host}, which is not https`);
-  }
+}
+
+async function checkStatus(url: string, res: Response): Promise<Response> {
   if (res.status === 404) {
     await res.body?.cancel();
     throw new OpError("NOT_FOUND", `${url} does not exist (404)`);
@@ -227,6 +262,58 @@ export interface InstallResult {
   source: string;
 }
 
+// ---- the runtime root ----------------------------------------------------------------
+
+/** In the runtime root: the host root whose registry records the runtimes there. */
+export const RUNTIME_OWNER_FILE = ".incibase-host";
+
+/**
+ * Checks that the runtime root is this host's, and with `claim` marks it so
+ * when it is no one's yet. Two hosts never share one: each one's gc counts
+ * only its own branches' pins, so it would remove what the other's run.
+ */
+function checkRuntimeOwner(ctx: OpsContext, claim: boolean): void {
+  const { sys, layout } = ctx;
+  const marker = join(layout.runtimeRoot, RUNTIME_OWNER_FILE);
+  const info = sys.lstat(marker);
+  if (!info) {
+    if (claim) sys.writeFile(marker, `${layout.root}\n`, { uid: 0, gid: 0, mode: 0o644 });
+    return;
+  }
+  const owner = info.type === "file" && info.size <= 4096 ? (sys.readFile(marker) ?? "").trim() : null;
+  if (owner === layout.root) return;
+  throw new OpError(
+    "CONFLICT",
+    `${layout.runtimeRoot} holds the runtimes of the host at ${JSON.stringify(owner ?? `(a ${info.type})`)}, not ${layout.root} (${marker}): ` +
+      `hosts never share a runtime root, since one's gc would remove what the other's branches run. Give this host its own runtime root, or remove ${marker} if that host is gone`,
+  );
+}
+
+/** A file an install stages, or the temp file copying it uses: `.incibase-<hex>.partial`. */
+const STAGED = /^\.{1,2}incibase-[0-9a-f]{16}\.partial(?:\.tmp)?$/;
+/** Longer than any install takes to stage, check and rename a file: the download timeout, with room for the rest. */
+export const STALE_STAGED_MS = DOWNLOAD_TIMEOUT_MS + 10 * 60_000;
+
+/**
+ * Removes the staged files in `dir` that installs killed midway (SIGKILL, a
+ * reboot, a lost SSH session) left: those untouched for longer than any
+ * install runs, so never one in progress. Their paths.
+ */
+function sweepStaged(ctx: OpsContext, dir: string): string[] {
+  // The wall clock, not ctx.now: it is compared with mtimes.
+  const cutoff = Date.now() - STALE_STAGED_MS;
+  const removed: string[] = [];
+  for (const name of ctx.sys.readdir(dir)) {
+    if (!STAGED.test(name)) continue;
+    const path = join(dir, name);
+    const info = ctx.sys.lstat(path);
+    if (!info || (info.type !== "file" && info.type !== "symlink") || info.mtimeMs > cutoff) continue;
+    ctx.sys.remove(path);
+    removed.push(path);
+  }
+  return removed;
+}
+
 /** What `<binary> --version` prints; the runtime is the platform's own code, checked before it runs. */
 function askVersion(path: string): { ok: boolean; said: string } {
   const result = Bun.spawnSync([path, "--version"], { stdin: "ignore", stdout: "pipe", stderr: "pipe", env: { PATH: "/usr/bin:/bin" }, timeout: 30_000 });
@@ -245,6 +332,7 @@ export async function installRuntime(ctx: RuntimeContext, input: z.input<typeof 
   return audited(ctx, "runtime.install", null, async () => {
     const { sys, layout, registry } = ctx;
     const path = layout.runtimeBinary(data.version);
+    if (sys.lstat(layout.runtimeRoot)) checkRuntimeOwner(ctx, false); // before anything is downloaded
     let expected: string | null = data.sha256 ?? null;
     let source: string;
     let url: string | null = null;
@@ -291,13 +379,29 @@ export async function installRuntime(ctx: RuntimeContext, input: z.input<typeof 
       expected = listed;
     }
 
+    // On disk but never recorded (copied there by hand, or installed before runtimes were recorded):
+    // branches may run it, so only the same bytes may take its place.
+    const unrecorded = existing ? null : sys.lstat(path);
+    if (unrecorded) {
+      const found = unrecorded.type === "file" ? (await sha256File(path)).sha256 : `(a ${unrecorded.type})`;
+      if (found !== expected) {
+        throw new OpError(
+          "CONFLICT",
+          `${path} is there already, unrecorded, with sha256 ${found}, not ${expected}: a version is never replaced by other bytes; move it away first if nothing runs it`,
+        );
+      }
+    }
+
     const dir = layout.runtimeDir(data.version);
     const createdDir = !sys.lstat(dir);
+    if (!sys.lstat(layout.runtimeRoot)) sys.mkdir(layout.runtimeRoot, 0o755);
+    checkRuntimeOwner(ctx, true);
     for (const d of [layout.runtimeRoot, dir]) {
       if (!sys.lstat(d)) sys.mkdir(d, 0o755);
       sys.chown(d, 0, 0);
       sys.chmod(d, 0o755);
     }
+    sweepStaged(ctx, dir);
     // A name of its own, so two installs never write the same file; root-only until it is checked.
     const staged = join(dir, `.incibase-${Buffer.from((ctx.random ?? randomBytes)(8)).toString("hex")}.partial`);
     try {
@@ -429,13 +533,20 @@ const gcRuntimesSchema = z.strictObject({ dryRun: z.boolean().default(false) });
  * Removes the installed runtimes nothing uses: no branch that is not
  * deleted pins it, the CLI link does not point at it and this process does
  * not run from it. While a branch is being upgraded (its job's target is
- * not pinned yet) it removes nothing.
+ * not pinned yet) it removes nothing. Then sweeps what killed installs left:
+ * stale staged files, and version directories without a record that held
+ * nothing else. A version directory with a binary but no record is left
+ * alone and reported (`unrecorded`): install-runtime records it, given its
+ * checksum. Refuses a runtime root another host has claimed.
  */
 export async function gcRuntimes(ctx: OpsContext, input: z.input<typeof gcRuntimesSchema> = {}) {
   const { dryRun } = parse(gcRuntimesSchema, input);
   return audited(ctx, "runtime.gc", null, async () => {
     const { registry, layout, sys } = ctx;
+    if (sys.lstat(layout.runtimeRoot)) checkRuntimeOwner(ctx, false);
     const result = await registry.withLock(() => {
+      // Under the lock: an install renames its file into place and records it under the lock too.
+      const { swept, unrecorded } = sweepRuntimeRoot(ctx, dryRun);
       const upgrading = registry.listBranches({ phase: "ready" }).filter((b) => b.busy_unit?.startsWith(`${layout.units.prefix}-upgrade-`));
       const pinned = registry.pinnedRuntimes();
       const cli = runtimeOf(ctx, layout.cliLink);
@@ -450,15 +561,44 @@ export async function gcRuntimes(ctx: OpsContext, input: z.input<typeof gcRuntim
       if (!dryRun) {
         registry.tx(() => {
           for (const v of removed) registry.deleteRuntime(v);
-          registry.audit({ actor: actor(ctx), action: "runtime.gc", detail: { removed, kept: kept.map((k) => k.version) }, ok: true }, now(ctx));
+          registry.audit({ actor: actor(ctx), action: "runtime.gc", detail: { removed, kept: kept.map((k) => k.version), swept, unrecorded }, ok: true }, now(ctx));
         });
       }
-      return { removed, kept, dryRun, ...(upgrading.length ? { skipped: `upgrading ${upgrading.map((b) => `${b.project}/${b.name}`).join(", ")}` } : {}) };
+      return { removed, kept, dryRun, swept, unrecorded, ...(upgrading.length ? { skipped: `upgrading ${upgrading.map((b) => `${b.project}/${b.name}`).join(", ")}` } : {}) };
     });
     // After the commit: a version without its row is not installed, so nothing starts from it meanwhile.
     if (!dryRun) for (const v of result.removed) if (sys.lstat(layout.runtimeDir(v))) sys.remove(layout.runtimeDir(v));
     return result;
   });
+}
+
+/**
+ * What killed installs left in the version directories (see gcRuntimes):
+ * removes their stale staged files, and the directories without a record
+ * that held nothing else; lists those without a record that hold a binary.
+ * With `dryRun` it only lists.
+ */
+function sweepRuntimeRoot(ctx: OpsContext, dryRun: boolean): { swept: string[]; unrecorded: string[] } {
+  const { sys, layout, registry } = ctx;
+  const swept: string[] = [];
+  const unrecorded: string[] = [];
+  const cutoff = Date.now() - STALE_STAGED_MS;
+  for (const name of sys.readdir(layout.runtimeRoot)) {
+    const dir = join(layout.runtimeRoot, name);
+    const info = RUNTIME_VERSION_REGEX.test(name) ? sys.lstat(dir) : null;
+    if (info?.type !== "dir") continue;
+    const orphan = !registry.getRuntime(name);
+    if (orphan && sys.lstat(join(dir, "incibase"))) unrecorded.push(name);
+    if (dryRun) continue;
+    // Its mtime from before the sweep: nothing was put in it for longer than an install runs.
+    const idle = info.mtimeMs <= cutoff;
+    swept.push(...sweepStaged(ctx, dir));
+    if (orphan && idle && sys.readdir(dir).length === 0) {
+      sys.remove(dir);
+      swept.push(dir);
+    }
+  }
+  return { swept, unrecorded };
 }
 
 const gcSchema = z.strictObject({ olderThanDays: z.number().min(0).max(3650).optional() });

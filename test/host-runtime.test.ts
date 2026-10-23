@@ -1,10 +1,10 @@
 // Runtimes on a fake host: installs checked against SHA256SUMS (a local HTTP
 // server stands in for GitHub), the CLI link, branch pins and gc.
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 // runtime.ts first: its import cycle with ops.ts must work from either side.
-import { MAX_RUNTIME_BYTES, parseSums, releasesBase, runtimeAsset, type RuntimeContext } from "../src/host/runtime.ts";
+import { MAX_RUNTIME_BYTES, parseSums, releasesBase, RUNTIME_OWNER_FILE, runtimeAsset, STALE_STAGED_MS, type RuntimeContext } from "../src/host/runtime.ts";
 import { sha256Hex } from "../src/engine/manifest.ts";
 import { VERSION } from "../src/engine/version.ts";
 import { HostLayout } from "../src/host/layout.ts";
@@ -53,9 +53,11 @@ async function hostWith(url?: string): Promise<OpsTestHost & RuntimeContext> {
 
 const ASSET = runtimeAsset();
 
-/** Nothing half-done left in the runtime root: no staged files, no empty version directories. */
+/** Nothing half-done left in the runtime root: no staged files, no empty version directories; it is this host's. */
 function noLeftovers(host: OpsTestHost) {
+  expect(readFileSync(join(host.layout.runtimeRoot, RUNTIME_OWNER_FILE), "utf8")).toBe(`${host.layout.root}\n`);
   for (const name of readdirSync(host.layout.runtimeRoot)) {
+    if (name === RUNTIME_OWNER_FILE) continue;
     const entries = readdirSync(join(host.layout.runtimeRoot, name));
     expect({ name, entries }).toEqual({ name, entries: ["incibase"] });
   }
@@ -223,6 +225,56 @@ describe("install from a release", () => {
     noLeftovers(host);
   });
 
+  test("every redirect hop is checked, not only the last one", async () => {
+    const bin = script("0.4.0");
+    const sums = sumsLine(bin, ASSET);
+    const requests: string[] = [];
+    // On every interface, so that 0.0.0.0 (not loopback) reaches it too.
+    const server = Bun.serve({
+      hostname: "0.0.0.0",
+      port: 0,
+      fetch(req): Response {
+        const url = new URL(req.url);
+        requests.push(`${url.hostname} ${url.pathname}`);
+        const [, kind, name] = url.pathname.split("/") as [string, string, string];
+        const to = (where: string) => new Response(null, { status: 302, headers: { location: where } });
+        // https -> http://<anywhere> -> https://<attacker>, with loopback standing in for https.
+        if (kind === "v0.4.0") return to(`http://0.0.0.0:${server.port}/hop/${name}`);
+        if (kind === "hop") return to(`http://127.0.0.1:${server.port}/real/${name}`);
+        if (kind === "real") return new Response(name === "SHA256SUMS" ? sums : bin);
+        if (kind === "v0.6.0") return to(`/v0.6.0/${name}`); // forever
+        if (kind === "v0.7.0") return new Response(null, { status: 302 }); // no Location
+        return new Response("Not Found", { status: 404 });
+      },
+    });
+    servers.push(server);
+    const host = await hostWith(`http://127.0.0.1:${server.port}`);
+    await expect(ops.installRuntime(host, { version: "0.4.0" })).rejects.toMatchObject({ code: "FAILED", message: expect.stringContaining(`redirected to http://0.0.0.0:${server.port}, which is not https`) });
+    // Refused at the hop itself: nothing was asked of 0.0.0.0.
+    expect(requests).toEqual(["127.0.0.1 /v0.4.0/SHA256SUMS"]);
+    await expect(ops.installRuntime(host, { version: "0.6.0" })).rejects.toThrow(/redirected more than 5 times/);
+    await expect(ops.installRuntime(host, { version: "0.7.0" })).rejects.toMatchObject({ code: "FAILED", message: expect.stringContaining("answered 302 without a Location") });
+    expect(installed(host)).toEqual([VERSION]);
+
+    // Loopback all the way (http only because the download started on loopback): followed.
+    const bin5 = script("0.5.0");
+    const sums5 = sumsLine(bin5, ASSET);
+    const gh = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req): Response {
+        const path = new URL(req.url).pathname;
+        if (path.startsWith("/v0.5.0/")) return new Response(null, { status: 302, headers: { location: `/store${path}` } });
+        if (path.startsWith("/store/")) return new Response(null, { status: 307, headers: { location: `http://localhost:${gh.port}/final${path}` } });
+        return new Response(path.endsWith("SHA256SUMS") ? sums5 : bin5);
+      },
+    });
+    servers.push(gh);
+    host.releasesUrl = `http://127.0.0.1:${gh.port}`;
+    expect(await ops.installRuntime(host, { version: "0.5.0" })).toMatchObject({ installed: true, sha256: sha256Hex(bin5) });
+    noLeftovers(host);
+  });
+
   test("again: no download, nothing changes", async () => {
     const bin = script("0.4.0");
     const gh = releases({ "/v0.4.0/SHA256SUMS": sumsLine(bin, ASSET), [`/v0.4.0/${ASSET}`]: bin });
@@ -300,6 +352,46 @@ describe("install from a local file", () => {
     });
     expect(await ops.installRuntime(host, { version: "0.4.0", binary: bin, sha256: sha256Hex(script("0.4.0")) })).toMatchObject({ installed: true });
     expect(readFileSync(host.layout.runtimeBinary("0.4.0"), "utf8")).toBe(script("0.4.0"));
+  });
+
+  test("a runtime on disk without a record is never replaced by other bytes, and is recorded given its own", async () => {
+    const host = await hostWith();
+    const path = host.layout.runtimeBinary("5.0.0");
+    mkdirSync(host.layout.runtimeDir("5.0.0"));
+    // Copied there by hand, or installed before runtimes were recorded.
+    writeFileSync(path, script("5.0.0", "A"), { mode: 0o755 });
+    const other = file(host, "b", script("5.0.0", "B"));
+    await expect(ops.installRuntime(host, { version: "5.0.0", binary: other, sha256: sha256Hex(script("5.0.0", "B")) })).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: expect.stringContaining(`unrecorded, with sha256 ${sha256Hex(script("5.0.0", "A"))}`),
+    });
+    expect(readFileSync(path, "utf8")).toBe(script("5.0.0", "A"));
+    expect(host.registry.getRuntime("5.0.0")).toBeNull();
+    // Nor from a release: refused before the binary is downloaded.
+    const gh = releases({ "/v5.0.0/SHA256SUMS": sumsLine(script("5.0.0", "B"), ASSET), [`/v5.0.0/${ASSET}`]: script("5.0.0", "B") });
+    host.releasesUrl = gh.url;
+    await expect(ops.installRuntime(host, { version: "5.0.0" })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(gh.requests).toEqual(["/v5.0.0/SHA256SUMS"]);
+    expect(readFileSync(path, "utf8")).toBe(script("5.0.0", "A"));
+    // gc leaves it alone, and says so.
+    expect(await ops.gcRuntimes(host)).toMatchObject({ removed: [VERSION], unrecorded: ["5.0.0"], swept: [] });
+    expect(readFileSync(path, "utf8")).toBe(script("5.0.0", "A"));
+
+    // Its own bytes: recorded (and put back root 0755).
+    const same = file(host, "a", script("5.0.0", "A"));
+    expect(await ops.installRuntime(host, { version: "5.0.0", binary: same, sha256: sha256Hex(script("5.0.0", "A")) })).toMatchObject({ installed: true });
+    expect(host.registry.getRuntime("5.0.0")).toMatchObject({ sha256: sha256Hex(script("5.0.0", "A")) });
+    expect(host.sys.lstat(path)).toMatchObject({ type: "file", uid: 0, mode: 0o755 });
+    expect((await ops.gcRuntimes(host, { dryRun: true })).unrecorded).toEqual([]);
+    noLeftovers(host);
+
+    // Something else than a file there is not a runtime either.
+    mkdirSync(host.layout.runtimeBinary("5.1.0"), { recursive: true });
+    const bin = file(host, "c", script("5.1.0"));
+    await expect(ops.installRuntime(host, { version: "5.1.0", binary: bin, sha256: sha256Hex(script("5.1.0")) })).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: expect.stringContaining("(a dir)"),
+    });
   });
 
   test("atomic: the binary appears by one rename, after its checks", async () => {
@@ -471,6 +563,105 @@ describe("branch pins and gc", () => {
     expect((await ops.gcRuntimes(host)).removed).toEqual([]);
     await ops.deleteBranch(host, { project: "shop", branch: "preview" });
     expect((await ops.gcRuntimes(host)).removed).toEqual(["0.4.0"]);
+  });
+});
+
+describe("what killed installs leave", () => {
+  /** A file an install staged and never finished (killed midway), last touched `ageMs` ago. */
+  function staged(host: OpsTestHost, version: string, ageMs: number, hex = "d2427740a93ce360"): string {
+    const dir = host.layout.runtimeDir(version);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `.incibase-${hex}.partial`);
+    writeFileSync(path, "1 MiB of a binary that never finished", { mode: 0o700 });
+    const at = new Date(Date.now() - ageMs);
+    utimesSync(path, at, at);
+    utimesSync(dir, at, at);
+    return path;
+  }
+  const OLD = STALE_STAGED_MS + 60_000;
+
+  test("an install of the version sweeps its stale staged files, never one still in progress", async () => {
+    const host = await hostWith();
+    const stale = staged(host, "0.3.2-st", OLD);
+    const tmp = join(host.layout.runtimeDir("0.3.2-st"), "..incibase-00000000000000aa.partial.tmp"); // a copy killed midway
+    writeFileSync(tmp, "half a copy");
+    utimesSync(tmp, new Date(Date.now() - OLD), new Date(Date.now() - OLD));
+    const fresh = staged(host, "0.3.2-st", 60_000, "00000000000000ff"); // another install, still downloading
+    const bin = file(host, "incibase", script("0.3.2-st"));
+    expect(await ops.installRuntime(host, { version: "0.3.2-st", binary: bin, sha256: sha256Hex(script("0.3.2-st")) })).toMatchObject({ installed: true });
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(tmp)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(readdirSync(host.layout.runtimeDir("0.3.2-st")).sort()).toEqual([".incibase-00000000000000ff.partial", "incibase"]);
+  });
+
+  test("gc sweeps stale staged files, and version directories without a record that held only those", async () => {
+    const host = await hostWith();
+    await withRuntime(host, "0.4.0");
+    await ops.useCli(host, { version: "0.4.0" });
+    const inInstalled = staged(host, "0.4.0", OLD);
+    const orphan = staged(host, "0.3.2-st", OLD);
+    const busy = staged(host, "0.3.3", 60_000);
+    mkdirSync(host.layout.runtimeDir("0.3.4")); // made a moment ago by an install that has not staged yet
+    const idleEmpty = host.layout.runtimeDir("0.3.5");
+    mkdirSync(idleEmpty);
+    utimesSync(idleEmpty, new Date(Date.now() - OLD), new Date(Date.now() - OLD));
+    const notOurs = join(host.layout.runtimeRoot, "notes");
+    mkdirSync(notOurs);
+    writeFileSync(join(notOurs, ".incibase-d2427740a93ce360.partial"), "not in a version directory");
+
+    const dry = await ops.gcRuntimes(host, { dryRun: true });
+    expect(dry).toMatchObject({ removed: [VERSION], swept: [], unrecorded: [] });
+    expect(existsSync(orphan)).toBe(true);
+
+    const result = await ops.gcRuntimes(host);
+    expect(result.removed).toEqual([VERSION]);
+    expect([...result.swept].sort()).toEqual([inInstalled, orphan, host.layout.runtimeDir("0.3.2-st"), idleEmpty].sort());
+    for (const gone of [inInstalled, host.layout.runtimeDir("0.3.2-st"), idleEmpty]) expect(existsSync(gone)).toBe(false);
+    for (const kept of [busy, host.layout.runtimeDir("0.3.4"), join(notOurs, ".incibase-d2427740a93ce360.partial"), host.layout.runtimeBinary("0.4.0")]) {
+      expect(existsSync(kept)).toBe(true);
+    }
+    expect(JSON.parse(host.registry.listAudit().at(-1)!.detail_json!)).toMatchObject({ swept: result.swept });
+    // Nothing left to sweep.
+    expect((await ops.gcRuntimes(host)).swept).toEqual([]);
+  });
+});
+
+describe("the runtime root is one host's", () => {
+  test("installs claim it; installs and gc refuse one another host claimed", async () => {
+    const host = await hostWith();
+    const marker = join(host.layout.runtimeRoot, RUNTIME_OWNER_FILE);
+    expect(readFileSync(marker, "utf8")).toBe(`${host.layout.root}\n`);
+    await withRuntime(host, "0.4.0");
+
+    // Another host's registry records these runtimes: this one's pins say nothing about its branches.
+    writeFileSync(marker, "/var/lib/incibase-other\n");
+    const gh = releases({});
+    host.releasesUrl = gh.url;
+    const local = file(host, "b", script("0.5.0"));
+    for (const attempt of [
+      () => ops.installRuntime(host, { version: "0.5.0" }),
+      () => ops.installRuntime(host, { version: "0.5.0", binary: local, sha256: sha256Hex(script("0.5.0")) }),
+      () => ops.gcRuntimes(host),
+      () => ops.gc(host),
+    ]) {
+      await expect(attempt()).rejects.toMatchObject({ code: "CONFLICT", message: expect.stringContaining("/var/lib/incibase-other") });
+    }
+    expect(gh.requests).toEqual([]);
+    expect(installed(host)).toEqual([VERSION, "0.4.0"]);
+    expect(existsSync(host.layout.runtimeBinary("0.4.0"))).toBe(true);
+    expect(existsSync(host.layout.runtimeDir("0.5.0"))).toBe(false);
+
+    host.sys.remove(marker);
+    mkdirSync(marker);
+    await expect(ops.gcRuntimes(host)).rejects.toMatchObject({ code: "CONFLICT", message: expect.stringContaining("(a dir)") });
+
+    // That host is gone: with the marker removed, the next install claims the root again.
+    host.sys.remove(marker);
+    expect((await ops.gcRuntimes(host)).removed).toEqual([VERSION, "0.4.0"]);
+    expect(existsSync(marker)).toBe(false);
+    await withRuntime(host, "0.5.0");
+    noLeftovers(host);
   });
 });
 

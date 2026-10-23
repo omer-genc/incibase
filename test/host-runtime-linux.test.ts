@@ -2,21 +2,23 @@
 // binary installed against a SHA256SUMS made with sha256sum, a branch pinned
 // to it, upgraded through the gate to a second version (the same binary
 // installed under another version string), a broken runtime reverted, the
-// CLI link and gc. Skipped unless INCIBASE_TEST_HOST=1 on Linux as root;
-// needs INCIBASE_TEST_BINARY (`bun scripts/build-binary.ts`). Uses its own
+// CLI link, gc, and the staged file of an install killed by SIGKILL midway
+// through a download swept once it is stale. Skipped unless
+// INCIBASE_TEST_HOST=1 on Linux as root; needs INCIBASE_TEST_BINARY
+// (`bun scripts/build-binary.ts`). Uses its own
 // host root (INCIBASE_TEST_HOST_ROOT, default /var/lib/incibase-runtime-test),
 // uid base (INCIBASE_TEST_UID_BASE, default 79000), and a unit prefix,
 // groups, runtime root and CLI link named after the root; removes everything
 // it created.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { VERSION } from "../src/engine/version.ts";
 import { openHost, type OpsContext } from "../src/host/context.ts";
 import { DEFAULT_ROOT, HostLayout } from "../src/host/layout.ts";
 import * as ops from "../src/host/ops.ts";
 import { Registry } from "../src/host/registry.ts";
-import { runtimeAsset } from "../src/host/runtime.ts";
+import { RUNTIME_OWNER_FILE, runtimeAsset, STALE_STAGED_MS } from "../src/host/runtime.ts";
 import { LinuxSystem } from "../src/host/system.ts";
 
 const enabled = process.env.INCIBASE_TEST_HOST === "1" && process.platform === "linux" && process.getuid?.() === 0;
@@ -210,9 +212,62 @@ describe.skipIf(!enabled)("runtimes on systemd", () => {
     await ops.useCli(ctx, { version: SECOND });
     expect((await ops.gc(ctx)).runtimes.removed).toEqual([VERSION]);
     expect(existsSync(ctx.layout.runtimeDir(VERSION))).toBe(false);
-    expect(readdirSync(ctx.layout.runtimeRoot)).toEqual([SECOND]);
+    expect(readdirSync(ctx.layout.runtimeRoot)).toEqual([RUNTIME_OWNER_FILE, SECOND]);
+    expect(readFileSync(join(ctx.layout.runtimeRoot, RUNTIME_OWNER_FILE), "utf8")).toBe(`${ROOT}\n`);
     // The branch runs on, on its pinned runtime.
     expect(runningBinary()).toBe(ctx.layout.runtimeBinary(SECOND));
     expect((await health())?.generation).toBe(dev().generation!);
+  }, SLOW);
+
+  test("an install killed midway leaves a staged file, which gc sweeps once it is stale", async () => {
+    const version = "0.3.2-st";
+    const dir = ctx.layout.runtimeDir(version);
+    // A release whose binary sends 1 MiB of its declared size and then stalls.
+    const server = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data(socket, data) {
+          if (/SHA256SUMS/.test(data.toString())) {
+            const sums = `${"0".repeat(64)}  ${asset}\n`;
+            socket.write(`HTTP/1.1 200 OK\r\nContent-Length: ${sums.length}\r\nConnection: close\r\n\r\n${sums}`);
+            socket.end();
+          } else {
+            socket.write(`HTTP/1.1 200 OK\r\nContent-Length: ${64 * 1024 * 1024}\r\n\r\n`);
+            socket.write(new Uint8Array(1024 * 1024));
+          }
+        },
+      },
+    });
+    try {
+      const script = [
+        `import { openHost } from ${JSON.stringify(join(import.meta.dir, "..", "src", "host", "context.ts"))};`,
+        `import * as ops from ${JSON.stringify(join(import.meta.dir, "..", "src", "host", "ops.ts"))};`,
+        `const ctx = openHost({ root: ${JSON.stringify(ROOT)}, layout: ${JSON.stringify(LAYOUT)} });`,
+        `ctx.releasesUrl = "http://127.0.0.1:${server.port}";`,
+        `await ops.installRuntime(ctx, { version: ${JSON.stringify(version)} });`,
+      ].join("\n");
+      const child = Bun.spawn([process.execPath, "-e", script], { stdout: "ignore", stderr: "inherit" });
+      const partial = () => readdirSync(existsSync(dir) ? dir : "/").filter((n) => /^\.incibase-[0-9a-f]{16}\.partial$/.test(n));
+      for (let i = 0; i < 600 && !(existsSync(dir) && partial().length === 1 && statSync(join(dir, partial()[0]!)).size >= 1024 * 1024); i++) await Bun.sleep(50);
+      child.kill("SIGKILL");
+      await child.exited;
+      const [name] = partial();
+      expect(name).toBeDefined();
+      const staged = join(dir, name!);
+      expect(statSync(staged).mode & 0o7777).toBe(0o700);
+
+      // Fresh: it could be an install still downloading.
+      expect((await ops.gcRuntimes(ctx)).swept).toEqual([]);
+      expect(existsSync(staged)).toBe(true);
+      const old = new Date(Date.now() - STALE_STAGED_MS - 60_000);
+      utimesSync(staged, old, old);
+      utimesSync(dir, old, old);
+      const swept = await ops.gcRuntimes(ctx);
+      expect(swept.swept).toEqual([staged, dir]);
+      expect(existsSync(dir)).toBe(false);
+    } finally {
+      server.stop(true);
+    }
   }, SLOW);
 });
