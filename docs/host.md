@@ -53,7 +53,7 @@ Temiz bir Ubuntu 24.04 VPS'ten çalışan bir `prod` ve `dev` branch'ine kadar k
   omer ALL=(root) NOPASSWD: /usr/local/bin/incibase
   ```
   incibase root olarak her şeyi yapabildiğinden bu satır pratikte bu hesaba root verir; hesabın SSH anahtarını buna göre koru. İstemezsen dosyayı `scp` ile gönderip `ssh -t` ile çalıştırırsın (aşağıda iki biçim de var).
-- **Paketler:** `sudo apt install nginx openssl curl`. nginx'i incibase kurmaz, yalnızca config'ini yazar.
+- **Paketler:** `sudo apt install nginx openssl curl ufw`. nginx'i incibase kurmaz, yalnızca config'ini yazar. ufw çoğu VPS imajında hazırdır ama minimal imajlarda yoktur.
 - **DNS:** Cloudflare'de yönetilen bir zone (aşağıda).
 
 ## Cloudflare
@@ -82,7 +82,8 @@ Zone `omergenc.net` Cloudflare'de olduğu varsayılır.
    ssh -t vps 'sudo install -d -m 0700 /root/origin && sudo install -m 0600 origin.pem origin.key /root/origin/ && rm origin.pem origin.key'
    ```
    `host init` (ya da sonra `host tls`) çifti doğrular (`*.incibase.omergenc.net`'i kapsıyor mu, anahtar eşleşiyor mu, süresi geçerli mi) ve `/var/lib/incibase/tls/` altına (root 0700) kopyalar; nginx o kopyayı sunar. `/root/origin` altındaki dosyalar sonra silinebilir. Laptoptaki kopyayı da sil ya da bir parola yöneticisinde sakla.
-5. **İstemci adresi.** Cloudflare proxied olduğundan nginx'e gelen bağlantı Cloudflare'in adresinden gelir. `--trust-proxy cloudflare` ile nginx istemci adresini `CF-Connecting-IP`'den alır, ama **yalnızca** bağlantı Cloudflare'in IP aralıklarından geliyorsa (aralıklar incibase'in içinde sabit; yeni sürümlerle güncellenir). Başka yerden gelen bir `CF-Connecting-IP`'ye inanılmaz. Rate limit'ler (`limit_req`, `limit_conn`) ve branch'in gördüğü `X-Forwarded-For` bu adrese göre çalışır.
+5. **HTTP'yi kenarda HTTPS'e çevir.** SSL/TLS > Edge Certificates: **Always Use HTTPS** açık. Böylece `http://` istekleri origin'e hiç gelmeden Cloudflare'de `https://`'e yönlendirilir.
+6. **İstemci adresi.** Cloudflare proxied olduğundan nginx'e gelen bağlantı Cloudflare'in adresinden gelir. `--trust-proxy cloudflare` ile nginx istemci adresini `CF-Connecting-IP`'den alır, ama **yalnızca** bağlantı Cloudflare'in IP aralıklarından geliyorsa (aralıklar incibase'in içinde sabit; yeni sürümlerle güncellenir). Başka yerden gelen bir `CF-Connecting-IP`'ye inanılmaz. Rate limit'ler (`limit_req`, `limit_conn`) ve branch'in gördüğü `X-Forwarded-For` bu adrese göre çalışır.
 
 Cloudflare'in ücretsiz ve Pro planlarında istek gövdesi en çok 100 MB'tır; incibase'in varsayılan yükleme sınırı da 100 MB.
 
@@ -98,13 +99,22 @@ sudo ufw enable
 sudo ufw status verbose
 ```
 
-incibase'in ön kapısı yalnızca 443'te (`--https-port`) dinler; 80'i Cloudflare'in "Always Use HTTPS" yönlendirmesi kenarda karşılar, origin'de açık tutmak zararsızdır.
+**Firewall zorunlu.** Branch unit'leri `SocketBindDeny=any` taşır: branch kodu TCP portu açamasın diye. Ama Ubuntu 24.04'ün systemd paketi BPF framework'süz derlenmiş (`systemctl --version` çıktısında `-BPF_FRAMEWORK`) ve SocketBindDeny buna muhtaç; bu sürümde **uygulanmaz**. Kötü niyetli ya da hatalı bir branch 0.0.0.0'da bir port açabilir. Yerel ve özel ağdaki eşleri (diğer branch'ler, nginx) `IPAddressDeny` dışarıda tutar; internete karşı geriye kalan tek engel host firewall'udur. `host doctor` bunu her çalıştırmada WARN olarak hatırlatır. 22, 80 ve 443 dışında her portu kapalı tut. Sağlayıcının firewall'u (cloud firewall, security group) yalnızca 22/80/443'e izin veriyorsa aynı işi görür; ikisi birlikte de olur.
 
-**Bu adım zorunlu.** Branch unit'leri `SocketBindDeny=any` taşır: branch kodu TCP portu açamasın diye. Ama Ubuntu 24.04'ün systemd paketi BPF framework'süz derlenmiş (`systemctl --version` çıktısında `-BPF_FRAMEWORK`) ve SocketBindDeny buna muhtaç; bu sürümde **uygulanmaz**. Kötü niyetli ya da hatalı bir branch 0.0.0.0'da bir port açabilir. Yerel ve özel ağdaki eşleri (diğer branch'ler, nginx) `IPAddressDeny` dışarıda tutar; internete karşı geriye kalan tek engel host firewall'udur. `host doctor` bunu her çalıştırmada WARN olarak hatırlatır. 22, 80 ve 443 dışında her portu kapalı tut.
+incibase'in ön kapısı yalnızca 443'te (`--https-port`) dinler; 80'i Cloudflare'in "Always Use HTTPS" yönlendirmesi (yukarıdaki 5. adım) kenarda karşılar. Ubuntu'nun nginx paketi ise `sites-enabled/default`'u açık getirir: origin'in 80'inde "Welcome to nginx!" sayfası nginx sürümüyle birlikte cevap verir. incibase o siteyi kullanmaz; kaldır:
+
+```bash
+sudo rm /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+80'e origin'de hiç ihtiyacın yoksa `sudo ufw allow 80/tcp` satırını da atlayabilirsin. Daha sıkı istersen 443'ü yalnızca Cloudflare'in IP aralıklarına aç; böylece origin Cloudflare'i atlayarak doğrudan çağrılamaz.
 
 ## incibase'i kurmak
 
-Binary'yi GitHub release'inden indir, `SHA256SUMS` ile doğrula, onunla host'u kur, sonra kendisini runtime olarak kur ve `/usr/local/bin/incibase`'i ona bağla:
+Sıra: binary'yi GitHub release'inden indir ve `SHA256SUMS` ile doğrula, onunla `host init` çalıştır, sonra kendisini runtime olarak kur, `/usr/local/bin/incibase`'i ona bağla ve unit'leri kurulu runtime'la yeniden yaz. İndirilen dosyayı ancak en sonda sil. Üç blok aynı kabukta koşar (`$V` ve `$ARCH` ilk bloktan gelir).
+
+### 1. İndirmek ve doğrulamak
 
 ```bash
 V=x.y.z                                    # host katmanını içeren sürüm (yukarıdaki not)
@@ -116,22 +126,9 @@ sha256sum --check --ignore-missing SHA256SUMS     # incibase-linux-<arch>: OK
 chmod +x incibase-linux-$ARCH
 ```
 
-Önce `host init` (sonraki bölüm) bu indirilen dosyayla çalıştırılır: `host init` dışındaki her komut kurulmuş bir host ister (`No incibase host at /var/lib/incibase: run sudo incibase host init …`). Ardından:
+### 2. `host init`
 
-```bash
-sudo ./incibase-linux-$ARCH host install-runtime ./incibase-linux-$ARCH --version $V --sums SHA256SUMS
-sudo ./incibase-linux-$ARCH host use-cli $V
-rm incibase-linux-$ARCH SHA256SUMS
-incibase --version
-sudo incibase host runtimes
-```
-
-- `host install-runtime` binary'yi `SHA256SUMS`'taki girdisiyle (ya da `--sha256 <hex>` ile) karşılaştırır; eşleşmezse siler ve hiç çalıştırmaz. Eşleşirse `/usr/local/lib/incibase/<sürüm>/incibase` olarak kurar ve registry'ye yazar. Checksum'sız kurulum yok.
-- Yerel dosya vermezsen `host install-runtime --version $V` binary'yi ve `SHA256SUMS`'ı GitHub release'inden kendisi indirip doğrular (yükseltmelerde bunu kullanırsın).
-- `host use-cli` `/usr/local/bin/incibase`'i kurulu runtime'a symlink yapar. Oraya elle kopyalanmış bir dosya varsa yalnızca `--replace` ile yerine geçer.
-- Her branch bir runtime sürümüne **pinlenir** (varsayılan: branch'i oluşturan CLI'ın sürümü); CLI'ı yükseltmek branch'leri değiştirmez.
-
-## `host init`
+`host init` dışındaki her komut kurulmuş bir host ister (`No incibase host at /var/lib/incibase: run sudo incibase host init …`), o yüzden ilk komut budur ve indirilen dosyayla çalışır:
 
 ```bash
 sudo ./incibase-linux-$ARCH host init \
@@ -155,8 +152,24 @@ Ne yapar: registry (`/var/lib/incibase/control/registry.db`), `incibase-proxy` (
 - `--https-port` (varsayılan 443), `--slice-memory` (varsayılan RAM − 1G), `--uid-base` (varsayılan 70000; yalnızca ilk branch'ten önce), `--tunnel-port-base` (varsayılan 7101) genelde değişmez.
 - `--no-check-timer` yalnızca testler için; üretimde timer açık kalmalı.
 - Sertifikayı sonra yenilemek: `sudo incibase host tls --cert <pem> --key <key>` (`nginx -t` ile denenir, geçerse nginx reload). `trust_proxy` ve `https_port` sonradan `host set` ile değişir.
+- **Bir makinede bir host.** `--root` (ya da `$INCIBASE_HOST_ROOT`) yalnızca veri dizinini değiştirir; unit adları (`incibase-*`), gruplar, `/etc/nginx/conf.d/incibase.conf`, nginx drop-in'i, `/usr/local/lib/incibase` ve `/usr/local/bin/incibase` aynı kalır. Aynı makinede başka bir `--root` ile ikinci bir `host init` ilk host'un bu dosyalarını ezer. Üretim makinesinde tek host kur; denemeleri ayrı bir VM'de yap.
 
-Ardından yukarıdaki `host install-runtime` ve `host use-cli` adımları.
+### 3. Runtime, CLI ve check unit'i
+
+```bash
+sudo ./incibase-linux-$ARCH host install-runtime ./incibase-linux-$ARCH --version $V --sums SHA256SUMS
+sudo ./incibase-linux-$ARCH host use-cli $V
+sudo incibase host render
+rm incibase-linux-$ARCH SHA256SUMS
+incibase --version
+sudo incibase host runtimes
+```
+
+- `host install-runtime` binary'yi `SHA256SUMS`'taki girdisiyle (ya da `--sha256 <hex>` ile) karşılaştırır; eşleşmezse siler ve hiç çalıştırmaz. Eşleşirse `/usr/local/lib/incibase/<sürüm>/incibase` olarak kurar ve registry'ye yazar. Checksum'sız kurulum yok.
+- Yerel dosya vermezsen `host install-runtime --version $V` binary'yi ve `SHA256SUMS`'ı GitHub release'inden kendisi indirip doğrular (yükseltmelerde bunu kullanırsın).
+- `host use-cli` `/usr/local/bin/incibase`'i kurulu runtime'a symlink yapar. Oraya elle kopyalanmış bir dosya varsa yalnızca `--replace` ile yerine geçer.
+- **`host render` atlanmamalı.** `host init` `incibase-check.service`'i kendisini çalıştıran dosyayla yazar: `ExecStart=/home/omer/incibase-linux-<arch> host check …`. `install-runtime` ve `use-cli` bunu değiştirmez. `/usr/local/bin/incibase` ile çalışan `host render` unit'i `/usr/local/lib/incibase/<sürüm>/incibase`'e çevirir. Atlanırsa root her 30 s'de giriş hesabının ev dizinindeki bir dosyayı çalıştırır; `rm`'den sonra da her check `203/EXEC` ile düşer ve `host doctor` `FAIL check timer` verir. Kontrol: `systemctl cat incibase-check.service | grep ExecStart`.
+- Her branch bir runtime sürümüne **pinlenir** (varsayılan: branch'i oluşturan CLI'ın sürümü); CLI'ı yükseltmek branch'leri değiştirmez.
 
 ## `host doctor`
 
@@ -262,7 +275,7 @@ Uygulamanın env değişkenleri branch başına registry'de tutulur ve branch'in
 ssh vps sudo incibase env import shop/prod - --restart < prod.env
 ```
 
-Parolalı sudo ile: `scp prod.env vps: && ssh -t vps 'sudo incibase env import shop/prod prod.env --restart && rm prod.env'`.
+Parolalı sudo ile: `scp prod.env vps: && ssh -t vps 'sudo incibase env import shop/prod prod.env --restart; rc=$?; rm -f prod.env; exit $rc'` (dosya import ya da restart düşse de silinir).
 
 - Gizli olmayan tek değerler: `sudo incibase env set shop/dev FEATURE_X=1 --restart`; silmek: `env unset shop/dev FEATURE_X`.
 - `env list shop/prod` adları ve kimin koyduğunu (`host`/`app`) gösterir; değerler yalnızca `--show` ile.
@@ -329,8 +342,13 @@ Ctrl-C closes the tunnel.
 
 - Tünel `127.0.0.1:<port>`'u branch'in admin soketine yönlendirir. Her branch'in kendi portu var (7101'den başlar), dolayısıyla kendi origin'i ve dashboard'da kendi kayıtlı girişi.
 - Dashboard admin anahtarını ister. Anahtarı ayrı bir terminalde al: `ssh -t vps sudo incibase admin-key shop/prod` (stdout'a yalnızca anahtar yazılır). Anahtarı değiştirmek: `sudo incibase admin-key shop/prod --rotate` (branch restart olur, admin oturumları biter).
-- MCP aynı tünelde `/mcp`'dedir; tünel açıkken Claude Code'a yukarıdaki `claude mcp add` komutuyla eklenir. Tünel kapalıyken MCP sunucusuna ulaşılamaz.
-- `--local-port`, `--timeout`, `--ssh-config <dosya>` (ssh -F) ve `--json` da var. `--ssh` ssh'in kabul ettiği her hedefi alır (`omer@<ip>` ya da config alias'ı).
+- MCP aynı tünelde `/mcp`'dedir; tünel açıkken Claude Code'a `claude mcp add` ile eklenir. Tünel kapalıyken MCP sunucusuna ulaşılamaz.
+- Tünelin yazdığı tek satırlık `claude mcp add … $(ssh … vps sudo incibase admin-key shop/prod)` **parolasız sudo** ister ([Gereksinimler](#gereksinimler)'deki sudoers satırı): `-t` olmadan sudo parola soramaz, `-t` ile de alınan anahtarın sonuna terminalin `\r`'si eklenir. Parolalı sudo ile anahtarı `ssh -t vps sudo incibase admin-key shop/prod` ile al ve elle yapıştır:
+  ```bash
+  claude mcp add --transport http incibase-prod--shop http://127.0.0.1:7101/mcp --header "Authorization: Bearer <admin anahtarı>"
+  ```
+  Her iki biçimde de anahtar `claude` sürecinin argümanlarında görünür ve Claude Code'un MCP config'inde düz metin olarak saklanır; o dosyayı bir sır gibi koru. `admin-key --rotate`'ten sonra eski başlık geçersizdir: `claude mcp remove incibase-prod--shop` ile kaldırıp yeni anahtarla yeniden ekle.
+- `--local-port`, `--timeout`, `--ssh-config <dosya>` (ssh -F), `--root <dizin>` (sunucudaki host root'u, varsayılan `/var/lib/incibase`) ve `--json` da var. `--ssh` ssh'in kabul ettiği her hedefi alır (`omer@<ip>` ya da config alias'ı).
 - Tünel açılmıyorsa: hesap admin grubunda mı (`host add-admin`, sonra yeniden giriş), sshd yönlendirmeye izin veriyor mu, branch çalışıyor mu (`incibase status`).
 
 ## Durum, loglar, alarmlar
@@ -372,6 +390,7 @@ Loglar journal'dan gelir; branch'ler satır başına bir JSON nesnesi yazar (ist
    ```
 
 - Yalnızca https kabul edilir; kullanıcı/parola ya da `#` içeren URL'ler reddedilir. `--test` bir deneme bildirimi gönderir.
+- Topic adı bir sırdır ama bu komut onu komut satırına koyar: sudo'nun loguna (auth.log, journal) ve o an `ps` çıktısına düşer. Bu logları kimseyle paylaşma; paylaştıysan yeni bir topic seçip `host set alert_webhook` ile değiştir.
 - Bir alarm açılınca ve kapanınca birer bildirim gider. Mesajlardan anahtarlar, app env değerleri ve webhook URL'sinin kendisi çıkarılır.
 - Teslimat başarısızsa bir sonraki check'te tekrar denenir; 5 dakikadan uzun süredir ulaşılamıyorsa `host doctor` FAIL verir.
 - Kaldırmak: `sudo incibase host set alert_webhook ''`.
@@ -423,10 +442,11 @@ sudo incibase host render                           # unit'ler ve nginx config'i
 sudo incibase host doctor
 sudo incibase branch upgrade shop/dev --runtime $V
 sudo incibase branch upgrade shop/prod --runtime $V
-sudo incibase host runtimes                         # hangi branch hangi sürüme pinli
+sudo incibase host runtimes                         # hangi branch hangi sürüme pinli (PINNED BY)
 sudo incibase host gc                               # artık kullanılmayan runtime'lar
 ```
 
+- `shop/feature-x` gibi preview branch'leri ve başka projelerin branch'leri de eski sürüme pinli kalır; `host gc` o sürümü onlar yüzünden silmez. `sudo incibase branch list`'in RUNTIME sütununa ya da `host runtimes`'ın PINNED BY sütununa bak ve her birini `branch upgrade <project>/<branch> --runtime $V` ile yükselt.
 - `branch upgrade` prod'da snapshot (`pre-upgrade-<n>`) ve preflight alır, restart eder ve gate'i bekler; düşerse pin eski sürüme geri döner. Önce dev'i yükseltip denemek iyi bir alışkanlık.
 - Kurulu bir sürüm başka baytlarla asla değiştirilmez; aynı sürümü yeniden kurmak bir şey yapmaz.
 - Laptoptaki incibase'i (bundle ve tunnel için) uygulamanın reposunda ayrıca yükselt; bundle'ı branch'in runtime'ıyla aynı sürümle oluşturmak en güvenlisi.
@@ -467,6 +487,7 @@ systemctl status incibase-branch@<id>.service
 Branch restart olurken (release, `--restart`, crash) nginx soketine bağlanamaz ve `503` döner, `x-incibase-unprocessed: 1` ve `Retry-After: 1` ile, gövde `{"error":{"code":"BRANCH_UNAVAILABLE"}}`. İstek branch'e hiç ulaşmamıştır; istemci güvenle tekrar dener. Birkaç saniyeden uzun sürüyorsa branch ayakta değildir: `incibase status`.
 
 - `502` (unprocessed işareti olmadan): branch bağlantıyı kabul edip cevap vermeden kapattı; istek işlenmiş olabilir, istemci tekrar denemez.
+- Aynı `503` durdurulmuş (`branch stop`) ya da henüz release'i olmayan bir branch'ten de, süresiz gelir: mesaj "restarting" dese de branch kalkmayacaktır. `incibase status`'ta `stopped` görürsün; `branch start` ya da `release add` ile düzelir.
 - `404` JSON: o label'da branch yok (adı kontrol et).
 - Cloudflare `526`: origin sertifikası geçersiz (Full (strict) Origin CA çiftini göremiyor). `525`: el sıkışması başarısız; ad nginx'in kabul ettiği biçimde mi (`<branch>--<project>.incibase.omergenc.net`), `--https-port` 443 mü.
 - Tarayıcıda sertifika hatası, Cloudflare'in kenar sertifikası: yukarıdaki ikinci seviye alt alan notu.
@@ -477,7 +498,7 @@ Branch restart olurken (release, `--restart`, crash) nginx soketine bağlanamaz 
 
 ```bash
 df -h /var/lib/incibase
-sudo du -sh /var/lib/incibase/branches/* /var/lib/incibase/backups/* /var/lib/incibase/trash 2>/dev/null
+sudo du -h -d 1 /var/lib/incibase/branches /var/lib/incibase/backups /var/lib/incibase/trash
 sudo incibase host gc --older-than 0     # trash ve kullanılmayan runtime'lar
 sudo journalctl --vacuum-size=500M
 ```
