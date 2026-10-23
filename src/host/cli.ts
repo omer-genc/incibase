@@ -7,10 +7,19 @@ import { DEFAULT_ROOT, type LayoutOptions } from "./layout.ts";
 import { openHost } from "./context.ts";
 import { OpError, OPS } from "./ops.ts";
 import { runJob } from "./release.ts";
+import { setSetting } from "./alerts.ts";
+import { runCheck } from "./check.ts";
+import { formatDoctor, runDoctor } from "./doctor.ts";
 
 const USAGE = `Usage (as root):
   incibase host op <name> [<json input>] [--root <dir>] [--layout <json>]
       Runs an owner operation: ${Object.keys(OPS).join(", ")}
+  incibase host check [--root <dir>]
+      One health check of every running branch, the disk and the alerts (the check timer runs it every 30 s).
+  incibase host doctor [--root <dir>]
+      OK/WARN/FAIL for everything the host relies on; exits 1 when something fails.
+  incibase host set alert_webhook <https url> [--test]
+      Where alerts go, e.g. an ntfy.sh topic; '' removes it. --test sends a test notification.
   incibase host _job --root <dir> <release|rollback|upgrade> <branch id> <n> [args]
       Internal: what a transient job unit runs.`;
 
@@ -18,7 +27,12 @@ export async function hostCli(argv: string[]): Promise<void> {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
-    options: { root: { type: "string" }, layout: { type: "string" }, help: { type: "boolean", short: "h", default: false } },
+    options: {
+      root: { type: "string" },
+      layout: { type: "string" },
+      test: { type: "boolean", default: false },
+      help: { type: "boolean", short: "h", default: false },
+    },
   });
   const [command, ...rest] = positionals;
   if (values.help || !command) {
@@ -31,6 +45,32 @@ export async function hostCli(argv: string[]): Promise<void> {
       const ctx = openHost({ root });
       try {
         await runJob(ctx, rest);
+      } finally {
+        ctx.registry.close();
+      }
+      return;
+    }
+    if (command === "check" || command === "doctor" || command === "set") {
+      const ctx = openHost({ root });
+      try {
+        if (command === "check") {
+          const report = await runCheck(ctx);
+          if (report.skipped) console.log(`skipped    ${report.skipped}`);
+          else {
+            for (const b of report.branches) console.log(`${b.outcome.padEnd(10)} ${b.ref}: ${b.detail}`);
+            if (report.disk) console.log(`disk       ${report.disk.usedPercent}% used, ${(report.disk.availableBytes / 1024 ** 3).toFixed(1)} GiB free`);
+            const n = report.notifications;
+            console.log(`alerts     ${n.unconfigured ? "no alert_webhook set" : `${n.sent} sent`}${n.error ? `; delivery stopped: ${n.error}` : ""}`);
+          }
+        } else if (command === "doctor") {
+          const report = await runDoctor(ctx);
+          console.log(formatDoctor(report));
+          if (!report.ok) process.exitCode = 1;
+        } else {
+          const [key, value] = rest;
+          if (key !== "alert_webhook" || value === undefined) throw new OpError("INVALID", `Usage: incibase host set alert_webhook <https url> [--test]`);
+          console.log(JSON.stringify(await setSetting(ctx, { key, value: value || null, test: values.test }), null, 2));
+        }
       } finally {
         ctx.registry.close();
       }

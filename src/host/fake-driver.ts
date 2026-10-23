@@ -5,7 +5,7 @@
 // migration_committed or keeps crashing until the start limit. `health`
 // answers the gate's probe for the generation a healthy process runs.
 import { existsSync, readFileSync } from "node:fs";
-import { CLD_EXITED, CLD_KILLED, type Driver, type JournalEntry, type JournalQuery, type TransientJob, type UnitStatus } from "./driver.ts";
+import { CLD_EXITED, CLD_KILLED, type Driver, type JournalEntry, type JournalQuery, type KillSignal, type TransientJob, type UnitStatus } from "./driver.ts";
 import type { HostLayout } from "./layout.ts";
 import { checkUnitName } from "./systemd.ts";
 
@@ -63,6 +63,7 @@ export class FakeDriver implements Driver {
   private readonly units = new Map<string, FakeUnit>();
   private nextPid = 1000;
   private nextCursor = 1;
+  private nextInvocation = 1;
 
   constructor(readonly layout: HostLayout) {}
 
@@ -109,7 +110,8 @@ export class FakeDriver implements Driver {
     const run = this.describe(name);
     if (run.kind !== "other" && !run.argv.length) throw new Error(`Unit ${name} has a bad unit file setting (no ExecStart).`);
     const outcome = this.behavior(run);
-    const invocationId = `inv${this.nextCursor}`;
+    // A new id for every start, as systemd gives (the host's check tells processes apart by it).
+    const invocationId = `inv${this.nextInvocation++}`;
     unit.run = run;
     unit.healthy = false;
     unit.status = { ...idle(), invocationId, nRestarts: 0 };
@@ -177,6 +179,21 @@ export class FakeDriver implements Driver {
     this.calls.push(`reset-failed ${name}`);
     const unit = this.unit(name);
     if (unit.status.activeState === "failed") unit.status = { ...unit.status, activeState: "inactive", subState: "dead", result: "success" };
+  }
+
+  /** SIGKILL: the process dies and systemd (Restart=on-failure) starts it again; SIGTERM: it drains and exits cleanly. */
+  killMain(name: string, signal: KillSignal) {
+    this.calls.push(`kill ${signal} ${name}`);
+    const unit = this.unit(name);
+    if (unit.status.activeState !== "active") throw new Error(`Failed to kill unit ${name}: No main process to kill`);
+    if (signal === "SIGTERM") {
+      unit.status = { ...unit.status, activeState: "inactive", subState: "dead", mainPid: 0, memoryCurrent: null };
+      unit.healthy = false;
+      return;
+    }
+    const restarts = unit.status.nRestarts + 1;
+    this.launch(name);
+    unit.status = { ...unit.status, nRestarts: restarts };
   }
 
   show(name: string): UnitStatus {

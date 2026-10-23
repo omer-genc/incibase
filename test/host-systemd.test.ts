@@ -16,6 +16,7 @@ import { chmodSync, chownSync, cpSync, existsSync, mkdirSync, readdirSync, readF
 import { basename, join } from "node:path";
 import { VERSION } from "../src/engine/version.ts";
 import { openHost, type OpsContext } from "../src/host/context.ts";
+import { systemdFeature } from "../src/host/doctor.ts";
 import { DEFAULT_ROOT, HostLayout } from "../src/host/layout.ts";
 import * as ops from "../src/host/ops.ts";
 import { renderBranchFiles } from "../src/host/provision.ts";
@@ -63,7 +64,7 @@ function cleanup() {
     run(["systemctl", "stop", unit], { ok: [0, 1, 5] });
     run(["systemctl", "reset-failed", unit], { ok: [0, 1, 5] });
   }
-  for (const dir of [LAYOUT.systemdDir, join(LAYOUT.systemdDir, "multi-user.target.wants")]) {
+  for (const dir of [LAYOUT.systemdDir, join(LAYOUT.systemdDir, "multi-user.target.wants"), join(LAYOUT.systemdDir, "timers.target.wants")]) {
     for (const name of existsSync(dir) ? readdirSync(dir) : []) {
       if (name.startsWith(`${prefix}-`) || name === `${prefix}.slice`) rmSync(join(dir, name), { recursive: true, force: true });
     }
@@ -187,7 +188,8 @@ describe.skipIf(!enabled)("the host on systemd", () => {
       lines.push(line);
       console.log(`  | ${line}`);
     };
-    await ops.initHost(ctx, { domain: DOMAIN, timezone: "Europe/Istanbul", uidBase: UID_BASE, sliceMemoryMax: 2 * 1024 ** 3 });
+    // The check timer stays off: a check of its own would race these tests (test/host-check-linux.test.ts runs it).
+    await ops.initHost(ctx, { domain: DOMAIN, timezone: "Europe/Istanbul", uidBase: UID_BASE, sliceMemoryMax: 2 * 1024 ** 3, checkTimer: false });
     await ops.installRuntime(ctx, { binary: BINARY, version: VERSION });
     v1 = bundleApp("v1");
   }, SLOW);
@@ -532,7 +534,9 @@ console.log("PROBE " + JSON.stringify(out));
   const directive = (name: string, effective: boolean, detail: string) => {
     if (effective) return report.lines.push(`ok   ${name}: ${detail}`);
     const by = overriddenBy(unit, name);
-    report.lines.push(`NOT EFFECTIVE ${name}: ${detail}${by ? ` (overridden by ${by})` : " (not supported here)"}`);
+    // SocketBindDeny needs systemd's BPF framework, which Ubuntu 24.04's build lacks (on a VM too).
+    const build = name === "SocketBindDeny" && systemdFeature(run(["systemctl", "--version"]).stdout, "BPF_FRAMEWORK") === false;
+    report.lines.push(`NOT EFFECTIVE ${name}: ${detail}${by ? ` (overridden by ${by})` : build ? " (unsupported by this systemd build: -BPF_FRAMEWORK)" : " (not supported here)"}`);
     report.ineffective.push(name);
   };
 

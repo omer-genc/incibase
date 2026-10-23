@@ -345,6 +345,61 @@ export function renderHostUnits(ctx: HostContext): boolean {
   let changed = writeIfChanged(ctx, layout.unitFile(layout.units.branchTemplate), branchTemplateUnit(layout), UNIT_FILE);
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.preflightTemplate), preflightTemplateUnit(layout), UNIT_FILE) || changed;
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.slice), sliceUnit(Number.isSafeInteger(sliceMax) && sliceMax > 0 ? sliceMax : null), UNIT_FILE) || changed;
+  if (ctx.self) changed = renderCheckUnits(ctx, ctx.self) || changed;
+  return changed;
+}
+
+// ---- the check timer (design section 9) ------------------------------------
+
+/** `<prefix>-check.service`: one `incibase host check` of this host, as root. */
+export function checkServiceUnit(layout: HostLayout, self: string[]): string {
+  if (!self.length) throw new Error("The check service needs the command that runs incibase");
+  return `${HEADER}[Unit]
+Description=incibase health check of ${word(layout.root)}
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${[...self, "host", "check", "--root", layout.root].map(word).join(" ")}
+Environment=NO_COLOR=1
+# Probes run in parallel with a 5 s timeout and an alert POST has 10 s; anything longer is stuck.
+TimeoutStartSec=120
+`;
+}
+
+/** `<prefix>-check.timer`: the check every 30 s; a oneshot never runs twice at once. */
+export function checkTimerUnit(layout: HostLayout): string {
+  return `${HEADER}[Unit]
+Description=incibase health check every 30 s
+
+[Timer]
+OnActiveSec=10s
+OnBootSec=60s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=${layout.units.checkService}
+
+[Install]
+WantedBy=timers.target
+`;
+}
+
+/**
+ * The check service and timer, and the timer's boot link unless the host
+ * turned the timer off (setting check_timer = off). True when one changed.
+ */
+export function renderCheckUnits(ctx: HostContext, self: string[]): boolean {
+  const { layout, sys } = ctx;
+  let changed = writeIfChanged(ctx, layout.unitFile(layout.units.checkService), checkServiceUnit(layout, self), UNIT_FILE);
+  changed = writeIfChanged(ctx, layout.unitFile(layout.units.checkTimer), checkTimerUnit(layout), UNIT_FILE) || changed;
+  const wants = layout.timerWantsLink();
+  if (ctx.registry.getSetting("check_timer") !== "off") {
+    if (sys.readlink(wants.path) !== wants.target) {
+      ensureDir(ctx, wants.path.slice(0, wants.path.lastIndexOf("/")));
+      sys.symlink(wants.target, wants.path);
+      changed = true;
+    }
+  } else if (removeIfPresent(ctx, wants.path)) changed = true;
   return changed;
 }
 

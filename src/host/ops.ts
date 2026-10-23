@@ -34,6 +34,11 @@ import * as provision from "./provision.ts";
 import { currentActor, RegistryLockedError, type BranchRow, type ReleaseRow, type ServiceKeyRow } from "./registry.ts";
 import { cleanupPreflight, followJob, gateBranch, newGeneration, recoverSwitchedBranch, stageRelease, startJob, type GateResult } from "./release.ts";
 import { branchUrl, removeIfPresent } from "./render.ts";
+import { setSetting } from "./alerts.ts";
+import { check, ensureCheckTimer } from "./check.ts";
+import { doctor } from "./doctor.ts";
+
+export { check, doctor, setSetting };
 
 /** Why an op refused: `code` for M4's HTTP mapping, the message for people. */
 export class OpError extends Error {
@@ -149,6 +154,8 @@ const initSchema = z.strictObject({
   tunnelPortBase: z.number().int().optional(),
   /** incibase.slice MemoryMax; default: the machine's memory less 1 GiB (at least 512 MiB). */
   sliceMemoryMax: z.number().int().min(256 * MiB).optional(),
+  /** Run `host check` every 30 s (default); false keeps the timer stopped (setting check_timer = off). */
+  checkTimer: z.boolean().optional(),
   ...frontDoorFields(),
 });
 
@@ -177,8 +184,11 @@ export async function initHost(ctx: OpsContext, input: z.input<typeof initSchema
   const { tlsCert, tlsKey, trustProxy, httpsPort, ...settings } = parse(initSchema, input);
   if ((tlsCert === undefined) !== (tlsKey === undefined)) throw new OpError("INVALID", "tlsCert and tlsKey go together");
   return audited(ctx, "host.init", null, async () => {
-    const sliceMemoryMax = settings.sliceMemoryMax ?? Math.max(512 * MiB, Math.floor((totalmem() - 1024 * MiB) / MiB) * MiB);
-    await provision.initHost(ctx, { ...settings, sliceMemoryMax });
+    const { checkTimer, ...init } = settings;
+    const sliceMemoryMax = init.sliceMemoryMax ?? Math.max(512 * MiB, Math.floor((totalmem() - 1024 * MiB) / MiB) * MiB);
+    if (checkTimer !== undefined) await ctx.registry.withLock(() => ctx.registry.setSetting("check_timer", checkTimer ? "on" : "off"));
+    await provision.initHost(ctx, { ...init, sliceMemoryMax });
+    ensureCheckTimer(ctx);
     await ctx.registry.withLock(() => ctx.registry.audit({ actor: actor(ctx), action: "host.init", detail: { domain: settings.domain }, ok: true }, now(ctx)));
     const front = await frontDoor(() => nginx.initFrontDoor(ctx, { tlsCert, tlsKey, trustProxy, httpsPort }));
     return { domain: ctx.registry.getSetting("domain"), layout: ctx.layout.saved(), ...(front ? { frontDoor: front } : {}) };
@@ -244,6 +254,7 @@ export async function render(ctx: OpsContext, _input: Record<string, never> = {}
       if (current && current.status === "interrupted" && current.generation) await recoverSwitchedBranch(ctx, id);
     }
     const report = await provision.renderHost(ctx);
+    ensureCheckTimer(ctx);
     // The front door last: nginx keeps its previous file when the new one fails.
     const front: nginx.NginxReport | { error: string } = await nginx.renderNginx(ctx).catch((err: Error) => ({ error: err.message }));
     await ctx.registry.withLock(() =>
@@ -933,4 +944,7 @@ export const OPS = {
   serviceKeyRevoke,
   status,
   logs,
+  check,
+  doctor,
+  setSetting,
 } as const satisfies Record<string, (ctx: OpsContext, input: never) => Promise<unknown>>;
