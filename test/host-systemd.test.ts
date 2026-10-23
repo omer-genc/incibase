@@ -16,6 +16,7 @@ import { chmodSync, chownSync, cpSync, existsSync, mkdirSync, readdirSync, readF
 import { basename, join } from "node:path";
 import { VERSION } from "../src/engine/version.ts";
 import { openHost, type OpsContext } from "../src/host/context.ts";
+import { systemdFeature } from "../src/host/doctor.ts";
 import { DEFAULT_ROOT, HostLayout } from "../src/host/layout.ts";
 import * as ops from "../src/host/ops.ts";
 import { renderBranchFiles } from "../src/host/provision.ts";
@@ -533,7 +534,9 @@ console.log("PROBE " + JSON.stringify(out));
   const directive = (name: string, effective: boolean, detail: string) => {
     if (effective) return report.lines.push(`ok   ${name}: ${detail}`);
     const by = overriddenBy(unit, name);
-    report.lines.push(`NOT EFFECTIVE ${name}: ${detail}${by ? ` (overridden by ${by})` : " (not supported here)"}`);
+    // SocketBindDeny needs systemd's BPF framework, which Ubuntu 24.04's build lacks (on a VM too).
+    const build = name === "SocketBindDeny" && systemdFeature(run(["systemctl", "--version"]).stdout, "BPF_FRAMEWORK") === false;
+    report.lines.push(`NOT EFFECTIVE ${name}: ${detail}${by ? ` (overridden by ${by})` : build ? " (unsupported by this systemd build: -BPF_FRAMEWORK)" : " (not supported here)"}`);
     report.ineffective.push(name);
   };
 

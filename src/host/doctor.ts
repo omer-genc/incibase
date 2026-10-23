@@ -4,7 +4,15 @@
 // The sandbox is not taken on trust: a short transient unit runs a probe as
 // `nobody` with the directives a branch gets and reports which of them
 // actually take effect here (a container may switch some off; on a VM each
-// one that does not is a FAIL). The probe is incibase's own script run by an
+// one that does not is a FAIL). SocketBindDeny needs systemd's BPF framework:
+// a systemd built without it (`-BPF_FRAMEWORK`, as Ubuntu 24.04's is) ignores
+// it on a VM too, so that is a WARN naming the build, not the container.
+//
+// The check timer is judged by what its runs leave behind (the check cannot
+// alert about itself): a failed check service, or no completed run for two
+// minutes, is a FAIL; so are alerts waiting more than 5 minutes to reach the
+// webhook. The journal's effective Storage= comes from journald.conf and its
+// drop-ins. The probe is incibase's own script run by an
 // installed runtime (BUN_BE_BUN=1 makes the standalone binary act as bun);
 // root runs no tenant code.
 //
@@ -13,7 +21,7 @@
 import { lstatSync, readFileSync } from "node:fs";
 import { VERSION } from "../engine/version.ts";
 import { RUNTIME_VERSION_REGEX } from "./layout.ts";
-import { statDisk, type DiskUsage } from "./check.ts";
+import { readCheckState, statDisk, type DiskUsage } from "./check.ts";
 import { ALERT_WEBHOOK } from "./alerts.ts";
 import type { OpsContext } from "./context.ts";
 import { printable } from "./driver.ts";
@@ -62,6 +70,40 @@ export interface DoctorContext extends OpsContext {
 const PATH_ENV = { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LC_ALL: "C", SYSTEMD_COLORS: "0", SYSTEMD_PAGER: "" };
 /** systemd 252 is the oldest with every directive the branch units use (and `systemctl kill --kill-whom`). */
 export const MIN_SYSTEMD = 252;
+/** A check that has not completed for this long is not running (the timer fires every 30 s). */
+export const CHECK_STALE_MS = 120_000;
+/** An alert that has waited this long for the webhook is not being delivered. */
+export const ALERT_DELIVERY_GRACE_MS = 5 * 60_000;
+
+/**
+ * Whether `systemctl --version` lists a compile-time feature: true for
+ * `+NAME`, false for `-NAME`, null when it is not listed.
+ */
+export function systemdFeature(versionOutput: string, name: string): boolean | null {
+  for (const word of versionOutput.split(/\s+/)) {
+    if (word === `+${name}`) return true;
+    if (word === `-${name}`) return false;
+  }
+  return null;
+}
+
+/** The Storage= journald uses: the last one in its configuration (drop-ins included), `auto` when none sets it. */
+export function journalStorage(config: string): string {
+  let section = "";
+  let storage = "auto";
+  for (const raw of config.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+    const header = /^\[(.+)\]$/.exec(line);
+    if (header) section = header[1]!;
+    else if (section === "Journal") {
+      const value = /^Storage\s*=\s*(.*)$/.exec(line)?.[1];
+      // An empty assignment resets it to the default.
+      if (value !== undefined) storage = value.trim().toLowerCase() || "auto";
+    }
+  }
+  return storage;
+}
 
 function runCommand(argv: string[], timeoutMs = 15_000): CommandResult | null {
   try {
@@ -224,6 +266,7 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
 
   // systemd and the kernel
   const version = hooks.command(["systemctl", "--version"]);
+  const bpfFramework = version ? systemdFeature(version.stdout, "BPF_FRAMEWORK") : null;
   const systemd = version ? Number(/^systemd (\d+)/.exec(version.stdout)?.[1]) : NaN;
   if (!version) add("systemd", "FAIL", "systemctl is not installed");
   else if (!Number.isInteger(systemd)) add("systemd", "FAIL", `cannot read the version from ${JSON.stringify(lastLine(version.stdout))}`);
@@ -246,7 +289,14 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
     for (const directive of PROBED_DIRECTIVES) {
       const { effective, detail } = probe.directives[directive];
       if (effective) add(`sandbox ${directive}`, "OK", detail);
-      else add(`sandbox ${directive}`, container ? "WARN" : "FAIL", `not effective${container ? ` in this container (${container})` : ""}: ${detail}`);
+      else if (directive === "SocketBindDeny" && bpfFramework === false) {
+        // Not the container: this systemd cannot apply it anywhere. IPAddressDeny still drops local and private peers.
+        add(
+          `sandbox ${directive}`,
+          "WARN",
+          `unsupported by this systemd build (-BPF_FRAMEWORK): a branch can listen on TCP; IPAddressDeny keeps local and private peers out, so the firewall must keep every port but 22, 80 and 443 closed: ${detail}`,
+        );
+      } else add(`sandbox ${directive}`, container ? "WARN" : "FAIL", `not effective${container ? ` in this container (${container})` : ""}: ${detail}`);
     }
   }
 
@@ -272,6 +322,7 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
   if (!sys.lstat(layout.registry)) registryProblems.push(`${layout.registry}: missing`);
   for (const suffix of ["", "-wal", "-shm"]) privateFile(`${layout.registry}${suffix}`, registryProblems);
   privateFile(layout.checkState, registryProblems);
+  privateFile(layout.checkLock, registryProblems);
   problems("registry", registryProblems, "registry.db and its -wal and -shm are root 0600");
   const ready = registry.listBranches({ phase: "ready" });
   const envProblems: string[] = [];
@@ -300,8 +351,19 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
   }
 
   // logs, the tunnel, time, disk
-  const persistent = hooks.file("/var/log/journal")?.type === "dir" || /^\s*Storage\s*=\s*persistent\s*$/m.test(hooks.readText("/etc/systemd/journald.conf") ?? "");
-  add("journald", persistent ? "OK" : "WARN", persistent ? "persistent storage (/var/log/journal)" : "the journal is kept in memory only, so branch logs are lost at reboot (mkdir /var/log/journal)");
+  const catConfig = hooks.command(["systemd-analyze", "cat-config", "systemd/journald.conf"]);
+  const storage = journalStorage(catConfig?.exitCode === 0 ? catConfig.stdout : (hooks.readText("/etc/systemd/journald.conf") ?? ""));
+  const machineId = hooks.readText("/etc/machine-id")?.trim() ?? "";
+  const journalDir = /^[0-9a-f]{32}$/.test(machineId) ? `/var/log/journal/${machineId}` : null;
+  if (storage === "volatile" || storage === "none") {
+    add("journald", "WARN", `Storage=${storage}: branch logs are lost at reboot (set Storage=persistent in /etc/systemd/journald.conf.d/)`);
+  } else if (storage !== "auto" && storage !== "persistent") {
+    add("journald", "WARN", `Storage=${printable(storage, 40)} is not a value journald knows`);
+  } else if (storage === "auto" && hooks.file("/var/log/journal")?.type !== "dir") {
+    add("journald", "WARN", "the journal is kept in memory only, so branch logs are lost at reboot (mkdir /var/log/journal)");
+  } else if (journalDir && hooks.file(journalDir)?.type !== "dir") {
+    add("journald", "WARN", `Storage=${storage}, but journald has not written to ${journalDir} yet (journalctl --flush)`);
+  } else add("journald", "OK", `persistent storage (Storage=${storage}, /var/log/journal)`);
   const sshd = hooks.command(["sshd", "-T"]);
   if (!sshd) add("sshd", "WARN", "sshd is not installed: incibase tunnel needs it");
   else if (sshd.exitCode !== 0) add("sshd", "WARN", `sshd -T: ${lastLine(sshd.stderr || sshd.stdout)}`);
@@ -330,9 +392,21 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
   }
 
   // the check and its alerts
+  const at = (ctx.now ?? Date.now)();
+  const checkState = readCheckState(ctx);
+  const { checkService, checkTimer } = layout.units;
+  const ago = (t: number) => `${Math.max(0, Math.round((at - t) / 1000))} s ago`;
   if (registry.getSetting("check_timer") === "off") add("check timer", "WARN", "turned off (check_timer = off): nothing kills a stalled branch or raises alerts");
-  else if (ctx.driver.isActive(layout.units.checkTimer)) add("check timer", "OK", `${layout.units.checkTimer} runs the check every 30 s`);
-  else add("check timer", "WARN", `${layout.units.checkTimer} is not running (incibase host render starts it)`);
+  else if (!ctx.driver.isActive(checkTimer)) add("check timer", "WARN", `${checkTimer} is not running (incibase host render starts it)`);
+  else {
+    const service = ctx.driver.show(checkService);
+    const last = checkState.lastRunAt;
+    if (service.activeState === "failed") {
+      add("check timer", "FAIL", `the last run of ${checkService} failed (${printable(service.result || "failed", 40)}): nothing kills a stalled branch or raises alerts (journalctl -u ${checkService})`);
+    } else if (last === undefined) add("check timer", "WARN", `${checkTimer} runs, but no check has completed yet`);
+    else if (at - last > CHECK_STALE_MS) add("check timer", "FAIL", `the last check completed ${ago(last)}: ${checkService} does not complete (journalctl -u ${checkService})`);
+    else add("check timer", "OK", `${checkTimer} runs the check every 30 s; the last one completed ${ago(last)}`);
+  }
   const webhook = registry.getSetting(ALERT_WEBHOOK);
   let webhookHost: string | null = null;
   try {
@@ -340,7 +414,27 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
   } catch {
     // Reported below as not set.
   }
-  add("alerts", webhookHost ? "OK" : "WARN", webhookHost ? `alerts go to ${webhookHost}` : "no alert_webhook: alerts only show in incibase host status (incibase host set alert_webhook https://ntfy.sh/<topic>)");
+  if (!webhookHost) add("alerts", "WARN", "no alert_webhook: alerts only show in incibase host status (incibase host set alert_webhook https://ntfy.sh/<topic>)");
+  else {
+    const delivery = checkState.delivery;
+    const lastError = delivery && !delivery.ok && !delivery.unconfigured ? printable(delivery.error ?? "failed", 300) : null;
+    // Due: an open not sent yet, or a resolve not sent yet; `since` is when it opened or resolved.
+    const waiting = registry
+      .listAlerts()
+      .filter((a) => ((a.state === "firing" && a.notified_at === null) || (a.state === "resolved" && a.notified_at !== null)) && at - a.since > ALERT_DELIVERY_GRACE_MS);
+    if (waiting.length) {
+      const oldest = Math.min(...waiting.map((a) => a.since));
+      add(
+        "alerts",
+        "FAIL",
+        `${waiting.length} alert(s) waiting to reach ${webhookHost}, the oldest since ${ago(oldest)}${lastError ? `; the last delivery failed: ${lastError}` : ""} (${waiting
+          .slice(0, 3)
+          .map((a) => printable(a.key, 40))
+          .join(", ")})`,
+      );
+    } else if (lastError) add("alerts", "WARN", `alerts go to ${webhookHost}, but the last delivery ${ago(delivery!.at)} failed: ${lastError}`);
+    else add("alerts", "OK", `alerts go to ${webhookHost}`);
+  }
 
   return { ok: !checks.some((c) => c.status === "FAIL"), checks };
 }

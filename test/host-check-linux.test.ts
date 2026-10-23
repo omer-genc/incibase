@@ -10,10 +10,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { DataDirLock } from "../src/engine/store.ts";
 import { VERSION } from "../src/engine/version.ts";
 import { runCheck } from "../src/host/check.ts";
 import { openHost, type OpsContext } from "../src/host/context.ts";
-import { runDoctor } from "../src/host/doctor.ts";
+import { runDoctor, systemdFeature } from "../src/host/doctor.ts";
 import { DEFAULT_ROOT, HostLayout } from "../src/host/layout.ts";
 import * as ops from "../src/host/ops.ts";
 import { Registry, type BranchRow } from "../src/host/registry.ts";
@@ -168,6 +169,39 @@ describe.skipIf(!enabled)("host check and doctor on systemd", () => {
     // OnActiveSec=10s: the timer runs the service by itself.
     await waitFor("the timer to run the check", () => checks() >= 2, 45_000);
     expect(ctx.driver.show(checkService).result).toBe("success");
+    const quick = { ...ctx, doctor: { sandboxProbe: async () => ({ ran: false as const, reason: "not needed here" }) } };
+    const timerVerdict = async () => (await runDoctor(quick)).checks.find((c) => c.name === "check timer")!;
+    expect(await timerVerdict()).toMatchObject({ status: "OK", detail: expect.stringContaining("the last one completed") });
+    // A run that fails (here: ExecStart replaced by /bin/false) leaves the timer active and the service failed: doctor FAILs.
+    const dropIn = join(LAYOUT.systemdDir, `${checkService}.d`);
+    mkdirSync(dropIn, { recursive: true });
+    writeFileSync(join(dropIn, "zz-test-fail.conf"), "[Service]\nExecStart=\nExecStart=/bin/false\n");
+    try {
+      run(["systemctl", "daemon-reload"]);
+      run(["systemctl", "start", checkService], { ok: [0, 1] });
+      expect(ctx.driver.isActive(checkTimer)).toBe(true);
+      expect(ctx.driver.show(checkService).activeState).toBe("failed");
+      expect(await timerVerdict()).toMatchObject({ status: "FAIL", detail: expect.stringContaining(`the last run of ${checkService} failed (exit-code)`) });
+    } finally {
+      rmSync(dropIn, { recursive: true, force: true });
+      run(["systemctl", "daemon-reload"]);
+      run(["systemctl", "reset-failed", checkService], { ok: [0, 1, 5] });
+    }
+    // A manual run while another one holds control/check.lock does nothing.
+    // (The timer may be running one right now: wait for it.)
+    const held = await waitFor("control/check.lock", () => {
+      try {
+        return new DataDirLock(ctx.layout.control, undefined, "check.lock");
+      } catch {
+        return null;
+      }
+    });
+    try {
+      const cli = run([join(APPS, "incibase"), "host", "check", "--root", ROOT]);
+      expect(cli.stdout.trim()).toBe("skipped    another check is running");
+    } finally {
+      held.release();
+    }
     await ops.initHost(ctx, { domain: "incibase.example.net", checkTimer: false });
     expect(ctx.driver.isActive(checkTimer)).toBe(false);
     expect(existsSync(ctx.layout.timerWantsLink().path)).toBe(false);
@@ -233,13 +267,21 @@ describe.skipIf(!enabled)("host check and doctor on systemd", () => {
       expect(by.virtualization!.detail).toContain(container);
       // A container that switches directives off gets WARNs, never FAILs.
       for (const c of report.checks.filter((x) => x.name.startsWith("sandbox "))) expect(c.status).not.toBe("FAIL");
-      // OrbStack's LXC: SocketBindDeny has no effect and zzz-lxc-service.conf turns ProtectProc off.
+      // OrbStack's LXC: zzz-lxc-service.conf turns ProtectProc off.
       if (existsSync("/run/systemd/system/service.d/zzz-lxc-service.conf")) {
-        expect(by["sandbox SocketBindDeny"]!.status).toBe("WARN");
         expect(by["sandbox ProtectProc"]!.status).toBe("WARN");
         expect(by["sandbox ProtectProc"]!.detail).toContain(`not effective in this container (${container})`);
       }
     } else expect(by.virtualization!.status).toBe("OK");
+    // SocketBindDeny needs systemd's BPF framework; Ubuntu 24.04 builds it without (VM or container): a WARN naming the build.
+    if (systemdFeature(run(["systemctl", "--version"]).stdout, "BPF_FRAMEWORK") === false) {
+      const bind = by["sandbox SocketBindDeny"]!;
+      expect(bind.status).toBe("WARN");
+      expect(bind.detail).toStartWith("unsupported by this systemd build (-BPF_FRAMEWORK)");
+      expect(bind.detail).toEndWith("listening on 0.0.0.0: bound");
+    }
+    // journald's effective Storage= (Ubuntu: auto, with /var/log/journal/<machine-id> written).
+    expect(by.journald).toMatchObject({ status: "OK", detail: "persistent storage (Storage=auto, /var/log/journal)" });
     if (REQUIRE_SANDBOX) for (const c of report.checks.filter((x) => x.name.startsWith("sandbox "))) expect(c.status).toBe("OK");
     // The probe cleaned up after itself.
     expect(readdirSync("/run").filter((n) => n.startsWith(`${LABEL}-doctor-`))).toEqual([]);

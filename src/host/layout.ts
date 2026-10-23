@@ -139,6 +139,8 @@ export class HostLayout {
   readonly ballast: string;
   /** The check's per-branch counters (consecutive failed probes, failure episodes), root 0600. */
   readonly checkState: string;
+  /** Held by a running `host check`, so a manual run never overlaps the timer's. */
+  readonly checkLock: string;
   readonly systemdDir: string;
   readonly units: UnitNames;
 
@@ -179,6 +181,7 @@ export class HostLayout {
     this.trash = join(this.root, "trash");
     this.ballast = join(this.root, "ballast");
     this.checkState = join(this.control, "check-state.json");
+    this.checkLock = join(this.control, "check.lock");
   }
 
   /** What the registry keeps so later commands rebuild this layout from the root alone. */

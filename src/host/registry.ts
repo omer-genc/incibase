@@ -592,14 +592,18 @@ export class Registry {
   /**
    * After the owner was told: a firing alert gets `notified_at`, a resolved
    * one becomes 'closed'. Only when the row is still the episode that was
-   * sent (same state and `since`); false otherwise.
+   * sent (same state and `since`); false otherwise. An open that went out
+   * while the episode resolved (resolving moves `since`) still marks it, so
+   * its resolve is sent too instead of the row closing silently.
    */
   markAlertNotified(key: string, state: "firing" | "resolved", since: number, at: number): boolean {
-    return this.tx(() =>
-      state === "firing"
-        ? this.db.run(`UPDATE alerts SET notified_at = ? WHERE key = ? AND state = 'firing' AND since = ?`, [at, key, since]).changes === 1
-        : this.db.run(`UPDATE alerts SET state = 'closed', notified_at = ? WHERE key = ? AND state = 'resolved' AND since = ?`, [at, key, since]).changes === 1,
-    );
+    return this.tx(() => {
+      if (state === "resolved") {
+        return this.db.run(`UPDATE alerts SET state = 'closed', notified_at = ? WHERE key = ? AND state = 'resolved' AND since = ?`, [at, key, since]).changes === 1;
+      }
+      if (this.db.run(`UPDATE alerts SET notified_at = ? WHERE key = ? AND state = 'firing' AND since = ?`, [at, key, since]).changes === 1) return true;
+      return this.db.run(`UPDATE alerts SET notified_at = ? WHERE key = ? AND state = 'resolved' AND notified_at IS NULL AND since >= ?`, [at, key, since]).changes === 1;
+    });
   }
 
   listAlerts(state?: string): AlertRow[] {

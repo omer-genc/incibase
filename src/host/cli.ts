@@ -55,10 +55,13 @@ export async function hostCli(argv: string[]): Promise<void> {
       try {
         if (command === "check") {
           const report = await runCheck(ctx);
-          for (const b of report.branches) console.log(`${b.outcome.padEnd(10)} ${b.ref}: ${b.detail}`);
-          if (report.disk) console.log(`disk       ${report.disk.usedPercent}% used, ${(report.disk.availableBytes / 1024 ** 3).toFixed(1)} GiB free`);
-          const n = report.notifications;
-          console.log(`alerts     ${n.unconfigured ? "no alert_webhook set" : `${n.sent} sent`}${n.error ? `; delivery stopped: ${n.error}` : ""}`);
+          if (report.skipped) console.log(`skipped    ${report.skipped}`);
+          else {
+            for (const b of report.branches) console.log(`${b.outcome.padEnd(10)} ${b.ref}: ${b.detail}`);
+            if (report.disk) console.log(`disk       ${report.disk.usedPercent}% used, ${(report.disk.availableBytes / 1024 ** 3).toFixed(1)} GiB free`);
+            const n = report.notifications;
+            console.log(`alerts     ${n.unconfigured ? "no alert_webhook set" : `${n.sent} sent`}${n.error ? `; delivery stopped: ${n.error}` : ""}`);
+          }
         } else if (command === "doctor") {
           const report = await runDoctor(ctx);
           console.log(formatDoctor(report));

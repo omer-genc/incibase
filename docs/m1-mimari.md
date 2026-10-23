@@ -167,7 +167,7 @@ Internet ─:443─▶ nginx (TLS, limit_req/limit_conn, JSON log)
 | A → B'nin env, argv ve süreçleri | environ sahibe özel; ProtectProc=invisible; argv'de sır yok | environ [P], ProtectProc [I] |
 | A → B'nin soketleri | 2750 dizin, `chmod 0770` | [P] |
 | A → host-local servisler ve metadata | `IPAddressDeny=localhost 10/8 172.16/12 192.168/16 100.64/10 169.254/16 fc00::/7 fe80::/10`, `IPAddressAllow=127.0.0.53` | [I] |
-| A'nın TCP listener açması | `SocketBindDeny=any` | [I] |
+| A'nın TCP listener açması | `SocketBindDeny=any`; Ubuntu 24.04'te etkisiz (aşağıdaki not). Yerel ve özel ağdaki eşleri IPAddressDeny düşürür [P]; internete karşı host firewall'u (yalnızca 22, 80, 443) kalır. | [P]: Ubuntu 24.04'te etkisiz; sahip kararı bekliyor |
 | A → bellek, CPU, PID, disk | slice, MemoryMax/High, CPUQuota, TasksMax, `max_page_count`, kota, ballast | OOM [P] |
 | `.env` / `bunfig.toml` ile kalıcılık | Root'a ait cwd; ProtectSystem=strict | autoload [P] |
 | Kötü niyetli release → root | Root yalnızca JSON okur; preflight branch uid'siyle sandbox'ta | test |
@@ -298,7 +298,7 @@ IPAddressAllow=127.0.0.53/32
 - `env set` satır sonu ve sekme dışındaki kontrol karakterlerini reddeder. systemd tırnak içindeki satır sonunu değerin parçası sayıyor [P], ama dosyada kendi başına değişken gibi okunan bir satır oluşurdu; çok satırlı değerler base64 ile verilir.
 - Onay kelimesi branch'in hostname'idir (`prod--shop.<domain>`). Silme, korunmasa da her production branch'inde onay ister.
 - Release olmadan drop-in'de `ExecStart` yok; unit `bad-setting` görünür ve başlamaz [P]. `systemctl reset-failed` yüklenmemiş bir instance için 1 ile çıkar, `stop` 5 ile [P].
-- OrbStack container'ında `/run/systemd/system/service.d/zzz-lxc-service.conf` her servis için ProtectSystem, ProtectHome, PrivateDevices, NoNewPrivileges, ReadWritePaths ve ProtectProc'u kapatıyor; SocketBindDeny etkisiz. Etkili olanlar: IPAddressDeny (127.0.0.1 ve 169.254.169.254 zaman aşımı), TemporaryFileSystem, InaccessiblePaths, boş CapabilityBoundingSet [P]. `test/host-systemd.test.ts` hangi direktifin etkisiz olduğunu ve onu neyin kapattığını raporlar; adım 15'teki gerçek VM'de `INCIBASE_TEST_REQUIRE_SANDBOX=1` ile hepsi zorunludur.
+- OrbStack container'ında `/run/systemd/system/service.d/zzz-lxc-service.conf` her servis için ProtectSystem, ProtectHome, PrivateDevices, NoNewPrivileges, ReadWritePaths ve ProtectProc'u kapatıyor. SocketBindDeny de etkisiz, ama sebebi container değil (adım 13 düzeltmesi): Ubuntu 24.04'ün systemd paketi BPF framework'süz derlenmiş (`systemctl --version`: `255.4-1ubuntu8.18 … -BPF_FRAMEWORK`) ve SocketBindDeny buna muhtaç; aynı paket KVM VM'de de çalışır [P, arm64; adım 15 amd64'te doğrular]. Etkili olanlar: IPAddressDeny (127.0.0.1 ve 169.254.169.254 zaman aşımı), TemporaryFileSystem, InaccessiblePaths, boş CapabilityBoundingSet [P]. `test/host-systemd.test.ts` hangi direktifin etkisiz olduğunu ve onu neyin kapattığını raporlar; adım 15'teki gerçek VM'de `INCIBASE_TEST_REQUIRE_SANDBOX=1` ile hepsi zorunludur.
 
 **`/etc/nginx/conf.d/incibase.conf`** (branch başına satır içermez):
 ```nginx
@@ -427,10 +427,25 @@ Değişmeden admin.sock'ta çalışır, çünkü yalnızca root-relative çağr�
 - `host init`'te `checkTimer: false` verilirse `check_timer=off` olur: timer durur ve boot linki kalkar. Linux testleri bunu kullanır.
 - Doctor'ın sandbox probe'u şöyle çalışır: `systemd-run --wait --pipe` ile `User=nobody` altında bir transient unit açılır. Bu unit, kurulu runtime binary'sini `BUN_BE_BUN=1` ile bun gibi çalıştırır [P, Bun 1.4.3]. Betik `/run` altında, deneme dosyası `/var/tmp` altında durur; ikisi de silinir.
 - OrbStack sonuçları [P]:
-  - SocketBindDeny, ProtectProc ve ProtectSystem etkisiz. `zzz-lxc-service.conf` ProtectSystem=no ve ProtectProc=default yazıyor.
-  - IPAddressDeny etkili.
-  - Container'da etkisiz direktif WARN olarak raporlanır, VM'de FAIL.
+  - ProtectProc ve ProtectSystem etkisiz. `zzz-lxc-service.conf` ProtectSystem=no ve ProtectProc=default yazıyor.
+  - SocketBindDeny etkisiz, ama container yüzünden değil: `zzz-lxc-service.conf`'ta SocketBind ayarı yok. Ubuntu 24.04'ün systemd'si `-BPF_FRAMEWORK` ile derlenmiş ve SocketBindDeny BPF framework ister. `SocketBindDeny=any` ile `nobody` olarak açılan transient unit 0.0.0.0:0 ve 0.0.0.0:18431'i direktif yokmuş gibi bağladı. Aynı paket KVM VM'de de koşar, yani hedef host'ta da etkisizdir.
+  - IPAddressDeny etkili. Branch sandbox'ının IPAddressDeny'ı gelen paketleri de düşürür: 0.0.0.0:18433'te dinleyen unit'e root'tan 127.0.0.1 ve 192.168.x adresiyle bağlanma zaman aşımına uğradı; direktifsiz unit cevap verdi. Bir branch'in TCP listener'ına yerel ve özel ağdaki eşler (diğer branch'ler, nginx) ulaşamaz; açık kalan, public IP üzerinden internet.
+  - Container'da etkisiz direktif WARN olarak raporlanır, VM'de FAIL. İstisna: `systemctl --version` `-BPF_FRAMEWORK` gösteriyorsa SocketBindDeny VM'de de container'da da "unsupported by this systemd build (-BPF_FRAMEWORK)" WARN'ıdır ve container suçlanmaz. Böylece Ubuntu 24.04 VM doctor'dan geçebilir.
+- **Sahip kararı bekliyor (TCP listener tehdidi):** Ubuntu 24.04'te `SocketBindDeny` hiçbir yerde çalışmadığı için 4.1'deki satırın yerine geçecek kontrol seçilmeli. Öneri: host firewall'u yalnızca 22, 80 ve 443'e izin versin (`host init --firewall`) ve doctor bunu denetlesin. RestrictAddressFamilies yetmez, çünkü branch'in dışarıya AF_INET bağlantısı gerekir. Karar verilene kadar doctor bu durumu WARN sayar; FAIL'e çevirmek tek satırlık değişikliktir. Seçilen kontrolün testi o adımda eklenir. Adım 15'te `INCIBASE_TEST_REQUIRE_SANDBOX=1` ile `test/host-systemd.test.ts` SocketBindDeny yüzünden düşer; o adım da aynı karara bağlıdır.
 - Doctor'ın disk eşikleri: %90 kullanımda WARN, %95'te FAIL. systemd için alt sınır 252.
+- Review düzeltmeleri:
+  - **Öldürmeden önce yeniden bakılır.** `killMain`'den hemen önce `show` tekrarlanır. Unit hâlâ `active` değilse ya da `InvocationID` veya MainPID, başarısız probe'lardakinden farklıysa öldürme yapılmaz (`transition`, "restarted while it was probed"). Bu durum, probe beklerken sahibin `branch restart`'ı ya da bir crash ve Restart= ile olur. Yeni süreç sıfırdan sayılır.
+  - **İki check aynı anda koşmaz.** Her çalıştırma `control/check.lock`'u (root 0600, `DataDirLock` ile aynı yöntem) tutar. Kilidi tutulmuş bulan çalıştırma hiçbir şey yapmaz ve "skipped another check is running" yazar. oneshot servis yalnızca timer'ı sıraya koyuyordu; elle çalıştırılan `host check` timer'ınkiyle çakışabiliyordu.
+  - **POST sırasında kapanan alarmın kapanışı da gider.** Açılış POST'u sürerken alarm resolve olursa (`since` değişir), `markAlertNotified` firing satırını bulamayınca aynı anahtarın `resolved` ve `notified_at` NULL satırını işaretler. Önceden bu satır sessizce kapanıyordu ve sahip alarmı açık sanıyordu. Şema değişmedi.
+  - **Disk alarmı histerezisle kapanır.** `disk:<p>` alarmı kullanım `p` − 3 puana (≤ %77 / ≤ %87) inince kapanır. Önceden %80 civarında salınan kullanım her 30 s'de bir bildirim üretiyordu.
+  - **Yavaş crash loop alarmı.** `restarts:<id>`, branch başına `NRestarts`'tan sayılır ve sayaç `check-state.json`'da tutulur. 10 dakikada 5 otomatik restart olunca açılır, 10 dakika restart olmayınca kapanır. 20-30 s'de bir çöken süreç start limit'e (120 s'de 8) hiç ulaşmaz ve unit `failed` olmaz. `failed` unit'te bu alarm açılmaz, çünkü `unit:<id>` zaten açıktır. Elle start'ın sıfırladığı `NRestarts` yeni taban sayılır.
+  - **Doctor, check'in sonucuna bakar.** `check-state.json` son tamamlanan çalıştırmayı (`lastRunAt`) ve teslimatın sonucunu (`delivery`: ok, hata; URL yok) tutar.
+    - `<prefix>-check.service` `failed` ise FAIL.
+    - Son tamamlanan check 120 s'den eskiyse FAIL.
+    - Hiç check tamamlanmamışsa WARN.
+    - Webhook'a 5 dakikadan uzun süredir ulaşamamış bir açılış ya da kapanış varsa FAIL. Son teslimat yalnızca başarısızsa WARN.
+    - Gerekçe: timer `active` kalırken her çalıştırma düşebilir ve check kendi arızasını alarm olarak bildiremez.
+  - **journald.** Etkin `Storage=` değeri `systemd-analyze cat-config systemd/journald.conf`'taki son `[Journal]` atamasıdır; drop-in'ler dahildir. Komut yoksa `/etc/systemd/journald.conf` okunur. `volatile`/`none` WARN'dır, `/var/log/journal` dizini olsa bile. `auto` ancak dizin varsa OK sayılır. `/var/log/journal/<machine-id>` yoksa "henüz yazmadı" WARN'ı verilir. Ubuntu 24.04'te `Storage=` hiç atanmaz (auto) ve dizin paketle gelir [P].
 
 ---
 

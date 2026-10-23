@@ -9,9 +9,12 @@ import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkAlertWebhook, deliverAlerts, redact, setSetting } from "../src/host/alerts.ts";
+import { DataDirLock } from "../src/engine/store.ts";
 import {
   check,
   KILL_AFTER_FAILURES,
+  RESTART_ALERT_COUNT,
+  RESTART_WINDOW_MS,
   probeAdminSocket,
   readCheckState,
   RETRY_AFTER_MS,
@@ -145,6 +148,123 @@ describe("a stalled branch", () => {
   });
 });
 
+describe("a kill that would hit another process", () => {
+  test("is dropped when the unit restarted while the third probe was waiting; the new process counts from zero", async () => {
+    const host = await checkHost(["prod"]);
+    const prod = branchOf(host, "prod");
+    const unit = unitOf(host, prod);
+    let n = 0;
+    host.probe = async (): Promise<ProbeResult> => {
+      // An owner's branch restart, or a crash and Restart=, during the 5 s probe.
+      if (++n === KILL_AFTER_FAILURES) host.driver.restart(unit);
+      return { kind: "fail", detail: "no answer within 5 s" };
+    };
+    for (let i = 1; i < KILL_AFTER_FAILURES; i++) await tick(host);
+    const restarted = host.driver.show(unit).invocationId;
+    const third = outcome(await tick(host), prod);
+    expect(host.driver.show(unit).invocationId).not.toBe(restarted);
+    expect(third).toMatchObject({ outcome: "transition", detail: "restarted while it was probed (active); not killed" });
+    expect(kills(host)).toEqual([]);
+    expect(firing(host)).toEqual([]);
+    expect(host.registry.listAudit(prod.id).some((a) => a.action === "check.kill")).toBe(false);
+    // The new process fails on its own: it is killed only after its own three failures.
+    for (let i = 1; i < KILL_AFTER_FAILURES; i++) expect(outcome(await tick(host), prod).outcome).toBe("failing");
+    expect(outcome(await tick(host), prod).outcome).toBe("killed");
+    expect(kills(host)).toHaveLength(1);
+  });
+
+  test("a stopped unit is not killed either", async () => {
+    const host = await checkHost(["prod"]);
+    const prod = branchOf(host, "prod");
+    let n = 0;
+    host.probe = async (): Promise<ProbeResult> => {
+      if (++n === KILL_AFTER_FAILURES) host.driver.stop(unitOf(host, prod));
+      return { kind: "fail", detail: "no answer within 5 s" };
+    };
+    for (let i = 0; i < KILL_AFTER_FAILURES; i++) await tick(host);
+    expect(kills(host)).toEqual([]);
+  });
+});
+
+describe("runs of the check", () => {
+  test("never overlap: one that finds control/check.lock held does nothing", async () => {
+    const host = await checkHost(["prod"]);
+    const prod = branchOf(host, "prod");
+    host.answers.set(sockOf(host, prod), { kind: "fail", detail: "no answer within 5 s" });
+    const held = new DataDirLock(host.layout.control, undefined, "check.lock");
+    try {
+      for (let i = 0; i < KILL_AFTER_FAILURES + 1; i++) expect(await tick(host)).toMatchObject({ skipped: "another check is running", branches: [] });
+      expect(readCheckState(host).branches).toEqual({});
+    } finally {
+      held.release();
+    }
+    // Two at once (the timer's and a manual one): one of them runs.
+    host.answers.delete(sockOf(host, prod));
+    const both = await Promise.all([runCheck(host), runCheck(host)]);
+    expect(both.filter((r) => r.skipped)).toHaveLength(1);
+    expect(both.find((r) => !r.skipped)!.branches).toHaveLength(1);
+    expect(host.sys.lstat(host.layout.checkLock)).toMatchObject({ type: "file", mode: 0o600 });
+  });
+
+  test("record when one last completed and how its delivery went, for doctor", async () => {
+    const host = await checkHost([]);
+    await tick(host);
+    expect(readCheckState(host)).toMatchObject({ lastRunAt: host.clock.t, delivery: { at: host.clock.t, ok: true, error: null, unconfigured: true } });
+    await host.registry.withLock(() => host.registry.setSetting("alert_webhook", "http://127.0.0.1:1/incibase-topic-secret"));
+    await host.registry.withLock(() => host.registry.raiseAlert("disk:90", "91% full", host.clock.t));
+    host.disk = { usedPercent: 91, availableBytes: 1024 ** 3 };
+    await tick(host);
+    const state = readCheckState(host);
+    expect(state.delivery).toMatchObject({ ok: false, unconfigured: false, error: expect.stringMatching(/^disk:80: /) });
+    expect(JSON.stringify(state)).not.toContain("incibase-topic-secret");
+  });
+});
+
+describe("a slow crash loop", () => {
+  /** What systemd's Restart= does after a crash: a new process, NRestarts one higher. */
+  const crash = (host: CheckHost, b: BranchRow) => host.driver.killMain(unitOf(host, b), "SIGKILL");
+
+  test("5 restarts by systemd within 10 minutes raise an alert, which resolves after 10 minutes without one", async () => {
+    const host = await checkHost(["prod", "dev"]);
+    const prod = branchOf(host, "prod");
+    await tick(host);
+    // A crash every 30 s never reaches the start limit (8 in 120 s): the unit never fails, each run sees a fresh process.
+    for (let i = 1; i < RESTART_ALERT_COUNT; i++) {
+      crash(host, prod);
+      expect(outcome(await tick(host), prod).outcome).toBe("ok");
+    }
+    expect(firing(host)).toEqual([]);
+    crash(host, prod);
+    await tick(host);
+    expect(firing(host)).toEqual([`restarts:${prod.id}`]);
+    expect(host.registry.listAlerts("firing")[0]!.message).toBe(
+      `shop/prod was restarted by systemd ${RESTART_ALERT_COUNT} times in the last 10 min (a crash loop slower than the start limit); see incibase logs`,
+    );
+    // It stays open while restarts keep coming, and while some are still in the window.
+    crash(host, prod);
+    await tick(host, 60_000);
+    for (let t = 60_000; t < RESTART_WINDOW_MS; t += 60_000) await tick(host, 60_000);
+    expect(firing(host)).toEqual([`restarts:${prod.id}`]);
+    await tick(host, 60_000);
+    expect(firing(host)).toEqual([]);
+  });
+
+  test("restarts spread over more than 10 minutes, or a manual start resetting NRestarts, raise nothing", async () => {
+    const host = await checkHost(["prod"]);
+    const prod = branchOf(host, "prod");
+    await tick(host);
+    for (let i = 0; i < 3 * RESTART_ALERT_COUNT; i++) {
+      crash(host, prod);
+      await tick(host, 3 * 60_000);
+    }
+    // An owner's restart: NRestarts starts over at 0 and is the new baseline.
+    host.driver.restart(unitOf(host, prod));
+    await tick(host);
+    expect(firing(host)).toEqual([]);
+    expect(readCheckState(host).branches[prod.id]).toMatchObject({ nRestarts: 0 });
+  });
+});
+
 describe("a branch that is still starting", () => {
   test("is never killed; past 2 minutes it raises 'startup slow', which resolves once it answers", async () => {
     const host = await checkHost(["prod"]);
@@ -255,6 +375,28 @@ describe("the disk", () => {
     host.disk = { usedPercent: 50, availableBytes: 50 * 1024 ** 3 };
     await tick(host);
     expect(firing(host)).toEqual([]);
+  });
+
+  test("use hovering at a threshold notifies once, not every tick: it resolves only 3 points below", async () => {
+    const host = await checkHost([]);
+    const hook = webhookServer();
+    try {
+      await useWebhook(host, hook.url);
+      for (let i = 0; i < 10; i++) {
+        host.disk = { usedPercent: i % 2 ? 79 : 80, availableBytes: 1024 ** 3 };
+        await tick(host);
+      }
+      expect(hook.received.map((r) => r.title)).toEqual(["incibase disk 80% full"]);
+      host.disk = { usedPercent: 78, availableBytes: 1024 ** 3 };
+      await tick(host);
+      expect(firing(host)).toEqual(["disk:80"]);
+      host.disk = { usedPercent: 77, availableBytes: 1024 ** 3 };
+      await tick(host);
+      expect(firing(host)).toEqual([]);
+      expect(hook.received.map((r) => r.title)).toEqual(["incibase disk 80% full", "incibase resolved: disk 80% full"]);
+    } finally {
+      hook.server.stop(true);
+    }
   });
 });
 
@@ -400,6 +542,62 @@ describe("alert delivery", () => {
       expect(await deliverAlerts(host)).toMatchObject({ sent: 0 });
     } finally {
       hook.server.stop(true);
+    }
+  });
+
+  test("an alert that resolves while its open is being POSTed still gets its resolve", async () => {
+    const host = await checkHost([]);
+    let first = true;
+    const received: string[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        received.push(req.headers.get("title") ?? "");
+        // A job, or another writer, resolves it during the POST.
+        if (first) {
+          first = false;
+          await host.registry.withLock(() => host.registry.resolveAlert(`release:b0000001`, host.clock.t + 5));
+        }
+        return Response.json({});
+      },
+    });
+    try {
+      await useWebhook(host, `http://127.0.0.1:${server.port}/topic`);
+      await host.registry.withLock(() => host.registry.raiseAlert(`release:b0000001`, "release 2 failed its gate", host.clock.t));
+      expect(await deliverAlerts(host)).toMatchObject({ sent: 1, closed: 0 });
+      expect(host.registry.listAlerts()[0]).toMatchObject({ state: "resolved", notified_at: host.clock.t });
+      expect(await deliverAlerts(host)).toMatchObject({ sent: 1, closed: 0 });
+      expect(received).toEqual(["incibase release problem", "incibase resolved: release problem"]);
+      expect(host.registry.listAlerts()[0]).toMatchObject({ state: "closed" });
+      // Re-raised during the POST (a new episode): its own open goes out next.
+      first = true;
+      await host.registry.withLock(() => host.registry.raiseAlert(`release:b0000001`, "again", host.clock.t + 10));
+      const server2 = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        async fetch(req) {
+          received.push(req.headers.get("title") ?? "");
+          if (first) {
+            first = false;
+            await host.registry.withLock(() => {
+              host.registry.resolveAlert(`release:b0000001`, host.clock.t + 11);
+              host.registry.raiseAlert(`release:b0000001`, "third", host.clock.t + 12);
+            });
+          }
+          return Response.json({});
+        },
+      });
+      try {
+        await useWebhook(host, `http://127.0.0.1:${server2.port}/topic`);
+        await deliverAlerts(host);
+        expect(host.registry.listAlerts()[0]).toMatchObject({ state: "firing", notified_at: null, message: "third" });
+        expect((await deliverAlerts(host)).sent).toBe(1);
+      } finally {
+        server2.stop(true);
+      }
+    } finally {
+      server.stop(true);
     }
   });
 

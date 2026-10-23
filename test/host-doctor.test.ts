@@ -1,9 +1,24 @@
 // `host doctor` on a fake host: the machine (commands, /sys, the journal,
 // sshd, the sandbox probe) comes from hooks, so every verdict is checked
-// here; test/host-check-linux.test.ts runs it on the real thing.
+// here; test/host-check-linux.test.ts runs it on the real thing. The default
+// machine is what an Ubuntu 24.04 VM shows, systemd built without the BPF
+// framework included.
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, writeFileSync } from "node:fs";
-import { formatDoctor, readProbe, runDoctor, type CommandResult, type DoctorContext, type DoctorHooks, type SandboxProbe } from "../src/host/doctor.ts";
+import { chmodSync, rmSync, writeFileSync } from "node:fs";
+import { runCheck, type CheckContext } from "../src/host/check.ts";
+import {
+  ALERT_DELIVERY_GRACE_MS,
+  CHECK_STALE_MS,
+  formatDoctor,
+  journalStorage,
+  readProbe,
+  runDoctor,
+  systemdFeature,
+  type CommandResult,
+  type DoctorContext,
+  type DoctorHooks,
+  type SandboxProbe,
+} from "../src/host/doctor.ts";
 import type { FileInfo } from "../src/host/system.ts";
 import * as ops from "../src/host/ops.ts";
 import { closeOpsHosts, fakeBundle, fakeOpsHost, type OpsTestHost } from "./host-helpers.ts";
@@ -14,20 +29,30 @@ const dir: FileInfo = { type: "dir", uid: 0, gid: 0, mode: 0o755, size: 0, mtime
 const file: FileInfo = { ...dir, type: "file", mode: 0o644 };
 const ok = (stdout: string): CommandResult => ({ exitCode: 0, stdout, stderr: "" });
 
-const effective = (all = true): SandboxProbe => ({
+/** What the probe finds; on Ubuntu 24.04 (`-BPF_FRAMEWORK`) SocketBindDeny does nothing, even on a VM. */
+const effective = (all = true, bind = all): SandboxProbe => ({
   ran: true,
   directives: {
-    SocketBindDeny: { effective: all, detail: "listening on 0.0.0.0: error EPERM" },
+    SocketBindDeny: { effective: bind, detail: bind ? "listening on 0.0.0.0: error EPERM" : "listening on 0.0.0.0: bound" },
     ProtectProc: { effective: all, detail: "root's /proc/1 is hidden" },
     IPAddressDeny: { effective: true, detail: "connecting to 127.0.0.1: timeout" },
     ProtectSystem: { effective: true, detail: "writing /var/tmp: error EROFS" },
   },
 });
 
+const MACHINE_ID = "1464c04e104a46fd83dcdf3790e3a865";
+/** `systemctl --version` of Ubuntu 24.04 (noble, amd64 and arm64 alike). */
+const UBUNTU_SYSTEMD =
+  "systemd 255 (255.4-1ubuntu8.18)\n+PAM +AUDIT +SELINUX +APPARMOR +IMA +SMACK +SECCOMP +GCRYPT -GNUTLS +OPENSSL +ACL +BLKID +CURL +ELFUTILS +FIDO2 +IDN2 -IDN +IPTC +KMOD +LIBCRYPTSETUP +LIBFDISK +PCRE2 -PWQUALITY +P11KIT +QRENCODE +TPM2 +BZIP2 +LZ4 +XZ +ZLIB +ZSTD -BPF_FRAMEWORK -XKBCOMMON +UTMP +SYSVINIT default-hierarchy=unified\n";
+const BPF_SYSTEMD = UBUNTU_SYSTEMD.replace("-BPF_FRAMEWORK", "+BPF_FRAMEWORK");
+/** `systemd-analyze cat-config systemd/journald.conf` of Ubuntu 24.04: every Storage= commented out (auto). */
+const UBUNTU_JOURNALD = "# /etc/systemd/journald.conf\n[Journal]\n#Storage=auto\n#Compress=yes\n\n# /usr/lib/systemd/journald.conf.d/syslog.conf\n[Journal]\nForwardToSyslog=yes\n";
+
 /** A healthy Ubuntu 24.04 VM, as the hooks show it; `patch` changes what one command says. */
 function machine(patch: Record<string, CommandResult | null> = {}, rest: Partial<DoctorHooks> = {}): Partial<DoctorHooks> {
   const commands: Record<string, CommandResult | null> = {
-    "systemctl --version": ok("systemd 255 (255.4-1ubuntu8)\n+PAM +AUDIT\n"),
+    "systemctl --version": ok(UBUNTU_SYSTEMD),
+    "systemd-analyze cat-config systemd/journald.conf": ok(UBUNTU_JOURNALD),
     "systemd-detect-virt --container": { exitCode: 1, stdout: "none\n", stderr: "" },
     "nginx -t": { exitCode: 0, stdout: "", stderr: "nginx: configuration file /etc/nginx/nginx.conf test is successful\n" },
     "sshd -T": ok("port 22\nallowstreamlocalforwarding yes\ndisableforwarding no\n"),
@@ -40,20 +65,28 @@ function machine(patch: Record<string, CommandResult | null> = {}, rest: Partial
       if (!(key in commands)) throw new Error(`unexpected command ${key}`);
       return commands[key]!;
     },
-    file: (path) => (path === "/sys/fs/cgroup/cgroup.controllers" ? file : path === "/var/log/journal" ? dir : null),
-    readText: () => null,
+    file: (path) => (path === "/sys/fs/cgroup/cgroup.controllers" ? file : path === "/var/log/journal" || path === `/var/log/journal/${MACHINE_ID}` ? dir : null),
+    readText: (path) => (path === "/etc/machine-id" ? `${MACHINE_ID}\n` : null),
     diskUsage: () => ({ usedPercent: 30, availableBytes: 70 * 1024 ** 3 }),
-    sandboxProbe: async () => effective(),
+    sandboxProbe: async () => effective(true, false),
     ...rest,
   };
 }
 
-async function doctorHost(): Promise<OpsTestHost & DoctorContext> {
-  const host = await fakeOpsHost();
+type DoctorHost = OpsTestHost & DoctorContext & CheckContext & { clock: { t: number } };
+
+/** A host with shop/dev, an ntfy webhook, a clock that only moves when told, and one completed check. */
+async function doctorHost(): Promise<DoctorHost> {
+  const host = (await fakeOpsHost()) as DoctorHost;
   host.sys.users.set("www-data", { name: "www-data", uid: 33, gid: 33, gecos: "", home: "/var/www", shell: "/usr/sbin/nologin" });
   host.sys.groups.get(host.layout.groups.proxy)!.members.push("www-data");
   await ops.createProject(host, { slug: "shop", branches: ["dev"] });
   await ops.setSetting(host, { key: "alert_webhook", value: "https://ntfy.sh/incibase-test" });
+  host.clock = { t: 1_900_000_000_000 };
+  host.now = () => host.clock.t;
+  host.diskUsage = () => ({ usedPercent: 30, availableBytes: 70 * 1024 ** 3 });
+  await runCheck(host);
+  host.clock.t += 10_000;
   return host;
 }
 
@@ -61,17 +94,20 @@ const verdicts = (report: Awaited<ReturnType<typeof runDoctor>>) => Object.fromE
 const detail = (report: Awaited<ReturnType<typeof runDoctor>>, name: string) => report.checks.find((c) => c.name === name)?.detail;
 
 describe("host doctor", () => {
-  test("a well set up VM is all OK", async () => {
+  test("a well set up Ubuntu 24.04 VM passes; SocketBindDeny, which its systemd cannot apply, is the one WARN", async () => {
     const host = await doctorHost();
     host.doctor = machine();
     const report = await runDoctor(host);
-    expect(report.checks.filter((c) => c.status !== "OK")).toEqual([]);
+    expect(report.checks.filter((c) => c.status !== "OK").map((c) => c.name)).toEqual(["sandbox SocketBindDeny"]);
+    expect(detail(report, "sandbox SocketBindDeny")).toBe(
+      "unsupported by this systemd build (-BPF_FRAMEWORK): a branch can listen on TCP; IPAddressDeny keeps local and private peers out, so the firewall must keep every port but 22, 80 and 443 closed: listening on 0.0.0.0: bound",
+    );
     expect(report.ok).toBe(true);
     expect(verdicts(report)).toEqual({
       systemd: "OK",
       "cgroup v2": "OK",
       virtualization: "OK",
-      "sandbox SocketBindDeny": "OK",
+      "sandbox SocketBindDeny": "WARN",
       "sandbox ProtectProc": "OK",
       "sandbox IPAddressDeny": "OK",
       "sandbox ProtectSystem": "OK",
@@ -89,12 +125,26 @@ describe("host doctor", () => {
       alerts: "OK",
     });
     expect(detail(report, "alerts")).toBe("alerts go to ntfy.sh");
+    expect(detail(report, "check timer")).toBe("incibase-check.timer runs the check every 30 s; the last one completed 10 s ago");
+    expect(detail(report, "journald")).toBe("persistent storage (Storage=auto, /var/log/journal)");
     expect(formatDoctor(report)).toContain("OK   systemd: systemd 255");
+    // With the BPF framework, SocketBindDeny works and is OK like the rest.
+    host.doctor = machine({ "systemctl --version": ok(BPF_SYSTEMD) }, { sandboxProbe: async () => effective() });
+    const strict = await runDoctor(host);
+    expect(strict.checks.filter((c) => c.status !== "OK")).toEqual([]);
+  });
+
+  test("systemdFeature reads systemctl --version's feature line", () => {
+    expect(systemdFeature(UBUNTU_SYSTEMD, "BPF_FRAMEWORK")).toBe(false);
+    expect(systemdFeature(BPF_SYSTEMD, "BPF_FRAMEWORK")).toBe(true);
+    expect(systemdFeature(UBUNTU_SYSTEMD, "SECCOMP")).toBe(true);
+    expect(systemdFeature("systemd 249 (249.11-0ubuntu3)\n", "BPF_FRAMEWORK")).toBeNull();
+    expect(systemdFeature("+BPF_FRAMEWORKX", "BPF_FRAMEWORK")).toBeNull();
   });
 
   test("in a container, sandbox directives that do not take effect are WARN; on a VM they FAIL", async () => {
     const host = await doctorHost();
-    host.doctor = machine({ "systemd-detect-virt --container": ok("lxc\n") }, { sandboxProbe: async () => effective(false) });
+    host.doctor = machine({ "systemctl --version": ok(BPF_SYSTEMD), "systemd-detect-virt --container": ok("lxc\n") }, { sandboxProbe: async () => effective(false) });
     const inContainer = await runDoctor(host);
     expect(verdicts(inContainer)).toMatchObject({
       virtualization: "WARN",
@@ -105,10 +155,17 @@ describe("host doctor", () => {
     });
     expect(detail(inContainer, "sandbox ProtectProc")).toBe("not effective in this container (lxc): root's /proc/1 is hidden");
     expect(inContainer.ok).toBe(true);
-    host.doctor = machine({}, { sandboxProbe: async () => effective(false) });
+    host.doctor = machine({ "systemctl --version": ok(BPF_SYSTEMD) }, { sandboxProbe: async () => effective(false) });
     const onVm = await runDoctor(host);
     expect(verdicts(onVm)).toMatchObject({ "sandbox SocketBindDeny": "FAIL", "sandbox ProtectProc": "FAIL" });
     expect(onVm.ok).toBe(false);
+    // Without the BPF framework SocketBindDeny is the build's doing, in a container as on a VM; the rest still FAIL on a VM.
+    host.doctor = machine({ "systemd-detect-virt --container": ok("lxc\n") }, { sandboxProbe: async () => effective(false) });
+    const orbstack = await runDoctor(host);
+    expect(detail(orbstack, "sandbox SocketBindDeny")).toStartWith("unsupported by this systemd build (-BPF_FRAMEWORK)");
+    expect(detail(orbstack, "sandbox SocketBindDeny")).not.toContain("container");
+    host.doctor = machine({}, { sandboxProbe: async () => effective(false) });
+    expect(verdicts(await runDoctor(host))).toMatchObject({ "sandbox SocketBindDeny": "WARN", "sandbox ProtectProc": "FAIL" });
     host.doctor = machine({}, { sandboxProbe: async () => ({ ran: false, reason: "no runtime is installed" }) });
     expect(verdicts(await runDoctor(host))).toMatchObject({ "sandbox probe": "WARN" });
   });
@@ -175,9 +232,86 @@ describe("host doctor", () => {
     expect(verdicts(report)).toMatchObject({ disk: "FAIL", journald: "WARN", time: "WARN", "check timer": "WARN", alerts: "WARN" });
     expect(detail(report, "time")).toBe("branches use Europe/Istanbul, the machine Etc/UTC; the clock is not NTP-synchronized");
     expect(detail(report, "disk")).toBe(`4% free (2.0 GiB) on the file system of ${host.layout.root}`);
-    // journald.conf can make it persistent too.
-    host.doctor = machine({}, { file: (p) => (p.startsWith("/sys") ? file : null), readText: () => "[Journal]\nStorage=persistent\n" });
+    // journald.conf can make it persistent too (read directly when systemd-analyze cannot show it).
+    host.doctor = machine(
+      { "systemd-analyze cat-config systemd/journald.conf": null },
+      { file: (p) => (p.startsWith("/sys") ? file : null), readText: () => "[Journal]\nStorage=persistent\n" },
+    );
     expect(verdicts(await runDoctor(host)).journald).toBe("OK");
+  });
+
+  test("journald: Storage=volatile or none wins over /var/log/journal, drop-ins included; a journal not written yet is a WARN", async () => {
+    const host = await doctorHost();
+    const config = (text: string) => machine({ "systemd-analyze cat-config systemd/journald.conf": ok(text) });
+    host.doctor = config("# /etc/systemd/journald.conf\n[Journal]\nStorage=volatile\n");
+    const volatile = await runDoctor(host);
+    expect(verdicts(volatile).journald).toBe("WARN");
+    expect(detail(volatile, "journald")).toBe("Storage=volatile: branch logs are lost at reboot (set Storage=persistent in /etc/systemd/journald.conf.d/)");
+    // The last one wins: a drop-in after journald.conf, in either direction.
+    host.doctor = config(`${UBUNTU_JOURNALD}\n# /etc/systemd/journald.conf.d/50-ram.conf\n[Journal]\nStorage=none\n`);
+    expect(detail(await runDoctor(host), "journald")).toStartWith("Storage=none:");
+    host.doctor = config("# /etc/systemd/journald.conf\n[Journal]\nStorage=volatile\n\n# /etc/systemd/journald.conf.d/keep.conf\n[Journal]\nStorage=persistent\n");
+    expect(verdicts(await runDoctor(host)).journald).toBe("OK");
+    // Only [Journal] counts; an empty assignment resets to auto.
+    expect(journalStorage("[Other]\nStorage=volatile\n")).toBe("auto");
+    expect(journalStorage("[Journal]\nStorage=volatile\n[Journal]\nStorage=\n")).toBe("auto");
+    expect(journalStorage("[Journal]\n  Storage = Persistent \n")).toBe("persistent");
+    // The directory is there, but nothing was written for this machine yet.
+    host.doctor = machine({}, { file: (p) => (p === "/var/log/journal" || p.startsWith("/sys") ? (p === "/var/log/journal" ? dir : file) : null) });
+    expect(detail(await runDoctor(host), "journald")).toBe(`Storage=auto, but journald has not written to /var/log/journal/${MACHINE_ID} yet (journalctl --flush)`);
+  });
+
+  test("check timer: a failed check service or no completed check for 2 minutes FAILs, though the timer runs", async () => {
+    const host = await doctorHost();
+    host.doctor = machine();
+    const { checkService } = host.layout.units;
+    expect(verdicts(await runDoctor(host))["check timer"]).toBe("OK");
+    // Every run fails (a removed binary, a registry lock that times out): systemd marks the oneshot failed.
+    const units = (host.driver as unknown as { units: Map<string, { status: Record<string, unknown> }> }).units;
+    host.driver.start(checkService);
+    units.get(checkService)!.status = { ...units.get(checkService)!.status, activeState: "failed", subState: "failed", result: "exit-code" };
+    const failed = await runDoctor(host);
+    expect(verdicts(failed)["check timer"]).toBe("FAIL");
+    expect(detail(failed, "check timer")).toBe(`the last run of ${checkService} failed (exit-code): nothing kills a stalled branch or raises alerts (journalctl -u ${checkService})`);
+    expect(failed.ok).toBe(false);
+    // Not failed, but nothing completed for a while (a hang, a unit that never runs).
+    units.get(checkService)!.status = { ...units.get(checkService)!.status, activeState: "inactive", subState: "dead", result: "success" };
+    host.clock.t += CHECK_STALE_MS;
+    const stale = await runDoctor(host);
+    expect(verdicts(stale)["check timer"]).toBe("FAIL");
+    expect(detail(stale, "check timer")).toBe(`the last check completed 130 s ago: ${checkService} does not complete (journalctl -u ${checkService})`);
+    await runCheck(host);
+    expect(verdicts(await runDoctor(host))["check timer"]).toBe("OK");
+    // A timer that runs but has not completed a check yet.
+    rmSync(host.layout.checkState);
+    expect(detail(await runDoctor(host), "check timer")).toBe("incibase-check.timer runs, but no check has completed yet");
+  });
+
+  test("alerts: a failing delivery is a WARN; alerts waiting more than 5 minutes for the webhook FAIL", async () => {
+    const host = await doctorHost();
+    host.doctor = machine();
+    const hook = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("no", { status: 500 }) });
+    try {
+      // The op takes https only; a local stand-in is written directly.
+      await host.registry.withLock(() => host.registry.setSetting("alert_webhook", `http://127.0.0.1:${hook.port}/incibase-topic-secret`));
+      // A job's alert (the check itself neither raises nor resolves it).
+      const key = `release:${host.registry.findBranch("shop", "dev")!.id}`;
+      await host.registry.withLock(() => host.registry.raiseAlert(key, "release 2 failed its gate", host.clock.t));
+      expect((await runCheck(host)).notifications.error).toBe(`${key}: HTTP 500`);
+      host.clock.t += 30_000;
+      const warn = await runDoctor(host);
+      expect(verdicts(warn).alerts).toBe("WARN");
+      expect(detail(warn, "alerts")).toBe(`alerts go to 127.0.0.1:${hook.port}, but the last delivery 30 s ago failed: ${key}: HTTP 500`);
+      host.clock.t += ALERT_DELIVERY_GRACE_MS;
+      await runCheck(host);
+      const fail = await runDoctor(host);
+      expect(verdicts(fail).alerts).toBe("FAIL");
+      expect(detail(fail, "alerts")).toBe(`1 alert(s) waiting to reach 127.0.0.1:${hook.port}, the oldest since 330 s ago; the last delivery failed: ${key}: HTTP 500 (${key})`);
+      expect(JSON.stringify(fail)).not.toContain("incibase-topic-secret");
+      expect(fail.ok).toBe(false);
+    } finally {
+      hook.stop(true);
+    }
   });
 
   test("the op runs it; the probe's output is read strictly", async () => {

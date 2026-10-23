@@ -214,8 +214,9 @@ export class DataDirLockedError extends Error {
 export class DataDirLock {
   private db: Database | null;
 
-  constructor(dir: string, database?: string) {
-    const path = join(dir, "LOCK");
+  /** `name` locks another file of `dir` instead (the host's check holds `control/check.lock`, so two never overlap). */
+  constructor(dir: string, database?: string, name = "LOCK") {
+    const path = join(dir, name);
     const created = ensurePrivateFile(path);
     let db: Database;
     try {

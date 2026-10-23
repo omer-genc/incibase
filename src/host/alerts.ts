@@ -6,9 +6,10 @@
 //   resolved                  ->  POST "resolved" (when its open was sent), state 'closed'
 //
 // A row re-raised while resolved or closed starts a new episode
-// (Registry.raiseAlert). Delivery is an HTTP POST to settings.alert_webhook,
-// shaped for an ntfy.sh topic: a plain-text body with Title, Priority and
-// Tags headers. It has a timeout, follows no redirect, and stops at the first
+// (Registry.raiseAlert); one that resolves while its open is being POSTed
+// still gets its resolve (Registry.markAlertNotified). Delivery is an HTTP
+// POST to settings.alert_webhook, shaped for an ntfy.sh topic: a plain-text
+// body with Title, Priority and Tags headers. It has a timeout, follows no redirect, and stops at the first
 // failure (the rest wait for the next tick). Messages never carry a secret:
 // key-like tokens, every env value of every branch and the webhook itself are
 // redacted, and the webhook URL (which is the topic's only secret) never
@@ -84,6 +85,7 @@ function describeKey(ctx: OpsContext, key: string): { kind: AlertKind; subject: 
     health: { title: "branch killed after failed health checks", priority: "high" },
     startup: { title: "branch slow to start", priority: "default" },
     unit: { title: "branch down", priority: "high" },
+    restarts: { title: "branch restarting repeatedly", priority: "high" },
     release: { title: "release problem", priority: "high" },
     branch: { title: "branch problem", priority: "high" },
     disk: { title: `disk ${rest}% full`, priority: rest === "80" ? "default" : "high" },
