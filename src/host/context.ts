@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { IS_COMPILED } from "../engine/build.ts";
 import type { Driver } from "./driver.ts";
 import { HostLayout, type LayoutOptions } from "./layout.ts";
+import type { NginxOptions } from "./nginx.ts";
 import type { HostContext } from "./provision.ts";
 import { Registry, RegistryError } from "./registry.ts";
 import { SystemdDriver } from "./systemd.ts";
@@ -32,6 +33,8 @@ export interface OpsContext extends HostContext {
   settleMs?: number;
   /** The shortest a gate waits for a start (default 60 s). */
   gateFloorMs?: number;
+  /** Where nginx keeps its files and how to test it (default: Ubuntu's paths, the real nginx). */
+  nginx?: NginxOptions;
 }
 
 /** The command that runs this same incibase: the binary, or bun with src/cli.ts. */
