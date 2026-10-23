@@ -673,7 +673,9 @@ describe("the CLI", () => {
     expect(help.exitCode).toBe(0);
     expect(help.stdout.toString()).toContain("--sums <SHA256SUMS>");
     expect(cli("--help").stdout.toString()).toContain("incibase host use-cli <version>");
+    // A usage error exits 2, as every host command does (step 12).
     const bad = cli("gc", "--bogus");
-    expect(bad.exitCode).toBe(64);
+    expect(bad.exitCode).toBe(2);
+    expect(bad.stderr.toString()).toContain("--bogus");
   });
 });

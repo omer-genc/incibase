@@ -166,13 +166,14 @@ export class SystemdDriver implements Driver {
     this.run(["journalctl", "--sync"], [0, 1]);
   }
 
-  journalCommand(query: { unit: string; follow?: boolean; lines?: number; since?: string; json?: boolean }): string[] {
+  journalCommand(query: { unit: string; follow?: boolean; lines?: number; since?: string; json?: boolean; grep?: string }): string[] {
     const args = ["journalctl", "--unit", checkUnitName(query.unit), "--output", query.json ? "json" : "cat", "--no-pager"];
     if (query.lines !== undefined) args.push("--lines", String(Math.max(1, Math.trunc(query.lines))));
     if (query.since !== undefined) {
       if (!SINCE.test(query.since)) throw new Error(`Invalid --since ${JSON.stringify(query.since)}`);
       args.push("--since", query.since);
     }
+    if (query.grep !== undefined) args.push("--grep", query.grep);
     if (query.follow) args.push("--follow");
     return args;
   }

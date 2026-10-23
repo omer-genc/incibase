@@ -87,6 +87,8 @@ export interface HostSystem {
   useradd(user: NewUser): void;
   /** Removes the user; its group goes too if it was the user's private group. */
   userdel(name: string): void;
+  /** Adds an existing user to a supplementary group (`usermod --append --groups`). */
+  addToGroup(user: string, group: string): void;
 
   /** The path itself, never what a symlink points at; null when missing. */
   lstat(path: string): FileInfo | null;
@@ -251,6 +253,10 @@ export class LinuxSystem implements HostSystem {
 
   groupdel(name: string) {
     this.run(["groupdel", "--", checkAccountName(name)]);
+  }
+
+  addToGroup(user: string, group: string) {
+    this.run(["usermod", "--append", "--groups", checkAccountName(group), "--", checkAccountName(user)]);
   }
 
   useradd(user: NewUser) {

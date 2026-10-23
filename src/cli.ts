@@ -35,7 +35,22 @@ Commands:
   build       Compile the app into a single executable
   bundle      Bundle the app into one release file (app.ib); runs its top-level code once
   init        Create a starter <dir>
-  admin-key   Print the admin key
+  admin-key   Print the admin key of the app in --data
+
+Hosting (on the server, as root; incibase host --help for the details):
+  host        The machine: init, add-admin, render, status, doctor, check, gc, runtimes, set
+  project     create <slug> [--branches prod,dev] | list | delete <slug>
+  branch      create | list | info | set | start | stop | restart | delete | upgrade <project>/<branch>
+  release     add <project>/<branch> <app.ib|-> | list | rollback
+  env         list | set | unset | import <project>/<branch>
+  service-key create | list | revoke <project>/<branch>
+  admin-key <project>/<branch>
+              A hosted branch's admin key ([--rotate]); with no <project>/<branch>
+              it is the local app's, from --data
+  status      Every branch: desired and actual state, release, memory, alerts
+  logs        <project>/<branch> [-f] [--errors] [--since <time>]
+  tunnel      <project>/<branch> --ssh <user@host> [--open]: on your laptop, the
+              branch's dashboard and MCP over SSH (no root)
 
 Options:
   --dir <path>      Backend source directory (default: incibase)
@@ -125,6 +140,35 @@ function parse(argv: string[]) {
   return { values, command: positionals[0] };
 }
 
+/** Commands for hosted branches (src/host/commands.ts, as root on the server) and `tunnel` (on the laptop). */
+const HOSTED_COMMANDS = new Set(["project", "branch", "release", "env", "service-key", "status", "logs", "tunnel"]);
+
+/** Flags of parse() and of the hosted commands that take a value, which is not a positional. */
+const VALUE_FLAGS = new Set(["--dir", "--data", "--port", "--host", "--url", "--outfile", "--target", "--out", "--bundle", "--socket", "--admin-socket", "--log-format", "--timeouts", "--drain-timeout", "--root"]);
+/** Flags only the hosted admin-key has. */
+const HOSTED_ADMIN_KEY_FLAGS = new Set(["--rotate", "--root", "--json"]);
+
+/**
+ * `admin-key shop/prod` is a hosted branch's key; `admin-key` alone or with
+ * --data reads a local app's data dir, as it always has. The argument
+ * shape decides, wherever the flags are: a positional with a "/" (the
+ * values of --data, --root and the like are not positionals) or a flag
+ * only the hosted one has (--rotate, --root, --json) makes it hosted. One
+ * of those together with --data is a usage error there.
+ */
+export function hostedAdminKey(args: string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--") return args.slice(i + 1).some((a) => a.includes("/"));
+    if (arg.startsWith("-")) {
+      const name = arg.split("=", 1)[0]!;
+      if (HOSTED_ADMIN_KEY_FLAGS.has(name)) return true;
+      if (!arg.includes("=") && VALUE_FLAGS.has(name)) i++;
+    } else if (arg.includes("/")) return true;
+  }
+  return false;
+}
+
 /** The log format `argv` asks for when it does not parse, so a bad flag still fails in the right format. */
 function requestedLogFormat(argv: string[]): string | undefined {
   let format = process.env.INCIBASE_LOG_FORMAT;
@@ -145,6 +189,18 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
     }
     const { hostCli } = await import("./host/cli.ts");
     return hostCli(argv.slice(1));
+  }
+  if (argv[0] !== undefined && (HOSTED_COMMANDS.has(argv[0]) || (argv[0] === "admin-key" && hostedAdminKey(argv.slice(1))))) {
+    if (options.embedded) {
+      console.error(`"${argv[0]}" is not available in a built app. Use: serve, admin-key`);
+      process.exit(ExitCode.CONFIG);
+    }
+    if (argv[0] === "tunnel") {
+      const { tunnelCli } = await import("./host/tunnel.ts");
+      process.exit(await tunnelCli(argv.slice(1)));
+    }
+    const { runCommand } = await import("./host/commands.ts");
+    process.exit(await runCommand(argv));
   }
   let parsed: ReturnType<typeof parse>;
   try {

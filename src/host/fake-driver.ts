@@ -243,8 +243,17 @@ export class FakeDriver implements Driver {
     this.calls.push("sync-journal");
   }
 
-  journalCommand(query: { unit: string; follow?: boolean; lines?: number; since?: string; json?: boolean }): string[] {
-    return ["journalctl", "--unit", query.unit, ...(query.follow ? ["--follow"] : [])];
+  journalCommand(query: { unit: string; follow?: boolean; lines?: number; since?: string; json?: boolean; grep?: string }): string[] {
+    return [
+      "journalctl",
+      "--unit",
+      query.unit,
+      ...(query.json ? ["--output", "json"] : []),
+      ...(query.lines !== undefined ? ["--lines", String(query.lines)] : []),
+      ...(query.since !== undefined ? ["--since", query.since] : []),
+      ...(query.grep !== undefined ? ["--grep", query.grep] : []),
+      ...(query.follow ? ["--follow"] : []),
+    ];
   }
 
   /** The admin socket's /api/health of the branch whose socket this is, when its process serves. */
