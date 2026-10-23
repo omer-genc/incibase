@@ -169,8 +169,14 @@ console.log("CONTROL " + JSON.stringify(out));
 process.exit(0);
 `;
 
-/** Run in a network namespace with only loopback up: the kernel's errno and Bun.connect's for a ULA with no route, and a closed loopback port. */
+/**
+ * Run as root in a fresh network namespace (`unshare --net`, gone with the
+ * process): loopback up and nothing else, then the kernel's errno and
+ * Bun.connect's for a ULA with no route, and a closed loopback port.
+ */
 const ERRNO_JS = `${TCP_CONNECT_JS}
+const lo = Bun.spawnSync(["ip", "link", "set", "lo", "up"], { stderr: "pipe" });
+if (lo.exitCode !== 0) throw new Error("ip link set lo up: " + lo.stderr);
 const viaBun = (host, port) => new Promise((done) => {
   const t = setTimeout(() => done("timeout"), 2000);
   Bun.connect({ hostname: host, port, socket: { open(s) { clearTimeout(t); s.end(); done("open"); }, data() {}, connectError(_s, e) { clearTimeout(t); done("error " + (e.code || e.message)); } } })
@@ -272,12 +278,11 @@ interface NetTarget {
 /** Root's listeners for the network probes, by target, each counting the connections it took. */
 const listeners = new Map<string, { accepted: number; stop(): void }>();
 
-/** Stops the probe listeners and removes the dummy interface and the network namespace (both named NET_IF). */
+/** Stops the probe listeners and removes the dummy interface. */
 function netDown() {
   for (const listener of listeners.values()) listener.stop();
   listeners.clear();
   if (existsSync(`/sys/class/net/${NET_IF}`)) run(["ip", "link", "del", NET_IF]);
-  if (existsSync(`/run/netns/${NET_IF}`)) run(["ip", "netns", "del", NET_IF]);
 }
 
 /**
@@ -690,19 +695,13 @@ describe.skipIf(!enabled)("isolation between branches", () => {
 
   test("the probes' connect reports the kernel's errno, where Bun.connect calls no route a refusal", () => {
     // Only loopback up, so no route to an IPv6 ULA: what a machine without IPv6 routing (a CI runner) gives for fd00::1.
-    run(["ip", "netns", "add", NET_IF]);
-    try {
-      run(["ip", "-n", NET_IF, "link", "set", "lo", "up"]);
-      const file = join(APPS, "net-errno.mjs");
-      writeFileSync(file, ERRNO_JS, { mode: 0o644 });
-      const { stdout } = run(["ip", "netns", "exec", NET_IF, "env", "BUN_BE_BUN=1", "HOME=/nonexistent", "NO_COLOR=1", ctx.layout.runtimeBinary(VERSION), file]);
-      const got = JSON.parse(stdout.split("\n").find((l) => l.startsWith("ERRNO "))?.slice("ERRNO ".length) ?? "null") as Record<string, string>;
-      console.log(`  no route to [fd00::1]:80: kernel ${got.ula}, Bun.connect ${got.ulaBun}; closed 127.0.0.1:1: kernel ${got.closed}`);
-      expect(got.ula).toBe("error ENETUNREACH");
-      expect(got.closed).toBe("error ECONNREFUSED");
-    } finally {
-      run(["ip", "netns", "del", NET_IF]);
-    }
+    const file = join(APPS, "net-errno.mjs");
+    writeFileSync(file, ERRNO_JS, { mode: 0o644 });
+    const { stdout } = run(["unshare", "--net", "--", "env", "BUN_BE_BUN=1", "HOME=/nonexistent", "NO_COLOR=1", ctx.layout.runtimeBinary(VERSION), file]);
+    const got = JSON.parse(stdout.split("\n").find((l) => l.startsWith("ERRNO "))?.slice("ERRNO ".length) ?? "null") as Record<string, string>;
+    console.log(`  no route to [fd00::1]:80: kernel ${got.ula}, Bun.connect ${got.ulaBun}; closed 127.0.0.1:1: kernel ${got.closed}`);
+    expect(got.ula).toBe("error ENETUNREACH");
+    expect(got.closed).toBe("error ECONNREFUSED");
   }, SLOW);
 
   test("host doctor reports whether SocketBindDeny is in force", async () => {
