@@ -680,7 +680,7 @@ describe("incibase _snapshot (what the unit runs, as the branch)", () => {
     expect(result.exitCode).toBe(0);
     expect(JSON.parse(result.stdout.toString())).toMatchObject({ ev: "snapshot", bytes: expect.any(Number) });
     expect(count(out)).toBe(5);
-    expect(Bun.spawnSync(["stat", "-f", "%Lp", out]).stdout.toString().trim()).toBe("600");
+    expect((statSync(out).mode & 0o777).toString(8)).toBe("600");
     expect(readdirSync(join(host.dir, "staging"))).toEqual(["snapshot.db"]);
   });
 
