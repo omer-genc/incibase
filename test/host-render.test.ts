@@ -45,6 +45,7 @@ IPAddressAllow=127.0.0.53/32
 ProtectSystem=strict
 ReadWritePaths=${writable}
 InaccessiblePaths=-/var/lib/incibase/control -/var/lib/incibase/trash -/var/lib/incibase/backups
+InaccessiblePaths=-/var/log/nginx
 ProtectHome=yes
 PrivateDevices=yes
 ProtectProc=invisible

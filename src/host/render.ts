@@ -80,6 +80,8 @@ export const IP_ADDRESS_DENY = "localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/1
 export const IP_ADDRESS_ALLOW = "127.0.0.53/32";
 /** Set for every branch process: no home, no colors, no transpiler cache outside the data dir. */
 const BRANCH_ENVIRONMENT = "HOME=/nonexistent NO_COLOR=1 BUN_RUNTIME_TRANSPILER_CACHE_PATH=0";
+/** Ubuntu's nginx log directory (nginx.ts DEFAULT_NGINX.logDir), hidden from branches. */
+const NGINX_LOG_DIR = "/var/log/nginx";
 /** Characters a value may have to go into a unit file unquoted: systemd expands `%` and `$`, splits on spaces. */
 const UNIT_WORD = /^[A-Za-z0-9_./:=,@+-]+$/;
 
@@ -109,6 +111,8 @@ function sandbox(layout: HostLayout, writable: string[]): string {
     "ProtectSystem=strict",
     `ReadWritePaths=${writable.join(" ")}`,
     `InaccessiblePaths=-${word(layout.control)} -${word(layout.trash)} -${word(layout.backups)}`,
+    // nginx's logs hold every tenant's requests (nginx.ts creates its own 0640; this covers the rest).
+    `InaccessiblePaths=-${NGINX_LOG_DIR}`,
     "ProtectHome=yes",
     "PrivateDevices=yes",
     "ProtectProc=invisible",

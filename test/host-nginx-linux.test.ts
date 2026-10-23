@@ -6,7 +6,10 @@
 // unknown SNI, the path blocks, X-Forwarded-For overwritten, Set-Cookie
 // Domain= emptied, 503-unprocessed only when the socket refused the
 // connection (an upstream that accepts and closes stays 502), WebSocket
-// upgrades, a 50 MB streamed upload, rate limits and certificate rotation.
+// upgrades, a 50 MB streamed upload, rate limits (per IPv6 /64 too, with
+// readable 429 and 413 answers), logs no branch user can read, no query
+// strings in any log, and certificate rotation. Known gaps are asserted as
+// they are, so a change in nginx shows up here.
 //
 // Skipped unless INCIBASE_TEST_HOST=1 on Linux as root with nginx installed;
 // needs INCIBASE_TEST_BINARY (bun scripts/build-binary.ts). Uses its own host
@@ -15,7 +18,7 @@
 // file names and port (INCIBASE_TEST_HTTPS_PORT, default 18443), and removes
 // everything it created, nginx's files included.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, chownSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { connect } from "node:tls";
 import { basename, join } from "node:path";
 import { VERSION } from "../src/engine/version.ts";
@@ -44,6 +47,8 @@ const WORK = `/tmp/${LABEL}-work`;
 const DOMAIN = "incibase.omergenc.net";
 const DEV = `dev--shop.${DOMAIN}`;
 const SLOW = 240_000;
+/** Source addresses for the /64 test: two in one /64, one in the next (documentation range). */
+const V6_ADDRS = ["2001:db8:11f:2::a", "2001:db8:11f:2:ffff::b", "2001:db8:11f:3::a"];
 
 const sys = new LinuxSystem();
 let ctx: OpsContext;
@@ -81,6 +86,8 @@ function cleanup() {
   // A restart, not a reload: the master's OOMScoreAdjust goes back too.
   if (hadNginx) run(["systemctl", "restart", NGINX_SERVICE]);
   rmSync(files.accessLog, { force: true });
+  rmSync(files.errorLog, { force: true });
+  for (const addr of V6_ADDRS) run(["ip", "-6", "addr", "del", `${addr}/128`, "dev", "lo"], { ok: [0, 2] });
   if (existsSync(join(ROOT, "control", "registry.db"))) {
     const registry = Registry.open(new HostLayout({ root: ROOT, ...LAYOUT }));
     for (const branch of registry.listBranches()) {
@@ -134,6 +141,8 @@ function bundleApp(name: string): string {
     const res = Response.json({ headers });
     res.headers.append("set-cookie", "sid=1; Domain=evil.example; Path=/; HttpOnly");
     res.headers.append("set-cookie", "pref=2; Path=/; Domain=.${DOMAIN}; Secure");
+    res.headers.append("set-cookie", "c6=1; Path=/;\\tDomain=${DOMAIN}");
+    res.headers.append("set-cookie", "c8=1; Path=/; Domain\\t=${DOMAIN}");
     return res;
   }),
 });
@@ -155,27 +164,49 @@ interface CurlResult {
 }
 
 let n = 0;
-/** curl over https to 127.0.0.1 with --resolve, trusting the test CA; the last header block counts (after a 100). */
-function curl(host: string, path: string, args: string[] = [], { cacert = true } = {}): CurlResult {
+interface CurlOptions {
+  cacert?: boolean;
+  /** Where the name resolves to (default 127.0.0.1); `[::1]` for IPv6. */
+  to?: string;
+}
+const CURL_EXITS = [0, 7, 22, 35, 52, 56];
+
+function curlCommand(host: string, path: string, args: string[], { cacert = true, to = "127.0.0.1" }: CurlOptions) {
   const out = join(WORK, `curl-${++n}`);
-  const result = run(
-    [
-      "curl",
-      "-sS",
-      "--max-time",
-      "60",
-      "-D",
-      `${out}.h`,
-      "-o",
-      `${out}.b`,
-      ...(cacert ? ["--cacert", join(WORK, "ca.crt")] : ["-k"]),
-      "--resolve",
-      `${host}:${PORT}:127.0.0.1`,
-      ...args,
-      `https://${host}:${PORT}${path}`,
-    ],
-    { ok: [0, 7, 22, 35, 52, 56] },
-  );
+  const command = [
+    "curl",
+    "-sS",
+    "--max-time",
+    "60",
+    "-D",
+    `${out}.h`,
+    "-o",
+    `${out}.b`,
+    ...(cacert ? ["--cacert", join(WORK, "ca.crt")] : ["-k"]),
+    "--resolve",
+    `${host}:${PORT}:${to}`,
+    ...args,
+    `https://${host}:${PORT}${path}`,
+  ];
+  return { command, out };
+}
+
+/** curl over https to 127.0.0.1 with --resolve, trusting the test CA; the last header block counts (after a 100). */
+function curl(host: string, path: string, args: string[] = [], options: CurlOptions = {}): CurlResult {
+  const { command, out } = curlCommand(host, path, args, options);
+  return curlResult(out, run(command, { ok: CURL_EXITS }).code);
+}
+
+/** curl in the background, so the test can watch nginx meanwhile. */
+async function curlAsync(host: string, path: string, args: string[] = [], options: CurlOptions = {}): Promise<CurlResult> {
+  const { command, out } = curlCommand(host, path, args, options);
+  const child = Bun.spawn(command, { stdout: "ignore", stderr: "pipe" });
+  const code = await child.exited;
+  if (!CURL_EXITS.includes(code)) throw new Error(`${command.join(" ")} exited ${code}: ${await new Response(child.stderr).text()}`);
+  return curlResult(out, code);
+}
+
+function curlResult(out: string, exit: number): CurlResult {
   const raw = existsSync(`${out}.h`) ? readFileSync(`${out}.h`, "utf8") : "";
   const blocks = raw.split(/\r\n\r\n/).filter((b) => b.trim());
   const last = blocks.at(-1) ?? "";
@@ -188,10 +219,42 @@ function curl(host: string, path: string, args: string[] = [], { cacert = true }
   const body = existsSync(`${out}.b`) ? readFileSync(`${out}.b`, "utf8") : "";
   rmSync(`${out}.h`, { force: true });
   rmSync(`${out}.b`, { force: true });
-  return { exit: result.code, status: Number(/^HTTP\/[\d.]+ (\d{3})/.exec(statusLine)?.[1] ?? 0), headers, body };
+  return { exit, status: Number(/^HTTP\/[\d.]+ (\d{3})/.exec(statusLine)?.[1] ?? 0), headers, body };
 }
 
 const header = (r: CurlResult, name: string) => r.headers[name]?.[0];
+
+/** Files nginx's workers hold open under its client body temp path: a request body spooled to disk (unlinked at once). */
+function spooledBodies(): string[] {
+  const held: string[] = [];
+  for (const pid of run(["pgrep", "-u", "www-data", "-x", "nginx"], { ok: [0, 1] }).stdout.split("\n").filter(Boolean)) {
+    let fds: string[] = [];
+    try {
+      fds = readdirSync(`/proc/${pid}/fd`);
+    } catch {
+      continue;
+    }
+    for (const fd of fds) {
+      try {
+        const target = readlinkSync(`/proc/${pid}/fd/${fd}`);
+        if (target.startsWith("/var/lib/nginx/body/")) held.push(target);
+      } catch {}
+    }
+  }
+  return held;
+}
+
+/** Runs `request` and samples spooledBodies() until it ends. */
+async function watchSpooling(request: Promise<CurlResult>) {
+  let done = false;
+  const seen = new Set<string>();
+  const result = request.finally(() => (done = true));
+  while (!done) {
+    for (const path of spooledBodies()) seen.add(path);
+    await Bun.sleep(25);
+  }
+  return { res: await result, spooled: [...seen] };
+}
 
 /** The access log lines (JSON) whose request id or path matches, newest last. */
 function accessLog(match: (line: Record<string, string | number>) => boolean) {
@@ -309,6 +372,13 @@ describe.skipIf(!enabled)("the nginx front door", () => {
     expect(statSync(tls).mode & 0o777).toBe(0o700);
     const key = ctx.registry.getSetting("tls_key")!;
     expect({ uid: statSync(key).uid, mode: statSync(key).mode & 0o777 }).toEqual({ uid: 0, mode: 0o600 });
+    // The host's logs as logrotate makes them, never nginx's root 0644.
+    const www = sys.getpwnam("www-data")!;
+    const adm = sys.getgrnam("adm")!;
+    for (const path of [files.accessLog, files.errorLog]) {
+      const st = statSync(path);
+      expect({ path, uid: st.uid, gid: st.gid, mode: st.mode & 0o777 }).toEqual({ path, uid: www.uid, gid: adm.gid, mode: 0o640 });
+    }
     const proxy = sys.getgrnam(LAYOUT.groups.proxy)!;
     expect(proxy.members).toContain("www-data");
     // The workers got the group with the reload, without a restart of nginx.
@@ -391,13 +461,36 @@ describe.skipIf(!enabled)("the nginx front door", () => {
     expect(seen["x-request-id"]).toMatch(/^[0-9a-f]{32}$/);
     note(`what the app saw: ${JSON.stringify({ xff: seen["x-forwarded-for"], proto: seen["x-forwarded-proto"], rid: seen["x-request-id"], connection: seen.connection })}`);
     const cookies = res.headers["set-cookie"] ?? [];
-    expect(cookies.length).toBe(2);
-    for (const cookie of cookies) expect(cookie).not.toMatch(/domain=[^;\s]/i);
+    expect(cookies.length).toBe(4);
+    const [sid, pref, tabBefore, tabAfter] = cookies;
+    for (const cookie of [sid, pref]) expect(cookie).toMatch(/; Domain=(;|$)/);
+    // Known gap (design 3.2 A): nginx leaves a tab before or after "Domain" alone, and browsers trim it
+    // (RFC 6265 5.2). If this starts failing, nginx changed: update the design's note.
+    expect(tabBefore).toBe(`c6=1; Path=/;\tDomain=${DOMAIN}`);
+    expect(tabAfter).toBe(`c8=1; Path=/; Domain\t=${DOMAIN}`);
     note(`Set-Cookie after nginx: ${JSON.stringify(cookies)}`);
     // The log has the path without its query string.
     const line = accessLog((l) => l.path === "/echo").at(-1)!;
     expect(line).toMatchObject({ status: 200, label: "dev--shop", ip: "127.0.0.1", rid: seen["x-request-id"] });
     expect(readFileSync(files.accessLog, "utf8")).not.toContain("secret=token");
+  });
+
+  test("no branch user can read nginx's logs: not by their mode, and the sandbox hides the directory", () => {
+    expect(curl(DEV, "/api/health").status).toBe(200);
+    const branch = ctx.registry.findBranch("shop", "dev")!;
+    const as = ["setpriv", `--reuid=${branch.os_uid}`, `--regid=${branch.os_uid}`, "--clear-groups", "--"];
+    for (const path of [files.accessLog, files.errorLog]) {
+      const denied = run([...as, "cat", path], { ok: [1] });
+      expect(denied.stderr).toContain("Permission denied");
+    }
+    // Inside the running branch's mount namespace /var/log/nginx is an empty, inaccessible directory.
+    const pid = run(["systemctl", "show", "--property", "MainPID", "--value", ctx.layout.units.branch(branch.id)]).stdout.trim();
+    expect(Number(pid)).toBeGreaterThan(0);
+    const inside = run(["nsenter", "-t", pid, "-m", "--", "ls", "-A", "/var/log/nginx"], { ok: [0, 2] });
+    expect(inside.stdout.trim()).toBe("");
+    // Outside, it has the logs.
+    expect(readdirSync("/var/log/nginx")).toContain(basename(files.accessLog));
+    note(`branch uid on the logs: Permission denied; /var/log/nginx inside the branch: ${JSON.stringify(inside.stdout.trim() || inside.stderr.trim())}`);
   });
 
   test("trust_proxy=cloudflare loads, and CF-Connecting-IP from outside Cloudflare's ranges is not believed", async () => {
@@ -411,8 +504,18 @@ describe.skipIf(!enabled)("the nginx front door", () => {
     expect((await ops.setFrontDoor(ctx, { trustProxy: "none" })).nginx).toMatchObject({ changed: true, action: "reload" });
   });
 
-  test("a stopped branch: 503 with x-incibase-unprocessed, Retry-After and CORS; OPTIONS 204", async () => {
+  test("a stopped branch: 503 with x-incibase-unprocessed, Retry-After and CORS; OPTIONS 204; no query string in any log", async () => {
     await ops.stop(ctx, { project: "shop", branch: "dev" });
+    const globalErrors = "/var/log/nginx/error.log";
+    const globalBefore = existsSync(globalErrors) ? statSync(globalErrors).size : 0;
+    const upload = curl(DEV, "/api/storage/upload?token=REVIEWSECRET123&visibility=public", ["-X", "POST", "--data", "x"]);
+    expect(upload.status).toBe(503);
+    const globalNew = existsSync(globalErrors) ? readFileSync(globalErrors, "utf8").slice(globalBefore) : "";
+    // The failed connect is logged at [crit] with the request line; the server's error_log is at alert.
+    expect(globalNew).not.toContain("REVIEWSECRET123");
+    expect(readFileSync(files.errorLog, "utf8")).not.toContain("REVIEWSECRET123");
+    expect(readFileSync(files.accessLog, "utf8")).not.toContain("REVIEWSECRET123");
+    expect(accessLog((l) => l.path === "/api/storage/upload").at(-1)).toMatchObject({ status: 503, connect: "-" });
     const res = curl(DEV, "/api/mutation", ["-X", "POST", "-H", "origin: https://app.example.com", "-H", "content-type: application/json", "--data", "{}"]);
     expect(res.status).toBe(503);
     expect(header(res, "x-incibase-unprocessed")).toBe("1");
@@ -499,32 +602,76 @@ describe.skipIf(!enabled)("the nginx front door", () => {
     const { key } = await ops.serviceKeyCreate(ctx, { project: "shop", branch: "dev", label: "uploader", scopes: ["upload"] });
     const file = join(WORK, "50mb.bin");
     writeFileSync(file, Buffer.alloc(50 * 1024 * 1024, 7));
-    const errorLog = "/var/log/nginx/error.log";
-    const errorsBefore = existsSync(errorLog) ? readFileSync(errorLog, "utf8").length : 0;
+    // The control: a 1.5 MB body to a buffered path is spooled to nginx's client body temp file meanwhile.
+    const medium = join(WORK, "1500k.json");
+    writeFileSync(medium, JSON.stringify({ path: "messages:bumpCount", args: { key: "x".repeat(1500 * 1024) } }));
+    const control = await watchSpooling(curlAsync(DEV, "/api/mutation", ["-X", "POST", "-H", "content-type: application/json", "--limit-rate", "600K", "--data-binary", `@${medium}`]));
+    expect(control.spooled.length).toBeGreaterThan(0);
     const started = performance.now();
-    const res = curl(DEV, "/api/storage/upload", ["-X", "POST", "-H", `authorization: Bearer ${key}`, "-H", "content-type: application/octet-stream", "--data-binary", `@${file}`]);
+    // Slowed down (about 2.5 s), so a spooled body would be seen.
+    const { res, spooled } = await watchSpooling(
+      curlAsync(DEV, "/api/storage/upload", ["-X", "POST", "-H", `authorization: Bearer ${key}`, "-H", "content-type: application/octet-stream", "--limit-rate", "20M", "--data-binary", `@${file}`]),
+    );
     const ms = Math.round(performance.now() - started);
     expect(res.status).toBe(200);
     const { storageId } = JSON.parse(res.body);
     expect(typeof storageId).toBe("string");
-    const newErrors = existsSync(errorLog) ? readFileSync(errorLog, "utf8").slice(errorsBefore) : "";
     // With proxy_request_buffering off nginx never spools the body to a temp file.
-    expect(newErrors).not.toContain("buffered to a temporary file");
-    note(`50 MB upload through nginx: 200 in ${ms} ms, no client body temp file`);
+    expect(spooled).toEqual([]);
+    note(`50 MB upload through nginx: 200 in ${ms} ms, no client body temp file (the 1.5 MB control to /api/mutation was spooled: ${control.spooled[0]})`);
     const big = join(WORK, "3mb.json");
     writeFileSync(big, JSON.stringify({ path: "messages:bumpCount", args: { key: "x".repeat(3 * 1024 * 1024) } }));
-    const tooBig = curl(DEV, "/api/mutation", ["-X", "POST", "-H", "content-type: application/json", "--data-binary", `@${big}`]);
+    const tooBig = curl(DEV, "/api/mutation", ["-X", "POST", "-H", "origin: https://app.example.com", "-H", "content-type: application/json", "--data-binary", `@${big}`]);
     expect(tooBig.status).toBe(413);
+    // nginx's own 413 in serve's shape, readable by a browser.
+    expect(header(tooBig, "content-type")).toBe("application/json");
+    expect(header(tooBig, "access-control-allow-origin")).toBe("*");
+    expect(JSON.parse(tooBig.body).error.code).toBe("PAYLOAD_TOO_LARGE");
+    expect(header(tooBig, "x-request-id")).toMatch(/^[0-9a-f]{32}$/);
   }, SLOW);
 
-  test("sign-in is rate limited per client address", () => {
+  const signIn = (options: CurlOptions = {}, extra: string[] = []) =>
+    curl(DEV, "/api/auth/signin", ["-X", "POST", "-H", "origin: https://app.example.com", "-H", "content-type: application/json", "--data", '{"email":"x@example.com","password":"wrong password"}', ...extra], options);
+  const preflight = (options: CurlOptions = {}, extra: string[] = []) =>
+    curl(DEV, "/api/auth/signin", ["-X", "OPTIONS", "-H", "origin: https://app.example.com", "-H", "access-control-request-method: POST", "-H", "access-control-request-headers: content-type", ...extra], options);
+
+  test("sign-in is rate limited per client address, with a 429 a browser can read; preflights are not counted", () => {
     const statuses: number[] = [];
     for (let i = 0; i < 10; i++) {
-      statuses.push(curl(DEV, "/api/auth/signin", ["-X", "POST", "-H", "content-type: application/json", "--data", '{"email":"x@example.com","password":"wrong password"}']).status);
+      // A browser's preflight before each: none of them uses up the budget.
+      expect(preflight().status).not.toBe(429);
+      statuses.push(signIn().status);
     }
-    note(`10 sign-ins in a row: ${statuses.join(" ")}`);
-    expect(statuses[0]).not.toBe(429);
-    expect(statuses).toContain(429);
+    note(`10 sign-ins in a row, each after a preflight: ${statuses.join(" ")}`);
+    expect(statuses.slice(0, 6).every((s) => s !== 429)).toBe(true);
+    expect(statuses.slice(6)).toEqual([429, 429, 429, 429]);
+    const limited = signIn();
+    expect(limited.status).toBe(429);
+    expect(header(limited, "content-type")).toBe("application/json");
+    expect(header(limited, "access-control-allow-origin")).toBe("*");
+    expect(header(limited, "access-control-expose-headers")).toContain("retry-after");
+    expect(header(limited, "retry-after")).toBe("6");
+    expect(JSON.parse(limited.body).error.code).toBe("RATE_LIMITED");
+    // Still the branch's own preflight answer, not nginx's.
+    const after = preflight();
+    expect(after.status).toBe(204);
+    expect(header(after, "access-control-max-age")).toBe("86400");
+  });
+
+  test("an IPv6 client is counted by its /64: rotating addresses in it buys no fresh sign-in budget", () => {
+    for (const addr of V6_ADDRS) run(["ip", "-6", "addr", "add", `${addr}/128`, "dev", "lo", "nodad"]);
+    const [a, b, other] = V6_ADDRS as [string, string, string];
+    const statuses: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      for (const addr of [a, b]) statuses.push(`${addr}:${signIn({ to: "[::1]" }, ["--interface", addr]).status}`);
+    }
+    note(`sign-ins alternating between two addresses of one /64: ${statuses.map((s) => s.split(":").pop()).join(" ")}`);
+    expect(statuses.filter((s) => !s.endsWith(":429")).length).toBe(6);
+    const logged = accessLog((l) => l.path === "/api/auth/signin" && l.ip === b);
+    expect(logged.length).toBe(4);
+    // The next /64 has its own budget.
+    expect(signIn({ to: "[::1]" }, ["--interface", other]).status).not.toBe(429);
+    for (const addr of V6_ADDRS) run(["ip", "-6", "addr", "del", `${addr}/128`, "dev", "lo"]);
   });
 
   test("certificate rotation: copy, nginx -t, reload; the new certificate is served and the old pair removed", async () => {

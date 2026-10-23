@@ -19,7 +19,13 @@
 // Also rendered: `nginx.service.d/50-<prefix>.conf` (OOMScoreAdjust=-900,
 // MemoryMin=64M: the front door outlives the branches under memory pressure),
 // and www-data joins the proxy group, which is what lets it traverse hosts/
-// and connect to http.sock (both 0750/0770 to that group).
+// and connect to http.sock (both 0750/0770 to that group). The host's two
+// logs are created www-data:adm 0640 before nginx first opens them (nginx
+// would make them root 0644, readable by every branch user).
+//
+// Names nginx keeps globally (zones, maps, the log format) come from the unit
+// prefix, so two hosts can share one nginx, but only on different ports: each
+// renders the default server of its own port.
 import { X509Certificate, createPrivateKey } from "node:crypto";
 import { join } from "node:path";
 import type { OpsContext } from "./context.ts";
@@ -117,6 +123,9 @@ export const DEFAULT_NGINX = {
   logDir: "/var/log/nginx",
   user: "www-data",
 } as const;
+/** The group logrotate gives nginx's logs (`create 0640 www-data adm`); root's when the machine has none. */
+export const LOG_GROUP = "adm";
+const LOG_MODE = 0o640;
 
 const ENV = { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LC_ALL: "C" };
 
@@ -170,6 +179,8 @@ export interface NginxFiles {
   /** `<systemdDir>/nginx.service.d/50-<prefix>.conf`. */
   dropIn: string;
   accessLog: string;
+  /** `<logDir>/<prefix>.error.log`: only alerts, see nginxConfig. */
+  errorLog: string;
   /** `<root>/tls`, root 0700. */
   tlsDir: string;
   /** Where candidates are tested, under control/ (root 0700). */
@@ -188,6 +199,7 @@ export function nginxFiles(layout: HostLayout, options: NginxOptions = {}): Ngin
     mainConfig: checkNginxPath(options.mainConfig ?? DEFAULT_NGINX.mainConfig),
     dropIn: join(layout.systemdDir, `${NGINX_SERVICE}.d`, `50-${prefix}.conf`),
     accessLog: join(logDir, `${prefix}.access.log`),
+    errorLog: join(logDir, `${prefix}.error.log`),
     tlsDir: join(layout.root, "tls"),
     testDir: join(layout.control, "nginx"),
     stem: prefix.replaceAll("-", "_"),
@@ -199,7 +211,7 @@ export function nginxFiles(layout: HostLayout, options: NginxOptions = {}): Ngin
 
 export interface NginxConfigInput {
   layout: HostLayout;
-  files: Pick<NginxFiles, "accessLog" | "stem">;
+  files: Pick<NginxFiles, "accessLog" | "errorLog" | "stem">;
   domain: string;
   port: number;
   trustProxy: TrustProxy;
@@ -210,11 +222,51 @@ export interface NginxConfigInput {
 const HEADER = "# Rendered by incibase from control/registry.db; changes here are overwritten.\n";
 const NOT_FOUND = `'{"error":{"code":"NOT_FOUND","message":"Not found"}}'`;
 const UNAVAILABLE = `'{"error":{"code":"BRANCH_UNAVAILABLE","message":"The branch is restarting; send the request again"}}'`;
+const RATE_LIMITED = `'{"error":{"code":"RATE_LIMITED","message":"Too many requests; send it again after Retry-After seconds"}}'`;
+/** The code serve gives a body over its route's limit (src/engine/http.ts). */
+const TOO_LARGE = `'{"error":{"code":"PAYLOAD_TOO_LARGE","message":"The request body is larger than this path accepts"}}'`;
 /** The CORS headers serve itself sends (src/engine/http.ts), so a browser can read the 503 during a restart. */
 const CORS_ALLOW_HEADERS = "authorization, content-type, x-incibase-as-user, x-request-id, mcp-protocol-version, mcp-session-id";
 const CORS_EXPOSE_HEADERS = "x-request-id, x-incibase-unprocessed, retry-after";
+const HEX = "[0-9a-f]+";
+const UP_TO_FOUR = `(?:${HEX}(?::${HEX}){0,3})?`;
+/**
+ * `map $remote_addr` to the key clients are counted by: the address for
+ * IPv4, the /64 for IPv6 (an ordinary allocation, so rotating addresses in
+ * it buys no fresh budget). nginx prints IPv6 compressed (ngx_inet6_ntop,
+ * "::" for the longest run of two or more zero hextets, lower case, no
+ * leading zeros); these give every address of one /64 its four leading
+ * hextets in that form. In order, the first match wins; addresses with a
+ * dotted tail (::ffff:a.b.c.d) keep the default.
+ */
+export const CLIENT_KEY_MAP: readonly (readonly [string, string])[] = [
+  // Four hextets before any "::".
+  [`^(${HEX}:${HEX}:${HEX}:${HEX}):`, "$1"],
+  // Fewer before "::", which covers the rest of the /64 (at most four after it).
+  [`^::${UP_TO_FOUR}$`, "0:0:0:0"],
+  [`^(${HEX})::${UP_TO_FOUR}$`, "$1:0:0:0"],
+  [`^(${HEX}:${HEX})::${UP_TO_FOUR}$`, "$1:0:0"],
+  [`^(${HEX}:${HEX}:${HEX})::${UP_TO_FOUR}$`, "$1:0"],
+  // "::" is two or three zeros and the /64 ends after it (five or six hextets follow).
+  [`^::(${HEX})(?::${HEX}){4}$`, "0:0:0:$1"],
+  [`^(${HEX})::(${HEX})(?::${HEX}){4}$`, "$1:0:0:$2"],
+  [`^::(${HEX}:${HEX})(?::${HEX}){4}$`, "0:0:$1"],
+];
 /** A label branchLabel makes: two slugs joined by "--" (neither has "--" of its own). */
 const LABEL_PATTERN = "[a-z0-9]+(?:-[a-z0-9]+)*--[a-z0-9]+(?:-[a-z0-9]+)*";
+
+/** The CORS headers of an answer nginx makes itself; `always`, as these are 4xx/5xx. */
+function corsHeaders(indent: string, preflight: boolean): string {
+  return [
+    "add_header Access-Control-Allow-Origin * always;",
+    ...(preflight
+      ? ['add_header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS" always;', `add_header Access-Control-Allow-Headers "${CORS_ALLOW_HEADERS}" always;`]
+      : []),
+    `add_header Access-Control-Expose-Headers "${CORS_EXPOSE_HEADERS}" always;`,
+  ]
+    .map((line) => `${indent}${line}`)
+    .join("\n");
+}
 
 /** `/etc/nginx/conf.d/<prefix>.conf`: the same text for every branch the host will ever have. */
 export function nginxConfig(input: NginxConfigInput): string {
@@ -238,9 +290,23 @@ map $http_upgrade $${s}_connection {
     default upgrade;
     "" close;
 }
-limit_req_zone $binary_remote_addr zone=${s}_ip:20m rate=50r/s;
-limit_req_zone $binary_remote_addr zone=${s}_auth:10m rate=10r/m;
-limit_conn_zone $binary_remote_addr zone=${s}_ip_conn:10m;
+# Clients are counted per IPv4 address and per IPv6 /64.
+map $remote_addr $${s}_client {
+    default $binary_remote_addr;
+${CLIENT_KEY_MAP.map(([re, key]) => `    "~${re}" ${key};`).join("\n")}
+}
+# Preflights do not use up the sign-in budget: a browser sends one before each sign-in.
+map $request_method $${s}_auth_client {
+    OPTIONS "";
+    default $${s}_client;
+}
+map $uri $${s}_retry_after {
+    ~^/api/auth/ 6;
+    default 1;
+}
+limit_req_zone $${s}_client zone=${s}_ip:20m rate=50r/s;
+limit_req_zone $${s}_auth_client zone=${s}_auth:10m rate=10r/m;
+limit_conn_zone $${s}_client zone=${s}_ip_conn:10m;
 limit_conn_zone $ib_label zone=${s}_branch_conn:10m;
 # No query strings ($uri, not $request_uri): they can carry upload tokens and signed URLs.
 log_format ${s}_json escape=json '{"t":"$time_iso8601","label":"$ib_label","method":"$request_method","path":"$uri",'
@@ -256,6 +322,9 @@ ${listen()}
     ssl_protocols TLSv1.2 TLSv1.3;
 ${realIp}
     access_log ${checkNginxPath(files.accessLog)} ${s}_json;
+    # nginx's own errors name the whole request line, query string included (upload tokens), for every
+    # failed connect; those failures are in the access log already (status, upstream, connect), without it.
+    error_log ${checkNginxPath(files.errorLog)} alert;
     default_type application/json;
 
     set $ib ${hosts}/$ib_label;
@@ -280,7 +349,9 @@ ${realIp}
     proxy_set_header X-Forwarded-Proto https;
 ${STRIPPED_HEADERS.map((name) => `    proxy_set_header ${name} "";`).join("\n")}
     proxy_set_header x-request-id $request_id;
-    # Cookies stay on their branch's hostname: an empty Domain= is ignored by browsers (RFC 6265 5.2.3).
+    # Best effort, not isolation: "; Domain=x" becomes an empty Domain=, which browsers ignore (RFC 6265 5.2.3),
+    # but nginx leaves a tab before or after "Domain" alone and never sees document.cookie. Branches share
+    # the parent domain (and are same-site) until it is on the Public Suffix List (design 3.2 A).
     proxy_cookie_domain ~.+ "";
     # A branch's response cannot make nginx serve something else.
     proxy_ignore_headers X-Accel-Redirect X-Accel-Expires X-Accel-Limit-Rate X-Accel-Charset;
@@ -288,6 +359,9 @@ ${STRIPPED_HEADERS.map((name) => `    proxy_set_header ${name} "";`).join("\n")}
     proxy_send_timeout 135s;
     proxy_read_timeout 135s;
     error_page 502 = @ib_down;
+    # What nginx refuses itself, readable by a browser and in serve's error shape.
+    error_page 429 = @ib_limited;
+    error_page 413 = @ib_too_large;
 
     location ~ ^/(?:_|api/admin|api/schema)(?:/|$) {
         return 404 ${NOT_FOUND};
@@ -319,10 +393,7 @@ ${STRIPPED_HEADERS.map((name) => `    proxy_set_header ${name} "";`).join("\n")}
             add_header Access-Control-Allow-Origin * always;
             return 502;
         }
-        add_header Access-Control-Allow-Origin * always;
-        add_header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS" always;
-        add_header Access-Control-Allow-Headers "${CORS_ALLOW_HEADERS}" always;
-        add_header Access-Control-Expose-Headers "${CORS_EXPOSE_HEADERS}" always;
+${corsHeaders("        ", true)}
         add_header Retry-After 1 always;
         add_header x-incibase-unprocessed 1 always;
         add_header x-request-id $request_id always;
@@ -330,6 +401,21 @@ ${STRIPPED_HEADERS.map((name) => `    proxy_set_header ${name} "";`).join("\n")}
             return 204;
         }
         return 503 ${UNAVAILABLE};
+    }
+    # limit_req or limit_conn. A limited preflight is let through, so the browser can read the 429 of the request itself.
+    location @ib_limited {
+${corsHeaders("        ", true)}
+        add_header Retry-After $${s}_retry_after always;
+        add_header x-request-id $request_id always;
+        if ($request_method = OPTIONS) {
+            return 204;
+        }
+        return 429 ${RATE_LIMITED};
+    }
+    location @ib_too_large {
+${corsHeaders("        ", false)}
+        add_header x-request-id $request_id always;
+        return 413 ${TOO_LARGE};
     }
 }
 
@@ -419,8 +505,34 @@ function ensureRootDir(ctx: OpsContext, path: string, mode: number) {
   if (ctx.sys.lstat(path)!.mode !== mode) ctx.sys.chmod(path, mode);
 }
 
+/**
+ * The host's logs as logrotate makes them (www-data:adm 0640), created before
+ * nginx opens them and repaired when they differ: nginx (its `-t` too) would
+ * create them root 0644, and the branch sandbox leaves /var/log readable.
+ * They carry every tenant's request metadata.
+ */
+function ensureLogs(ctx: OpsContext, files: NginxFiles) {
+  const user = ctx.sys.getpwnam(files.user);
+  if (!user) throw new FrontDoorError("FAILED", `The user ${files.user} nginx runs as does not exist: apt install nginx`);
+  const owner = { uid: user.uid, gid: ctx.sys.getgrnam(LOG_GROUP)?.gid ?? 0, mode: LOG_MODE };
+  const dir = files.accessLog.slice(0, files.accessLog.lastIndexOf("/"));
+  if (!ctx.sys.lstat(dir)) ctx.sys.mkdir(dir, 0o755);
+  for (const path of [files.accessLog, files.errorLog]) {
+    const info = ctx.sys.lstat(path);
+    if (info && info.type !== "file") throw new FrontDoorError("FAILED", `${path} exists and is not a regular file`);
+    if (!info) {
+      ctx.sys.writeFile(path, "", owner);
+      continue;
+    }
+    if (info.uid !== owner.uid || info.gid !== owner.gid) ctx.sys.chown(path, owner.uid, owner.gid);
+    if (info.mode !== owner.mode) ctx.sys.chmod(path, owner.mode);
+  }
+}
+
 /** `nginx -t` on `content` alone, in a harness under control/; throws FAILED with nginx's words. */
 function testCandidate(ctx: OpsContext, files: NginxFiles, content: string) {
+  // nginx -t opens (and creates) the logs the candidate names.
+  ensureLogs(ctx, files);
   ensureRootDir(ctx, files.testDir, ROOT_ONLY_DIR);
   const candidate = join(files.testDir, "candidate.conf");
   const harness = join(files.testDir, "harness.conf");
@@ -461,6 +573,7 @@ export async function renderNginx(ctx: OpsContext): Promise<NginxReport> {
       report.groupAdded = true;
     }
 
+    ensureLogs(ctx, files);
     const current = ctx.sys.lstat(files.conf)?.type === "file" ? ctx.sys.readFile(files.conf) : null;
     const confOwner = { uid: 0, gid: 0, mode: 0o644 };
     const confInfo = ctx.sys.lstat(files.conf);

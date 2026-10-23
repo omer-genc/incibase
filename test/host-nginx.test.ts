@@ -3,13 +3,14 @@
 // nginx rejects never replaces the one it serves. The behaviour against a
 // real nginx is in host-nginx-linux.test.ts.
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostLayout } from "../src/host/layout.ts";
 import {
   checkCertificate,
   checkNginxPath,
+  CLIENT_KEY_MAP,
   CLOUDFLARE_RANGES,
   nginxConfig,
   nginxDropIn,
@@ -82,10 +83,50 @@ async function nginxHost(): Promise<NginxHost> {
   writeFileSync(mainConfig, "# includes conf.d/*.conf\n");
   writeFileSync(host.layout.unitFile(NGINX_SERVICE), "[Service]\nExecStart=/usr/sbin/nginx\n");
   host.fake = new FakeNginx(host.sys, confDir);
+  // What the nginx package and Ubuntu bring: the worker user and logrotate's group.
+  host.sys.groups.set("www-data", { name: "www-data", gid: 33, members: [] });
+  host.sys.users.set("www-data", { name: "www-data", uid: 33, gid: 33, gecos: "www-data", home: "/var/www", shell: "/usr/sbin/nologin" });
+  host.sys.groups.set("adm", { name: "adm", gid: 4, members: [] });
+  mkdirSync(join(host.dir, "log"));
   host.nginx = { confDir, mainConfig, logDir: join(host.dir, "log"), control: host.fake };
   host.conf = join(confDir, "incibase.conf");
   host.driver.calls.length = 0;
   return host;
+}
+
+/** IPv6 text as nginx 1.24 prints $remote_addr (ngx_inet6_ntop): the longest run of two or more zero hextets is "::". */
+function ntop(groups: number[]): string {
+  const bytes = groups.flatMap((g) => [g >> 8, g & 0xff]);
+  let zero = -1;
+  let last = -1;
+  let max = 1;
+  let n = 0;
+  for (let i = 0; i < 16; i += 2) {
+    if (bytes[i] || bytes[i + 1]) {
+      if (max < n) [zero, max] = [last, n];
+      n = 0;
+      continue;
+    }
+    if (n++ === 0) last = i;
+  }
+  if (max < n) [zero, max] = [last, n];
+  let out = "";
+  let end = 16;
+  if (zero === 0) {
+    if ((max === 5 && bytes[10] === 0xff && bytes[11] === 0xff) || max === 6 || (max === 7 && bytes[14] !== 0 && bytes[15] !== 1)) end = 12;
+    out += ":";
+  }
+  for (let i = 0; i < end; i += 2) {
+    if (i === zero) {
+      out += ":";
+      i += (max - 1) * 2;
+      continue;
+    }
+    out += ((bytes[i]! << 8) | bytes[i + 1]!).toString(16);
+    if (i < 14) out += ":";
+  }
+  if (end === 12) out += bytes.slice(12).join(".");
+  return out;
 }
 
 const settings = (host: OpsTestHost) => ({ cert: host.registry.getSetting("tls_cert"), key: host.registry.getSetting("tls_key") });
@@ -113,9 +154,30 @@ map $http_upgrade $incibase_connection {
     default upgrade;
     "" close;
 }
-limit_req_zone $binary_remote_addr zone=incibase_ip:20m rate=50r/s;
-limit_req_zone $binary_remote_addr zone=incibase_auth:10m rate=10r/m;
-limit_conn_zone $binary_remote_addr zone=incibase_ip_conn:10m;
+# Clients are counted per IPv4 address and per IPv6 /64.
+map $remote_addr $incibase_client {
+    default $binary_remote_addr;
+    "~^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+):" $1;
+    "~^::(?:[0-9a-f]+(?::[0-9a-f]+){0,3})?$" 0:0:0:0;
+    "~^([0-9a-f]+)::(?:[0-9a-f]+(?::[0-9a-f]+){0,3})?$" $1:0:0:0;
+    "~^([0-9a-f]+:[0-9a-f]+)::(?:[0-9a-f]+(?::[0-9a-f]+){0,3})?$" $1:0:0;
+    "~^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+)::(?:[0-9a-f]+(?::[0-9a-f]+){0,3})?$" $1:0;
+    "~^::([0-9a-f]+)(?::[0-9a-f]+){4}$" 0:0:0:$1;
+    "~^([0-9a-f]+)::([0-9a-f]+)(?::[0-9a-f]+){4}$" $1:0:0:$2;
+    "~^::([0-9a-f]+:[0-9a-f]+)(?::[0-9a-f]+){4}$" 0:0:$1;
+}
+# Preflights do not use up the sign-in budget: a browser sends one before each sign-in.
+map $request_method $incibase_auth_client {
+    OPTIONS "";
+    default $incibase_client;
+}
+map $uri $incibase_retry_after {
+    ~^/api/auth/ 6;
+    default 1;
+}
+limit_req_zone $incibase_client zone=incibase_ip:20m rate=50r/s;
+limit_req_zone $incibase_auth_client zone=incibase_auth:10m rate=10r/m;
+limit_conn_zone $incibase_client zone=incibase_ip_conn:10m;
 limit_conn_zone $ib_label zone=incibase_branch_conn:10m;
 # No query strings ($uri, not $request_uri): they can carry upload tokens and signed URLs.
 log_format incibase_json escape=json '{"t":"$time_iso8601","label":"$ib_label","method":"$request_method","path":"$uri",'
@@ -132,6 +194,9 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
 
     access_log /var/log/nginx/incibase.access.log incibase_json;
+    # nginx's own errors name the whole request line, query string included (upload tokens), for every
+    # failed connect; those failures are in the access log already (status, upstream, connect), without it.
+    error_log /var/log/nginx/incibase.error.log alert;
     default_type application/json;
 
     set $ib /var/lib/incibase/hosts/$ib_label;
@@ -166,7 +231,9 @@ server {
     proxy_set_header True-Client-IP "";
     proxy_set_header CF-Connecting-IP "";
     proxy_set_header x-request-id $request_id;
-    # Cookies stay on their branch's hostname: an empty Domain= is ignored by browsers (RFC 6265 5.2.3).
+    # Best effort, not isolation: "; Domain=x" becomes an empty Domain=, which browsers ignore (RFC 6265 5.2.3),
+    # but nginx leaves a tab before or after "Domain" alone and never sees document.cookie. Branches share
+    # the parent domain (and are same-site) until it is on the Public Suffix List (design 3.2 A).
     proxy_cookie_domain ~.+ "";
     # A branch's response cannot make nginx serve something else.
     proxy_ignore_headers X-Accel-Redirect X-Accel-Expires X-Accel-Limit-Rate X-Accel-Charset;
@@ -174,6 +241,9 @@ server {
     proxy_send_timeout 135s;
     proxy_read_timeout 135s;
     error_page 502 = @ib_down;
+    # What nginx refuses itself, readable by a browser and in serve's error shape.
+    error_page 429 = @ib_limited;
+    error_page 413 = @ib_too_large;
 
     location ~ ^/(?:_|api/admin|api/schema)(?:/|$) {
         return 404 '{"error":{"code":"NOT_FOUND","message":"Not found"}}';
@@ -217,6 +287,25 @@ server {
         }
         return 503 '{"error":{"code":"BRANCH_UNAVAILABLE","message":"The branch is restarting; send the request again"}}';
     }
+    # limit_req or limit_conn. A limited preflight is let through, so the browser can read the 429 of the request itself.
+    location @ib_limited {
+        add_header Access-Control-Allow-Origin * always;
+        add_header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "authorization, content-type, x-incibase-as-user, x-request-id, mcp-protocol-version, mcp-session-id" always;
+        add_header Access-Control-Expose-Headers "x-request-id, x-incibase-unprocessed, retry-after" always;
+        add_header Retry-After $incibase_retry_after always;
+        add_header x-request-id $request_id always;
+        if ($request_method = OPTIONS) {
+            return 204;
+        }
+        return 429 '{"error":{"code":"RATE_LIMITED","message":"Too many requests; send it again after Retry-After seconds"}}';
+    }
+    location @ib_too_large {
+        add_header Access-Control-Allow-Origin * always;
+        add_header Access-Control-Expose-Headers "x-request-id, x-incibase-unprocessed, retry-after" always;
+        add_header x-request-id $request_id always;
+        return 413 '{"error":{"code":"PAYLOAD_TOO_LARGE","message":"The request body is larger than this path accepts"}}';
+    }
 }
 
 # Any other name (or none) on this port: no certificate is shown at all.
@@ -243,7 +332,7 @@ server {
     expect(plain).not.toContain("real_ip");
   });
 
-  test("another host prefix, root and port get their own names, so two hosts can share one nginx", () => {
+  test("another host prefix, root and port get their own names, so two hosts can share one nginx on different ports", () => {
     const other = new HostLayout({ root: "/var/lib/incibase-n11", unitPrefix: "incibase-n11" });
     const text = nginxConfig({ ...input, layout: other, files: nginxFiles(other), port: 18443, cert: "/var/lib/incibase-n11/tls/a.crt", key: "/var/lib/incibase-n11/tls/a.key" });
     expect(nginxFiles(other).conf).toBe("/etc/nginx/conf.d/incibase-n11.conf");
@@ -255,7 +344,13 @@ server {
     expect(text).toContain("    listen 18443 ssl http2;\n    listen [::]:18443 ssl http2;");
     expect(text).toContain("    listen 18443 ssl http2 default_server;");
     expect(text).toContain("access_log /var/log/nginx/incibase-n11.access.log incibase_n11_json;");
+    expect(text).toContain("error_log /var/log/nginx/incibase-n11.error.log alert;");
+    for (const name of ["$incibase_n11_client {", "$incibase_n11_auth_client {", "limit_req_zone $incibase_n11_client ", "limit_req_zone $incibase_n11_auth_client ", "Retry-After $incibase_n11_retry_after"]) {
+      expect(text).toContain(name);
+    }
     expect(text).not.toContain("listen 443");
+    // Each host has the default server of its own port: on one port the second fails nginx -t ("a duplicate default server").
+    expect(text.match(/default_server/g)?.length).toBe(2);
   });
 
   test("the server name matches exactly the labels branchLabel makes, under this domain only", () => {
@@ -265,6 +360,39 @@ server {
     for (const host of ["shop.incibase.omergenc.net", "a.b--c.incibase.omergenc.net", "prod--shop.incibase.omergenc.net.evil.net", "prod--shop.incibasexomergenc.net", "../x--y.incibase.omergenc.net", "a---b.incibase.omergenc.net", "incibase.omergenc.net"]) {
       expect(re.test(host)).toBe(false);
     }
+  });
+
+  test("clients are counted per IPv4 address and per IPv6 /64, whatever compression nginx prints", () => {
+    const text = nginxConfig(input);
+    const block = /map \$remote_addr \$incibase_client \{\n([\s\S]*?)\n\}/.exec(text)![1]!;
+    const rules = [...block.matchAll(/^ {4}"~(.*)" (\S+);$/gm)].map((m) => [new RegExp(m[1]!), m[2]!] as const);
+    expect(rules.length).toBe(CLIENT_KEY_MAP.length);
+    expect(block).toContain("default $binary_remote_addr;");
+    /** What the map gives for an address as nginx prints it; null is the default ($binary_remote_addr). */
+    const key = (addr: string) => {
+      for (const [re, value] of rules) {
+        const m = re.exec(addr);
+        if (m) return value.replace(/\$(\d)/g, (_, i) => m[Number(i)]!);
+      }
+      return null;
+    };
+    const rand = (n: number) => Math.floor(Math.random() * n);
+    for (let i = 0; i < 20_000; i++) {
+      // Many zero hextets, so every place and length of "::" comes up.
+      const groups = Array.from({ length: 8 }, () => (rand(2) ? 0 : rand(3) ? rand(0x10000) : rand(16)));
+      const text = ntop(groups);
+      const expected = text.includes(".") ? null : groups.slice(0, 4).map((g) => g.toString(16)).join(":");
+      expect({ text, key: key(text) }).toEqual({ text, key: expected });
+    }
+    // Two addresses of one /64, written differently by nginx, share a key; the next /64 does not.
+    expect(key("2001:db8::5")).toBe("2001:db8:0:0");
+    expect(key("2001:db8:0:0:1::")).toBe("2001:db8:0:0");
+    expect(key("2001:db8:1:2::a")).toBe(key("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+    expect(key("2001:db8:1:3::a")).toBe("2001:db8:1:3");
+    expect(key("203.0.113.7")).toBeNull();
+    expect(key("::ffff:203.0.113.7")).toBeNull();
+    // Preflights are not counted against sign-ins.
+    expect(text).toContain('map $request_method $incibase_auth_client {\n    OPTIONS "";\n    default $incibase_client;\n}');
   });
 
   test("the nginx drop-in keeps the front door alive under memory pressure", () => {
@@ -347,6 +475,46 @@ describe("the front door on a host", () => {
     // host render renders it too.
     const report = await ops.render(host);
     expect(report.nginx).toMatchObject({ changed: false, action: null });
+  });
+
+  test("the host's logs are www-data:adm 0640 before nginx first opens them, and repaired when they drift", async () => {
+    const host = await nginxHost();
+    const files = nginxFiles(host.layout, host.nginx);
+    expect(files.errorLog).toBe(join(host.dir, "log", "incibase.error.log"));
+    const seen: unknown[] = [];
+    host.fake.reject = () => {
+      seen.push([files.accessLog, files.errorLog].map((p) => host.sys.lstat(p)));
+      return null;
+    };
+    const pair = makeCert("logs");
+    await ops.initHost(host, { domain: DOMAIN, tlsCert: pair.cert, tlsKey: pair.key });
+    const owner = { type: "file", uid: 33, gid: 4, mode: 0o640 };
+    // Already so for the very first nginx -t (which would create them root 0644).
+    expect(seen[0]).toEqual([expect.objectContaining(owner), expect.objectContaining(owner)]);
+    for (const path of [files.accessLog, files.errorLog]) expect(host.sys.lstat(path)).toMatchObject(owner);
+    const text = readFileSync(host.conf, "utf8");
+    expect(text).toContain(`access_log ${files.accessLog} incibase_json;`);
+    expect(text).toContain(`error_log ${files.errorLog} alert;`);
+
+    // A log nginx made itself (root 0644) is repaired on the next render, its lines kept, nginx left alone.
+    writeFileSync(files.accessLog, '{"status":200}\n');
+    host.sys.chown(files.accessLog, 0, 0);
+    host.sys.chmod(files.accessLog, 0o644);
+    host.sys.chmod(files.errorLog, 0o604);
+    host.driver.calls.length = 0;
+    expect(await ops.renderNginx(host)).toMatchObject({ changed: false, action: null });
+    for (const path of [files.accessLog, files.errorLog]) expect(host.sys.lstat(path)).toMatchObject(owner);
+    expect(readFileSync(files.accessLog, "utf8")).toBe('{"status":200}\n');
+    expect(nginxCalls(host)).toEqual([]);
+
+    // Something else in its place is not followed.
+    rmSync(files.errorLog);
+    symlinkSync("/etc/shadow", files.errorLog);
+    await expect(ops.renderNginx(host)).rejects.toMatchObject({ code: "FAILED", message: expect.stringMatching(/not a regular file/) });
+    rmSync(files.errorLog);
+    // Without the user nginx runs as there is no owner to give them.
+    host.sys.users.delete("www-data");
+    await expect(ops.renderNginx(host)).rejects.toMatchObject({ code: "FAILED", message: expect.stringMatching(/www-data nginx runs as does not exist/) });
   });
 
   test("a rotation installs the new pair, reloads nginx, then removes the old one", async () => {
