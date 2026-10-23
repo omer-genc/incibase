@@ -22,6 +22,10 @@ export interface UnitStatus {
   invocationId: string;
 }
 
+/** The signals the host sends a unit's main process. */
+export type KillSignal = "SIGKILL" | "SIGTERM";
+export const KILL_SIGNALS: readonly KillSignal[] = ["SIGKILL", "SIGTERM"];
+
 export const CLD_EXITED = 1;
 export const CLD_KILLED = 2;
 export const CLD_DUMPED = 3;
@@ -64,6 +68,8 @@ export interface Driver {
   reload(unit: string): void;
   /** Forgets a failed state and the start limit, so the next start is not refused. */
   resetFailed(unit: string): void;
+  /** `systemctl kill --kill-whom=main`: signals only the unit's main process; with SIGKILL, Restart= starts it again. */
+  killMain(unit: string, signal: KillSignal): void;
   show(unit: string): UnitStatus;
   isActive(unit: string): boolean;
   /** `systemd-run --unit=<unit> --collect`: runs on when the caller (an SSH session) goes away. */

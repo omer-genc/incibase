@@ -1,10 +1,10 @@
 // The Driver on a real machine: systemctl, systemd-run and journalctl, each
 // from an argument array (never a shell), with every unit name checked first.
 import { SystemCommandError } from "./system.ts";
-import type { Driver, JournalEntry, JournalQuery, TransientJob, UnitStatus } from "./driver.ts";
+import { KILL_SIGNALS, type Driver, type JournalEntry, type JournalQuery, type KillSignal, type TransientJob, type UnitStatus } from "./driver.ts";
 
 /** Unit names this layer passes to systemctl: a prefix, an optional `@instance`, a known suffix. */
-const UNIT_NAME = /^[a-z][a-z0-9-]{0,80}(?:@[a-z0-9]{1,32})?\.(?:service|slice)$/;
+const UNIT_NAME = /^[a-z][a-z0-9-]{0,80}(?:@[a-z0-9]{1,32})?\.(?:service|slice|timer)$/;
 /** What may reach systemd-run's command line: systemd itself expands `$VAR` and `%` specifiers there. */
 const SAFE_ARG = /^[A-Za-z0-9_./:=@,+-]+$/;
 /** journalctl --since values: what `incibase logs --since` passes on (`1h`, `2026-10-22 10:00`, `today`). */
@@ -108,6 +108,11 @@ export class SystemdDriver implements Driver {
 
   resetFailed(unit: string) {
     this.systemctl("reset-failed", unit, true);
+  }
+
+  killMain(unit: string, signal: KillSignal) {
+    if (!KILL_SIGNALS.includes(signal)) throw new Error(`Invalid signal ${JSON.stringify(signal)}`);
+    this.run(["systemctl", "kill", "--kill-whom=main", `--signal=${signal}`, "--", checkUnitName(unit)]);
   }
 
   show(unit: string): UnitStatus {

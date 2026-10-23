@@ -411,6 +411,27 @@ Değişmeden admin.sock'ta çalışır, çünkü yalnızca root-relative çağr�
 | needrestart | Branch'ler istisnada. `branch restart --all` sırayla ve gate'li çalışır. |
 | Container VPS, downgrade | `init` reddeder. Şeması binary'den yeni olan DB'de exit 64. |
 
+**Adım 13'te doğrulanan sapmalar** (`src/host/check.ts`, `alerts.ts`, `doctor.ts`; OrbStack Ubuntu 24.04, systemd 255):
+- Probe üç sonuç verir. Admin soketinde kimse dinlemiyorsa (dosya yok, ya da önceki sürecin bıraktığı dosya: ECONNREFUSED) branch "başlıyor" sayılır. serve soketi migration'dan sonra bağladığı için uzun migration da buraya düşer. Dinleyip 5 s içinde cevap vermeyen ya da 200 dışı dönen probe "hata" sayılır. Sokete konmuş symlink'e bağlanılmaz.
+- Öldürme, aynı systemd invocation'ında üç ardışık hatadan sonra `systemctl kill --kill-whom=main --signal=SIGKILL` ile yapılır. SIGSTOP ile durdurulan süreç üçüncü çalıştırmada öldürüldü ve systemd yeniden başlattı (`NRestarts` arttı) [P].
+- "Başlangıç uzun sürüyor" alarmı 120 s sonra açılır; süreç öldürülmez.
+- `failed` unit'te yeniden deneme şartı: exit 1, exit 137 ya da SIGKILL (OOM dahil). Arıza bölümü başına bir kez yapılır, 10 dakika sonra. Bölüm, branch yeniden sağlıklı görülünce biter. 64, 65 ve 78 yeniden denenmez. `inactive` olup çalışması gereken unit için de alarm açılır.
+- Sayaçlar registry'de değil, `control/check-state.json` (root 0600) dosyasında tutulur; registry şeması değişmedi. Bozuk dosyayla sıfırdan başlanır.
+- Alarm anahtarları: `health:<id>`, `startup:<id>`, `unit:<id>`, `disk:80`, `disk:90`.
+- `alerts.state` yeni bir değer alır: `closed`. Akış `firing` → `resolved` → `closed` şeklindedir. Açılış bildirimi `notified_at`'ı yazar, kapanış bildirimi satırı `closed` yapar. Açılışı hiç gönderilmemiş bir alarm sessizce kapanır.
+- Teslimat ilk hatada durur; kalanlar bir sonraki çalıştırmada gönderilir. Her POST için 10 s süre var ve yönlendirme izlenmez.
+- Mesajdan şunlar çıkarılır: `ik_admin_`/`ik_svc_` biçimli anahtarlar, her app env değeri (≥ 8 karakter), host'un `*KEY*`/`*SECRET*` env değerleri ve webhook URL'sinin kendisi. Audit satırında URL değil yalnızca host tutulur.
+- `host set alert_webhook` yalnızca https kabul eder. Kullanıcı, parola ve `#` içeren URL'ler reddedilir. `--test` ile bir deneme bildirimi gönderilebilir.
+- Timer ayarları: `OnBootSec=60s`, `OnActiveSec=10s`, `OnUnitActiveSec=30s`. Servis `Type=oneshot` olduğu için iki check aynı anda koşmaz.
+- Timer açılış anında hemen tetiklenir, çünkü `OnBootSec` geçmiştir [P]. Biten oneshot `ExecMainCode=0` gösterir ve `InvocationID` boştur [P].
+- `host init`'te `checkTimer: false` verilirse `check_timer=off` olur: timer durur ve boot linki kalkar. Linux testleri bunu kullanır.
+- Doctor'ın sandbox probe'u şöyle çalışır: `systemd-run --wait --pipe` ile `User=nobody` altında bir transient unit açılır. Bu unit, kurulu runtime binary'sini `BUN_BE_BUN=1` ile bun gibi çalıştırır [P, Bun 1.4.3]. Betik `/run` altında, deneme dosyası `/var/tmp` altında durur; ikisi de silinir.
+- OrbStack sonuçları [P]:
+  - SocketBindDeny, ProtectProc ve ProtectSystem etkisiz. `zzz-lxc-service.conf` ProtectSystem=no ve ProtectProc=default yazıyor.
+  - IPAddressDeny etkili.
+  - Container'da etkisiz direktif WARN olarak raporlanır, VM'de FAIL.
+- Doctor'ın disk eşikleri: %90 kullanımda WARN, %95'te FAIL. systemd için alt sınır 252.
+
 ---
 
 ## 10. Tek uygulama `incibase serve` ile uyumluluk

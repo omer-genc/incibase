@@ -63,7 +63,7 @@ function cleanup() {
     run(["systemctl", "stop", unit], { ok: [0, 1, 5] });
     run(["systemctl", "reset-failed", unit], { ok: [0, 1, 5] });
   }
-  for (const dir of [LAYOUT.systemdDir, join(LAYOUT.systemdDir, "multi-user.target.wants")]) {
+  for (const dir of [LAYOUT.systemdDir, join(LAYOUT.systemdDir, "multi-user.target.wants"), join(LAYOUT.systemdDir, "timers.target.wants")]) {
     for (const name of existsSync(dir) ? readdirSync(dir) : []) {
       if (name.startsWith(`${prefix}-`) || name === `${prefix}.slice`) rmSync(join(dir, name), { recursive: true, force: true });
     }
@@ -187,7 +187,8 @@ describe.skipIf(!enabled)("the host on systemd", () => {
       lines.push(line);
       console.log(`  | ${line}`);
     };
-    await ops.initHost(ctx, { domain: DOMAIN, timezone: "Europe/Istanbul", uidBase: UID_BASE, sliceMemoryMax: 2 * 1024 ** 3 });
+    // The check timer stays off: a check of its own would race these tests (test/host-check-linux.test.ts runs it).
+    await ops.initHost(ctx, { domain: DOMAIN, timezone: "Europe/Istanbul", uidBase: UID_BASE, sliceMemoryMax: 2 * 1024 ** 3, checkTimer: false });
     await ops.installRuntime(ctx, { binary: BINARY, version: VERSION });
     v1 = bundleApp("v1");
   }, SLOW);

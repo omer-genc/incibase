@@ -360,6 +360,12 @@ export class Registry {
     });
   }
 
+  /** Removes an owner setting (such as alert_webhook); the ones `host init` fixes cannot be removed. */
+  deleteSetting(key: string): boolean {
+    if (["uid_next", "tunnel_port_next", "uid_base", "layout", "domain", "timezone"].includes(key)) throw new RegistryError(`${key} cannot be removed`);
+    return this.tx(() => this.db.run(`DELETE FROM settings WHERE key = ?`, [key]).changes === 1);
+  }
+
   /** Writes the settings a new host starts with; keys already set keep their value. */
   initSettings(init: InitSettings = {}) {
     const uidBase = init.uidBase ?? DEFAULT_UID_BASE;
@@ -581,6 +587,19 @@ export class Registry {
 
   resolveAlert(key: string, at: number) {
     this.tx(() => this.db.run(`UPDATE alerts SET state = 'resolved', since = ? WHERE key = ? AND state = 'firing'`, [at, key]));
+  }
+
+  /**
+   * After the owner was told: a firing alert gets `notified_at`, a resolved
+   * one becomes 'closed'. Only when the row is still the episode that was
+   * sent (same state and `since`); false otherwise.
+   */
+  markAlertNotified(key: string, state: "firing" | "resolved", since: number, at: number): boolean {
+    return this.tx(() =>
+      state === "firing"
+        ? this.db.run(`UPDATE alerts SET notified_at = ? WHERE key = ? AND state = 'firing' AND since = ?`, [at, key, since]).changes === 1
+        : this.db.run(`UPDATE alerts SET state = 'closed', notified_at = ? WHERE key = ? AND state = 'resolved' AND since = ?`, [at, key, since]).changes === 1,
+    );
   }
 
   listAlerts(state?: string): AlertRow[] {

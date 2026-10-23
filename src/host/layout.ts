@@ -115,6 +115,9 @@ export interface UnitNames {
   /** `<prefix>-branch@<id>.service`. */
   branch(id: string): string;
   preflight(id: string): string;
+  /** `<prefix>-check.service`, the health check `<prefix>-check.timer` runs every 30 s. */
+  checkService: string;
+  checkTimer: string;
   /** A transient job, e.g. `<prefix>-release-<id>-<seq>.service`. */
   job(kind: "release" | "rollback" | "upgrade" | "restore", id: string, n: number): string;
 }
@@ -134,6 +137,8 @@ export class HostLayout {
   readonly backups: string;
   readonly trash: string;
   readonly ballast: string;
+  /** The check's per-branch counters (consecutive failed probes, failure episodes), root 0600. */
+  readonly checkState: string;
   readonly systemdDir: string;
   readonly units: UnitNames;
 
@@ -147,6 +152,8 @@ export class HostLayout {
       slice: `${prefix}.slice`,
       branchTemplate: `${prefix}-branch@.service`,
       preflightTemplate: `${prefix}-preflight@.service`,
+      checkService: `${prefix}-check.service`,
+      checkTimer: `${prefix}-check.timer`,
       branch: (id) => `${prefix}-branch@${checkBranchId(id)}.service`,
       preflight: (id) => `${prefix}-preflight@${checkBranchId(id)}.service`,
       job: (kind, id, n) => {
@@ -171,6 +178,7 @@ export class HostLayout {
     this.backups = join(this.root, "backups");
     this.trash = join(this.root, "trash");
     this.ballast = join(this.root, "ballast");
+    this.checkState = join(this.control, "check-state.json");
   }
 
   /** What the registry keeps so later commands rebuild this layout from the root alone. */
@@ -203,6 +211,11 @@ export class HostLayout {
       path: join(this.systemdDir, "multi-user.target.wants", this.units.branch(id)),
       target: join(this.systemdDir, this.units.branchTemplate),
     };
+  }
+
+  /** What `systemctl enable` makes for the check timer: started at boot. */
+  timerWantsLink(): { path: string; target: string } {
+    return { path: join(this.systemdDir, "timers.target.wants", this.units.checkTimer), target: join(this.systemdDir, this.units.checkTimer) };
   }
 
   releaseDir(id: string, seq: number): string {
