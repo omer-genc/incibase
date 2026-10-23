@@ -116,10 +116,16 @@ export const queueThree = mutation({
 export const queueHangingAction = mutation({ handler: async (ctx) => ctx.scheduler.runAfter(0, "app:writeThenHang" as any) });
 `;
 
-const CRONS = `import { cronJobs } from "incibase/server";
+/**
+ * "top" runs once an hour at `minute` (UTC). The skipped-crons test picks a
+ * minute half an hour away from the clock: with "0 * * * *" a run near the
+ * top of the hour saw the hour turn between its own clock and the server's
+ * (4 missed runs, not 3), or the cron fire while the server was up.
+ */
+const crons = (minute: number) => `import { cronJobs } from "incibase/server";
 const crons = cronJobs();
 crons.interval("hourly", { hours: 1 }, "app:tick" as any);
-crons.cron("top", "0 * * * *", "app:tick" as any, undefined, { tz: "UTC" });
+crons.cron("top", "${minute} * * * *", "app:tick" as any, undefined, { tz: "UTC" });
 crons.interval("changed", { hours: 2 }, "app:tick" as any);
 export default crons;
 `;
@@ -838,7 +844,10 @@ describe("interrupted jobs", () => {
 
 describe("skipped crons", () => {
   test("runs missed while the server was down are logged once per cron and not run late", async () => {
-    const p = project({ "crons.ts": CRONS });
+    const HOUR = 3_600_000;
+    // The minute of "top": half an hour from now, so no run of it comes due while this test runs (well under 29 minutes).
+    const minute = (new Date().getUTCMinutes() + 30) % 60;
+    const p = project({ "crons.ts": crons(minute) });
     const first = serve(p);
     await first.ready();
     first.proc.kill("SIGTERM");
@@ -847,17 +856,21 @@ describe("skipped crons", () => {
 
     // As if the server had been down for a while: move the saved next runs into the past.
     const now = Date.now();
-    const topOfHour = Math.floor(now / 3_600_000) * 3_600_000;
+    // The last run of "top" at or before now: about half an hour ago, so the server's clock is still before the next one.
+    let lastTop = Math.floor(now / HOUR) * HOUR + minute * 60_000;
+    if (lastTop > now) lastTop -= HOUR;
+    expect(now - lastTop).toBeGreaterThan(29 * 60_000);
     const db = new Database(join(p.data, "data.db"));
     const saved = (name: string) =>
       JSON.parse((db.query(`SELECT value FROM _incibase_meta WHERE key = ?`).get(`cron_next:${name}`) as { value: string }).value);
     expect(saved("hourly")).toEqual({ schedule: "every 3600000ms", next: expect.any(Number) });
     expect(saved("hourly").next).toBeGreaterThan(now);
-    expect(saved("top").schedule).toBe("0 * * * * UTC");
+    expect(saved("top").schedule).toBe(`${minute} * * * * UTC`);
     const set = (name: string, value: unknown) =>
       db.query(`UPDATE _incibase_meta SET value = ? WHERE key = ?`).run(JSON.stringify(value), `cron_next:${name}`);
     set("hourly", { schedule: "every 3600000ms", next: now - 2.5 * 3_600_000 });
-    set("top", { schedule: "0 * * * * UTC", next: topOfHour - 2 * 3_600_000 });
+    // Three runs came due while it was down: two hours before the last one, an hour before it, and the last one.
+    set("top", { schedule: `${minute} * * * * UTC`, next: lastTop - 2 * HOUR });
     // Saved under another schedule: not this cron's missed runs.
     set("changed", { schedule: "every 60000ms", next: now - 3_600_000 });
     db.close();
