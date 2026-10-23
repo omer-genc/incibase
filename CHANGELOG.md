@@ -1,5 +1,25 @@
 # Değişiklikler
 
+## Unreleased
+
+M1 Faz B: tek sunucuda birden fazla proje ve branch barındıran host katmanı. Tasarım: [docs/m1-mimari.md](docs/m1-mimari.md), kurulum ve işletim rehberi: [docs/host.md](docs/host.md). Tek uygulama `serve`/`dev` değişmedi.
+
+### Yeni
+
+- **Host CLI** (sunucuda root olarak): `host init|add-admin|render|status|doctor|check|gc|install-runtime|use-cli|runtimes|set|tls`, `project`, `branch`, `release`, `env`, `service-key`, hosted `admin-key`, `status`, `logs`. Kontrol düzlemi root'a ait bir SQLite registry; daemon yok. Çıkış kodları 0 tamam, 1 başarısız, 2 kullanım.
+- **Branch başına izolasyon.** Her branch kendi OS kullanıcısıyla (`ib-<id>`) ayrı bir systemd unit'inde, sandbox'ta ve `incibase.slice` altında koşar; bellek, CPU, PID, veritabanı ve depolama sınırları branch başına. Adresler `https://<branch>--<project>.<domain>`.
+- **Ön kapı nginx.** Unix soketlere yönlendirme, TLS (Cloudflare Origin CA dahil, `host tls` ile rotation), `trust_proxy cloudflare`, rate limit'ler, admin yollarının public'te 404'ü, restart sırasında `503` + `x-incibase-unprocessed`.
+- **Release akışı.** `release add` (dosyadan ya da stdin'den); prod'da branch'in kendi kullanıcısıyla alınan snapshot, verinin kopyasında preflight, restart ve health gate; başarısızlıkta otomatik geri dönüş. `release rollback [--to] [--restore] [--snapshot]`.
+- **Runtime pinleme.** Runtime'lar `SHA256SUMS` ile doğrulanarak kurulur (`host install-runtime`), her branch bir sürüme pinlenir, `branch upgrade` snapshot, preflight ve gate ile yükseltir; GitHub Release'e `SHA256SUMS` eklenir.
+- **Check timer ve alarmlar.** 30 s'de bir health, takılan branch'i öldürme, `failed` unit'i bir kez yeniden deneme, disk eşikleri; alarmlar `host set alert_webhook` ile (ör. ntfy.sh). `host doctor` host'un dayandığı her şeyi OK/WARN/FAIL olarak denetler.
+- **Admin yalnızca SSH ile.** Laptopta `incibase tunnel <project>/<branch> --ssh <host>` dashboard'u ve MCP'yi branch'in admin soketine tüneller; `host add-admin` hesabı admin grubuna ekler.
+- **Sırlar ve servis anahtarları.** `env import … -` sırları stdin'den alır; servis anahtarları yalnızca sha256'larıyla tutulur ve restart'sız iptal edilir.
+
+### Bilinen sınırlar
+
+- Ubuntu 24.04'ün systemd'si `-BPF_FRAMEWORK` ile derlendiği için `SocketBindDeny` uygulanmaz: firewall 22, 80 ve 443 dışında her portu kapalı tutmalı (`host doctor` WARN verir).
+- Snapshot'lar ve trash aynı diskte; off-site yedek yok (M3).
+
 ## 0.3.1
 
 `v0.3.0` tag'i Linux CI'daki iki test hatası yüzünden yayınlanmadı; 0.3.1 aynı içeriği ve bu düzeltmeleri taşır (Linux'ta dinleme hatalarının sınıflandırılması, migration bellek testinin ölçümü).
