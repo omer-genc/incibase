@@ -584,6 +584,10 @@ Zaman yetmezse önce şunlar kesilir: adopt, alias'lar ve Cloudflare `real_ip` (
   - S3'te kopya prefix'ten prefix'e yapılır.
   - Kopya branch, kaynağın servis anahtarlarını ve env'ini **devralmaz**.
   - Preflight, dry-run'a dönüşür.
+- **M2 sonrası: sorgu cache'i** (sahibin kararı, 2026-10-23; zamanı gerçek bir uygulamanın `slow` log'larında tekrar eden pahalı sorgular görülünce).
+  - Bugün realtime abonelikler (path, args, kimlik) başına paylaşılıyor ve yalnızca okuma aralığını etkileyen bir yazmada yeniden çalışıyor; tek seferlik `/api/query` her istekte SQLite'a gidiyor.
+  - Opt-in `query({ cache: true })`: anahtar fonksiyon + args + kimlik, geçersizleme realtime'ın `readset.ts` okuma aralığı takibiyle; deterministik olmayan sorgular (`Date.now()`, `Math.random()`) reddedilir ya da cache'lenmez.
+  - Önce ölçüm ve index; kullanıcıya özel sorgularda isabet oranı düşük, asıl kazanç herkese aynı sonucu dönen pahalı sorgularda.
 - **M3:**
   - `incibase-backup.timer`, check timer ile aynı kalıpta.
   - Off-site için host kimlik bilgileri kullanılır.
