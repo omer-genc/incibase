@@ -448,7 +448,7 @@ async function teardownBranch(ctx: HostContext, id: string) {
 
   if (ctx.driver) {
     step(ctx, "units");
-    for (const unit of [layout.units.branch(id), layout.units.preflight(id)]) {
+    for (const unit of [layout.units.branch(id), layout.units.preflight(id), layout.units.snapshot(id)]) {
       ctx.driver.stop(unit);
       ctx.driver.resetFailed(unit);
     }

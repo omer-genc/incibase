@@ -190,6 +190,15 @@ export async function runCli(argv: string[], options: CliOptions = {}) {
     const { hostCli } = await import("./host/cli.ts");
     return hostCli(argv.slice(1));
   }
+  // What the host's snapshot unit runs, as a branch, in its sandbox (src/host/snapshot-command.ts); not in the help.
+  if (argv[0] === "_snapshot") {
+    if (options.embedded) {
+      console.error(`"_snapshot" is not available in a built app. Use: serve, admin-key`);
+      process.exit(ExitCode.CONFIG);
+    }
+    const { snapshotCli } = await import("./host/snapshot-command.ts");
+    process.exit(snapshotCli(argv.slice(1)));
+  }
   if (argv[0] !== undefined && (HOSTED_COMMANDS.has(argv[0]) || (argv[0] === "admin-key" && hostedAdminKey(argv.slice(1))))) {
     if (options.embedded) {
       console.error(`"${argv[0]}" is not available in a built app. Use: serve, admin-key`);

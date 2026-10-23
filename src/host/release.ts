@@ -4,10 +4,12 @@
 // starts the rest as a transient unit, `incibase-release-<id>-<seq>`, so an
 // SSH drop does not stop it. The job (`runReleaseJob`) then:
 //
-//   1. snapshot (production): VACUUM INTO backups/<id>/pre-<seq>.db while the
-//      branch keeps running;
-//   2. preflight (production by default, opt-in elsewhere): the snapshot is
-//      copied into preflight/ and `incibase-preflight@<id>` runs
+//   1. snapshot (production): `incibase-snapshot@<id>` VACUUMs the database
+//      INTO the branch's staging dir as the branch, while it keeps running,
+//      and root takes that file in by fd as backups/<id>/pre-<seq>.db
+//      (snapshot.ts);
+//   2. preflight (production by default, opt-in elsewhere): a copy of the
+//      snapshot is renamed into preflight/ and `incibase-preflight@<id>` runs
 //      `serve --migrate-only` with the new bundle as the branch's uid, in the
 //      branch's sandbox and memory limit. 64, 65, 78 or an OOM fail the
 //      release; the live branch is not touched;
@@ -32,12 +34,12 @@ import { describeExit, ExitCode } from "../engine/exit-codes.ts";
 import { readManifest, sha256Hex, verifyBundle } from "../engine/manifest.ts";
 import { MiB, parseConfig } from "./config.ts";
 import { defaults, type OpsContext } from "./context.ts";
-import { CLD_EXITED, printable, settled, type UnitStatus } from "./driver.ts";
+import { CLD_EXITED, printable, ranToSuccess, settled, unitJournalTail, type UnitStatus } from "./driver.ts";
 import { branchRef, checkBranchId } from "./names.ts";
 import { currentActor, RegistryError, type BranchRow, type ReleaseRow } from "./registry.ts";
 import { renderBranchFiles } from "./provision.ts";
 import { renderPreflightUnit } from "./render.ts";
-import { emptyDir, hasDatabase, pruneSnapshots, restoreDatabase, snapshotDatabase, SnapshotError } from "./snapshot.ts";
+import { cleanupSnapshot, emptyDir, hasDatabase, placeCopy, pruneSnapshots, restoreDatabase, snapshotDatabase, SnapshotError } from "./snapshot.ts";
 
 /** Bundles above this are refused before they are read whole. */
 export const MAX_BUNDLE_BYTES = 64 * MiB;
@@ -147,11 +149,7 @@ export function describeStatus(status: UnitStatus): { exitCode: number | null; t
 
 /** The last lines `unit` logged after `cursor`, cleaned for root's terminal. */
 function journalTail(ctx: OpsContext, unit: string, cursor: string | null, lines = 15): string {
-  const entries = ctx.driver.journal({ unit, ...(cursor ? { afterCursor: cursor } : {}), lines });
-  return entries
-    .filter((e) => e.invocationId)
-    .map((e) => printable(e.message, 400))
-    .join("\n");
+  return unitJournalTail(ctx.driver, unit, cursor, lines);
 }
 
 /**
@@ -400,7 +398,7 @@ async function deploy(ctx: OpsContext, id: string, input: DeployInput): Promise<
     snapshot = layout.snapshot(id, input.snapshotName);
     log(`${input.what}: snapshot ${snapshot}`);
     try {
-      snapshotDatabase(ctx, before, snapshot, { uid: 0, gid: 0, mode: 0o600 });
+      await snapshotDatabase(ctx, before, snapshot, { uid: 0, gid: 0, mode: 0o600 });
     } catch (err) {
       if (!(err instanceof SnapshotError)) throw err;
       snapshot = null;
@@ -583,10 +581,15 @@ async function stopPreflight(ctx: OpsContext, unit: string): Promise<boolean> {
   return ok;
 }
 
-/** Stops a branch's preflight unit and empties preflight/, so a killed job leaves no orphan process or copy behind. */
+/**
+ * Stops a branch's preflight and snapshot units, empties preflight/ and the
+ * snapshot staging dir and removes its ingest temps in backups/, so a killed
+ * job leaves no orphan process or copy behind.
+ */
 export async function cleanupPreflight(ctx: OpsContext, branch: BranchRow): Promise<void> {
   await stopPreflight(ctx, ctx.layout.units.preflight(branch.id));
   emptyDir(ctx, ctx.layout.branch(branch.id).preflight);
+  await cleanupSnapshot(ctx, branch);
 }
 
 /** `serve --migrate-only` with the target, as the branch, on a copy of its data (or none). */
@@ -597,7 +600,7 @@ async function preflight(
   hasData: boolean,
   snapshot: string | null,
 ): Promise<{ ok: true; ms: number } | { ok: false; ms: number; exitCode: number | null; error: string }> {
-  const { layout, sys, driver } = ctx;
+  const { layout, driver } = ctx;
   const unit = layout.units.preflight(branch.id);
   const dir = layout.branch(branch.id).preflight;
   const owner = { uid: branch.os_uid, gid: branch.os_uid, mode: 0o600 };
@@ -611,8 +614,9 @@ async function preflight(
   emptyDir(ctx, dir);
   if (hasData) {
     try {
-      if (snapshot) sys.copyFile(snapshot, join(dir, "data.db"), owner);
-      else snapshotDatabase(ctx, branch, join(dir, "data.db"), owner);
+      // Root's copy is made in backups/ and renamed in: nothing is written through a name the branch controls.
+      if (snapshot) placeCopy(ctx, branch, snapshot, join(dir, "data.db"), owner);
+      else await snapshotDatabase(ctx, branch, join(dir, "data.db"), owner);
     } catch (err) {
       emptyDir(ctx, dir);
       return { ok: false, ms: 0, exitCode: null, error: `preflight: copying the data failed: ${(err as Error).message}` };
@@ -644,8 +648,7 @@ async function preflight(
   }
   const ms = performance.now() - started;
   driver.resetFailed(unit);
-  // systemd 255 resets ExecMainCode to 0 once a unit that exited 0 is deactivated; start had already confirmed the exec.
-  if (status.result === "success" && status.execMainStatus === 0 && (status.execMainCode === CLD_EXITED || status.execMainCode === 0)) return { ok: true, ms };
+  if (ranToSuccess(status)) return { ok: true, ms };
   const { exitCode, text } = describeStatus(status);
   const tail = journalTail(ctx, unit, cursor);
   const hint =

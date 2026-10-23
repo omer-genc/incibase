@@ -223,15 +223,19 @@ export async function renderNginx(ctx: OpsContext, _input: Record<string, never>
 /**
  * `incibase host render`: every derived file again (repairing half-done
  * provisioning and deletes, see provision.renderHost), and branches still
- * marked busy with a job that is gone are freed; their unfinished release
- * becomes 'interrupted'.
+ * marked busy with a job that is gone are cleaned up and freed; their
+ * unfinished release becomes 'interrupted'.
  */
 export async function render(ctx: OpsContext, _input: Record<string, never> = {}) {
   return audited(ctx, "host.render", null, async () => {
-    const interrupted = await ctx.registry.withLock(() => {
+    const interrupted = await ctx.registry.withLock(async () => {
       const freed: string[] = [];
       for (const branch of ctx.registry.listBranches({ phase: "ready" })) {
         if (!branch.busy_unit || !settled(ctx.driver.show(branch.busy_unit))) continue;
+        // What the dead job orphaned (its preflight and snapshot units, their copies, root's ingest temps) is
+        // cleaned up first, while busy_unit still marks the branch and this command holds the lock: no new job
+        // can claim the branch until it is freed below, so the sweep never touches a new job's files.
+        await cleanupPreflight(ctx, branch);
         ctx.registry.tx(() => {
           for (const release of ctx.registry.listReleases(branch.id)) {
             if (release.status === "staged" || release.status === "preflight") {
@@ -249,11 +253,10 @@ export async function render(ctx: OpsContext, _input: Record<string, never> = {}
       }
       return freed;
     });
-    // For each freed branch: clean up any preflight the dead job orphaned, and if the job had already switched
-    // the branch to a release that never passed its gate, make sure the branch is healthy on it or revert.
+    // For each freed branch: if the job had already switched the branch to a release that never passed its
+    // gate, make sure the branch is healthy on it or revert.
     for (const id of interrupted) {
       const branch = ctx.registry.getBranch(id)!;
-      await cleanupPreflight(ctx, branch);
       const current = branch.release_seq === null ? null : ctx.registry.getRelease(id, branch.release_seq);
       if (current && current.status === "interrupted" && current.generation) await recoverSwitchedBranch(ctx, id);
     }

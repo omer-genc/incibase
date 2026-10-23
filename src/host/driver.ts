@@ -88,6 +88,24 @@ export function settled(status: UnitStatus): boolean {
   return status.loadState === "not-found" || status.activeState === "inactive" || status.activeState === "failed";
 }
 
+/**
+ * Whether a run-to-completion unit (preflight, snapshot) finished cleanly.
+ * systemd 255 resets ExecMainCode to 0 once a unit that exited 0 is
+ * deactivated; the start had already confirmed the exec.
+ */
+export function ranToSuccess(status: UnitStatus): boolean {
+  return status.result === "success" && status.execMainStatus === 0 && (status.execMainCode === CLD_EXITED || status.execMainCode === 0);
+}
+
+/** The last lines a unit's own processes wrote after `cursor` (systemd's own left out), safe to print. */
+export function unitJournalTail(driver: Driver, unit: string, cursor: string | null, lines = 15): string {
+  const entries = driver.journal({ unit, ...(cursor ? { afterCursor: cursor } : {}), lines });
+  return entries
+    .filter((e) => e.invocationId)
+    .map((e) => printable(e.message, 400))
+    .join("\n");
+}
+
 /** Text from a process, safe to print on root's terminal: no control characters except tabs. */
 export function printable(text: string, max = 2000): string {
   const clean = text.replace(/[\u0000-\u0008\u000a-\u001f\u007f-\u009f]/g, (c) => (c === "\n" ? " " : "?"));

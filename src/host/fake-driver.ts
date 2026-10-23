@@ -3,19 +3,26 @@
 // drop-in) and plays what the process would do: `behavior` decides, per
 // start, whether it serves, exits with a code, runs out of memory, logs
 // migration_committed or keeps crashing until the start limit. `health`
-// answers the gate's probe for the generation a healthy process runs.
+// answers the gate's probe for the generation a healthy process runs. A
+// snapshot unit really copies (`snapshot`, by default the `_snapshot`
+// command in this process), and with a FakeSystem its file is recorded as
+// the branch user's, as systemd's User= would make it.
 import { existsSync, readFileSync } from "node:fs";
 import { CLD_EXITED, CLD_KILLED, type Driver, type JournalEntry, type JournalQuery, type KillSignal, type TransientJob, type UnitStatus } from "./driver.ts";
+import type { FakeSystem } from "./fake-system.ts";
 import type { HostLayout } from "./layout.ts";
+import { SNAPSHOT_EXIT, SnapshotCommandError, takeSnapshot } from "./snapshot-command.ts";
 import { checkUnitName } from "./systemd.ts";
 
 /** One start of a unit, as the rendered files describe it. */
 export interface FakeRun {
   unit: string;
-  kind: "branch" | "preflight" | "other";
+  kind: "branch" | "preflight" | "snapshot" | "other";
   id: string | null;
   /** The command's words (ExecStart). */
   argv: string[];
+  /** User= of the drop-in. */
+  user: string | null;
   bundle: string | null;
   runtime: string | null;
   generation: string | null;
@@ -60,12 +67,32 @@ export class FakeDriver implements Driver {
   behavior: (run: FakeRun) => FakeOutcome = () => ({});
   /** Runs a transient job; its unit is active until the promise settles. */
   onTransient: ((job: TransientJob) => Promise<unknown>) | null = null;
+  /** What a snapshot unit's process does when `behavior` lets it run; returns its exit code. */
+  snapshot: (run: FakeRun) => number = (run) => this.copySnapshot(run);
   private readonly units = new Map<string, FakeUnit>();
   private nextPid = 1000;
   private nextCursor = 1;
   private nextInvocation = 1;
 
-  constructor(readonly layout: HostLayout) {}
+  constructor(
+    readonly layout: HostLayout,
+    readonly sys: FakeSystem | null = null,
+  ) {}
+
+  /** `_snapshot --data … --out …` in this process; the file it leaves is the unit user's. */
+  copySnapshot(run: FakeRun): number {
+    const flag = (f: string) => (run.argv.includes(f) ? run.argv[run.argv.indexOf(f) + 1]! : "");
+    const out = flag("--out");
+    try {
+      takeSnapshot(flag("--data"), out);
+    } catch (err) {
+      this.log(run.unit, (err as Error).message);
+      return err instanceof SnapshotCommandError ? err.exitCode : SNAPSHOT_EXIT.FAILED;
+    }
+    const uid = run.user ? this.sys?.getpwnam(run.user)?.uid : undefined;
+    if (uid !== undefined) this.sys!.own(out, uid, uid, 0o600);
+    return SNAPSHOT_EXIT.OK;
+  }
 
   private unit(name: string): FakeUnit {
     let unit = this.units.get(checkUnitName(name));
@@ -93,7 +120,7 @@ export class FakeDriver implements Driver {
     const units = this.layout.units;
     const match = /@([a-z0-9]+)\.service$/.exec(name);
     const id = match ? match[1]! : null;
-    const kind = id && name === units.branch(id) ? "branch" : id && name === units.preflight(id) ? "preflight" : "other";
+    const kind = id && name === units.branch(id) ? "branch" : id && name === units.preflight(id) ? "preflight" : id && name === units.snapshot(id) ? "snapshot" : "other";
     const path = this.layout.dropIn(name);
     const text = existsSync(path) ? readFileSync(path, "utf8") : "";
     const exec = [...text.matchAll(/^ExecStart=(.*)$/gm)].map((m) => m[1]!).filter(Boolean).pop() ?? "";
@@ -101,7 +128,8 @@ export class FakeDriver implements Driver {
     const flag = (f: string) => (argv.includes(f) ? argv[argv.indexOf(f) + 1]! : null);
     const runtime = argv[0] ? (/\/([^/]+)\/incibase$/.exec(argv[0])?.[1] ?? null) : null;
     const generation = /^Environment=INCIBASE_GENERATION=(\S+)$/m.exec(text)?.[1] ?? null;
-    return { unit: name, kind, id, argv, bundle: flag("--bundle"), runtime, generation };
+    const user = /^User=(\S+)$/m.exec(text)?.[1] ?? null;
+    return { unit: name, kind, id, argv, user, bundle: flag("--bundle"), runtime, generation };
   }
 
   private launch(name: string) {
@@ -109,7 +137,8 @@ export class FakeDriver implements Driver {
     const unit = this.unit(name);
     const run = this.describe(name);
     if (run.kind !== "other" && !run.argv.length) throw new Error(`Unit ${name} has a bad unit file setting (no ExecStart).`);
-    const outcome = this.behavior(run);
+    let outcome = this.behavior(run);
+    if (run.kind === "snapshot" && outcome.exit === undefined && !outcome.oom && !outcome.hang) outcome = { ...outcome, exit: this.snapshot(run) };
     // A new id for every start, as systemd gives (the host's check tells processes apart by it).
     const invocationId = `inv${this.nextInvocation++}`;
     unit.run = run;
@@ -129,7 +158,7 @@ export class FakeDriver implements Driver {
         execMainStatus: outcome.exit,
         nRestarts: prevented ? 0 : 7,
       };
-    } else if (run.kind === "preflight" || outcome.exit === 0) {
+    } else if (run.kind === "preflight" || (run.kind === "snapshot" && !outcome.hang) || outcome.exit === 0) {
       // As systemd 255 shows it once deactivated: no exec status left.
       unit.status = { ...unit.status, activeState: "inactive", subState: "dead", result: "success", execMainCode: 0, execMainStatus: 0 };
     } else {

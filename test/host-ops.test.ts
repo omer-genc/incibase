@@ -221,8 +221,11 @@ describe("deleteBranch", () => {
       `reset-failed ${unit}`,
       `stop ${host.layout.units.preflight(prod.id)}`,
       `reset-failed ${host.layout.units.preflight(prod.id)}`,
+      `stop ${host.layout.units.snapshot(prod.id)}`,
+      `reset-failed ${host.layout.units.snapshot(prod.id)}`,
       "daemon-reload",
     ]);
+    expect(existsSync(host.layout.dropIn(host.layout.units.snapshot(prod.id)))).toBe(false);
     expect(existsSync(`${host.layout.dropIn(unit)}`)).toBe(false);
     expect(existsSync(host.layout.wantsLink(prod.id).path)).toBe(false);
     expect(existsSync(host.layout.branch(prod.id).dir)).toBe(false);

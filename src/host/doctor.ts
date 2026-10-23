@@ -19,8 +19,6 @@
 // Everything outside the host's own files goes through DoctorHooks, so the
 // macOS tests feed it the machine they want.
 import { lstatSync, readFileSync } from "node:fs";
-import { VERSION } from "../engine/version.ts";
-import { RUNTIME_VERSION_REGEX } from "./layout.ts";
 import { readCheckState, statDisk, type DiskUsage } from "./check.ts";
 import { ALERT_WEBHOOK } from "./alerts.ts";
 import type { OpsContext } from "./context.ts";
@@ -28,6 +26,7 @@ import { printable } from "./driver.ts";
 import { branchRef } from "./names.ts";
 import { OpError } from "./ops.ts";
 import { verifyBranch, verifyHostTree } from "./provision.ts";
+import { hostRuntime } from "./render.ts";
 import { checkUnitName } from "./systemd.ts";
 import type { FileInfo } from "./system.ts";
 
@@ -181,24 +180,15 @@ export function readProbe(stdout: string): SandboxProbe {
   };
 }
 
-/** The runtime the probe runs with: this version if installed, else the newest. */
-function probeRuntime(ctx: OpsContext): string | null {
-  const versions = ctx.sys.readdir(ctx.layout.runtimeRoot).filter((v) => RUNTIME_VERSION_REGEX.test(v));
-  const usable = versions.filter((v) => {
-    const info = ctx.sys.lstat(ctx.layout.runtimeBinary(v));
-    return info?.type === "file" && info.uid === 0 && (info.mode & 0o022) === 0 && (info.mode & 0o005) === 0o005;
-  });
-  const pick = usable.includes(VERSION) ? VERSION : usable.sort(Bun.semver.order).at(-1);
-  return pick ? ctx.layout.runtimeBinary(pick) : null;
-}
-
 /**
  * Runs PROBE_SCRIPT in `<prefix>-doctor-<n>.service` as nobody, with the
  * branch sandbox's network, bind, /proc and file-system directives, and a
  * listener of ours on 127.0.0.1 for it to try.
  */
 export async function runSandboxProbe(ctx: OpsContext): Promise<SandboxProbe> {
-  const runtime = probeRuntime(ctx);
+  // The same pick as the snapshot unit's (render.hostRuntime), without a branch's pin: this VERSION if it is
+  // trusted, else the newest trusted runtime (the probe only needs a Bun to run its script).
+  const runtime = hostRuntime(ctx, null)?.binary;
   if (!runtime) return { ran: false, reason: `no runtime is installed under ${ctx.layout.runtimeRoot} to run it with` };
   const nobody = ctx.sys.getpwnam("nobody");
   if (!nobody) return { ran: false, reason: "there is no user nobody to run it as" };
