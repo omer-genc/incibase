@@ -14,8 +14,8 @@
 //      non-SQLite file), never touching what a symlink points at.
 //   2. The by-fd copy keeps holes: a 200 MiB sparse staging file under the
 //      cap becomes a copy with almost nothing allocated, and a database with
-//      long runs of zeros goes through ingestFile, copyFile and a whole
-//      snapshotDatabase byte for byte (sha256), its zeros left as holes.
+//      long runs of zeros goes through ingestFile and copyFile byte for byte
+//      (sha256), its zeros left as holes.
 //   3. Inflating data.db (a 2 GiB sparse file) lifts the branch's
 //      INCIBASE_MAX_DB_BYTES cap to twice the limit and no further: a dense
 //      file the branch swaps in just before root's ingest (injected there, so
@@ -24,7 +24,7 @@
 //   4. The snapshot unit runs as the branch: a data.db, -wal or -shm swapped
 //      for a symlink to the registry is refused or yields the branch's own data.
 //   5. A branch process races root (flipping data.db and the staging output
-//      through every shape above) while root snapshots in a loop: no snapshot
+//      between several of the shapes above) while root snapshots in a loop: no snapshot
 //      ever holds a secret or a foreign database, and none hangs. Nothing is
 //      asserted about how the race goes; the racer clobbers the staging file
 //      so often that a run may take no snapshot at all, so this guards
