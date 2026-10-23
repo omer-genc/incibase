@@ -4,6 +4,8 @@
 // tests against LinuxSystem. Commands run from argument arrays, never a
 // shell; every name is checked before it reaches one.
 import {
+  copyFileSync,
+  constants as fsConstants,
   closeSync,
   fchmodSync,
   fchownSync,
@@ -17,6 +19,7 @@ import {
   readlinkSync,
   renameSync,
   rmSync,
+  statfsSync,
   symlinkSync,
   unlinkSync,
   writeSync,
@@ -45,6 +48,8 @@ export interface FileInfo {
   gid: number;
   /** Permission bits with setuid, setgid and sticky (`& 0o7777`). */
   mode: number;
+  size: number;
+  mtimeMs: number;
 }
 
 export interface NewUser {
@@ -82,7 +87,13 @@ export interface HostSystem {
   readlink(path: string): string | null;
   /** Writes `content` to a temp file next to `path` with the owner and mode, syncs it and renames it over `path`. */
   writeFile(path: string, content: string, owner: { uid: number; gid: number; mode: number }): void;
+  /** Copies the file `from` (not following a link) the same way: temp file with owner and mode, fsync, rename. */
+  copyFile(from: string, to: string, owner: { uid: number; gid: number; mode: number }): void;
   readFile(path: string): string | null;
+  /** Names in a directory, sorted; empty when it is missing. */
+  readdir(path: string): string[];
+  /** Bytes an unprivileged writer could still use on the file system of `path`. */
+  freeBytes(path: string): number;
   rename(from: string, to: string): void;
   /** Removes a file, link or whole tree without following links; missing is fine. */
   remove(path: string): void;
@@ -143,7 +154,17 @@ function fileInfo(path: string): FileInfo | null {
     throw err;
   }
   const type = st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : st.isFile() ? "file" : "other";
-  return { type, uid: st.uid, gid: st.gid, mode: st.mode & 0o7777 };
+  return { type, uid: st.uid, gid: st.gid, mode: st.mode & 0o7777, size: st.size, mtimeMs: st.mtimeMs };
+}
+
+/** Names in `dir`, sorted; empty when it does not exist. */
+export function listDir(dir: string): string[] {
+  try {
+    return readdirSync(dir).sort();
+  } catch (err) {
+    if ((err as { code?: string }).code === "ENOENT") return [];
+    throw err;
+  }
 }
 
 function tempPath(path: string): string {
@@ -297,6 +318,24 @@ export class LinuxSystem implements HostSystem {
     fsyncDir(dirname(path));
   }
 
+  copyFile(from: string, to: string, owner: { uid: number; gid: number; mode: number }) {
+    const info = fileInfo(checkPath(from));
+    if (info?.type !== "file") throw new Error(`${from} is not a regular file`);
+    const temp = tempPath(checkPath(to));
+    removeQuietly(temp);
+    copyFileSync(from, temp, fsConstants.COPYFILE_EXCL);
+    const fd = openSync(temp, "r+");
+    try {
+      fchownSync(fd, checkId(owner.uid), checkId(owner.gid));
+      fchmodSync(fd, owner.mode);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temp, to);
+    fsyncDir(dirname(to));
+  }
+
   readFile(path: string) {
     try {
       return readFileSync(checkPath(path), "utf8");
@@ -304,6 +343,15 @@ export class LinuxSystem implements HostSystem {
       if ((err as { code?: string }).code === "ENOENT") return null;
       throw err;
     }
+  }
+
+  readdir(path: string) {
+    return listDir(checkPath(path));
+  }
+
+  freeBytes(path: string) {
+    const st = statfsSync(checkPath(path));
+    return Number(st.bavail) * Number(st.bsize);
   }
 
   rename(from: string, to: string) {

@@ -16,12 +16,25 @@
 //           admin/                ib-<id>:<admin group> 2750
 //     backups/                    root 0700   <id>/pre-<seq>.db 0600
 //     trash/                      root 0700
+//
+// Outside the root: the runtimes (`<runtime root>/<version>/incibase`, root
+// 0755) and the systemd units (design section 5.4), named after a unit
+// prefix: `incibase-branch@.service`, `incibase-preflight@.service`,
+// `incibase.slice`, per-branch drop-ins and the transient
+// `incibase-release-<id>-<seq>` jobs. A test host picks its own prefix, so
+// hosts sharing a machine never touch each other's units.
 import { isAbsolute, join, normalize, relative } from "node:path";
 import { branchUser, checkBranchId, checkLabel, NameError } from "./names.ts";
 
 export const DEFAULT_ROOT = "/var/lib/incibase";
 export const DEFAULT_RUNTIME_ROOT = "/usr/local/lib/incibase";
+export const DEFAULT_SYSTEMD_DIR = "/etc/systemd/system";
+export const DEFAULT_UNIT_PREFIX = "incibase";
 export const DEFAULT_GROUPS = { proxy: "incibase-proxy", admin: "incibase-admin" } as const;
+/** Runtime versions as `incibase --version` prints them; they name directories. */
+export const RUNTIME_VERSION_REGEX = /^\d{1,4}\.\d{1,5}\.\d{1,6}(?:-[0-9A-Za-z.]{1,40})?$/;
+/** A unit prefix: what `incibase` is in the unit names; lowercase words joined by single hyphens. */
+const UNIT_PREFIX = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 
 /** Who owns a path: root, or a branch's own user (and group). */
 export type Principal = "root" | "branch";
@@ -39,9 +52,37 @@ export interface LayoutOptions {
   root?: string;
   runtimeRoot?: string;
   groups?: { proxy: string; admin: string };
+  /** Where unit files go (default /etc/systemd/system). */
+  systemdDir?: string;
+  /** What unit names start with (default `incibase`). */
+  unitPrefix?: string;
+}
+
+/** The layout options a host keeps in its registry, so every later command (and job) builds the same layout. */
+export interface SavedLayout {
+  runtimeRoot: string;
+  systemdDir: string;
+  unitPrefix: string;
+  groups: { proxy: string; admin: string };
+}
+
+export function checkRuntimeVersion(value: unknown): string {
+  if (typeof value !== "string" || !RUNTIME_VERSION_REGEX.test(value)) {
+    throw new NameError(`Invalid runtime version ${JSON.stringify(value)}: expected a version such as 0.3.1`);
+  }
+  return value;
+}
+
+export function checkUnitPrefix(value: unknown): string {
+  if (typeof value !== "string" || value.length > 32 || !UNIT_PREFIX.test(value)) {
+    throw new NameError(`Invalid unit prefix ${JSON.stringify(value)}: lowercase letters, digits and single hyphens, at most 32`);
+  }
+  return value;
 }
 
 const GROUP_NAME = /^[a-z_][a-z0-9_-]{0,31}$/;
+/** Snapshot names: `pre-<seq>` before a release, `pre-upgrade-<n>` before a runtime upgrade. */
+export const SNAPSHOT_NAME = /^pre-(?:\d{1,9}|upgrade-\d{1,15})$/;
 
 function checkRoot(root: string, what: string): string {
   if (!isAbsolute(root) || normalize(root) !== root || root === "/" || root.endsWith("/") || /[\s:]/.test(root)) {
@@ -65,6 +106,19 @@ export interface BranchPaths {
   backups: string;
 }
 
+/** The systemd names of a host: units, and where their files go. */
+export interface UnitNames {
+  prefix: string;
+  slice: string;
+  branchTemplate: string;
+  preflightTemplate: string;
+  /** `<prefix>-branch@<id>.service`. */
+  branch(id: string): string;
+  preflight(id: string): string;
+  /** A transient job, e.g. `<prefix>-release-<id>-<seq>.service`. */
+  job(kind: "release" | "rollback" | "upgrade" | "restore", id: string, n: number): string;
+}
+
 export class HostLayout {
   readonly root: string;
   readonly runtimeRoot: string;
@@ -80,10 +134,26 @@ export class HostLayout {
   readonly backups: string;
   readonly trash: string;
   readonly ballast: string;
+  readonly systemdDir: string;
+  readonly units: UnitNames;
 
   constructor(options: LayoutOptions = {}) {
     this.root = checkRoot(options.root ?? DEFAULT_ROOT, "The host root");
     this.runtimeRoot = checkRoot(options.runtimeRoot ?? DEFAULT_RUNTIME_ROOT, "The runtime root");
+    this.systemdDir = checkRoot(options.systemdDir ?? DEFAULT_SYSTEMD_DIR, "The systemd unit directory");
+    const prefix = checkUnitPrefix(options.unitPrefix ?? DEFAULT_UNIT_PREFIX);
+    this.units = {
+      prefix,
+      slice: `${prefix}.slice`,
+      branchTemplate: `${prefix}-branch@.service`,
+      preflightTemplate: `${prefix}-preflight@.service`,
+      branch: (id) => `${prefix}-branch@${checkBranchId(id)}.service`,
+      preflight: (id) => `${prefix}-preflight@${checkBranchId(id)}.service`,
+      job: (kind, id, n) => {
+        if (!Number.isSafeInteger(n) || n < 0) throw new NameError(`Invalid job number ${n}`);
+        return `${prefix}-${kind}-${checkBranchId(id)}-${n}.service`;
+      },
+    };
     const groups = options.groups ?? DEFAULT_GROUPS;
     for (const name of [groups.proxy, groups.admin]) {
       if (!GROUP_NAME.test(name)) throw new NameError(`Invalid group name ${JSON.stringify(name)}`);
@@ -101,6 +171,53 @@ export class HostLayout {
     this.backups = join(this.root, "backups");
     this.trash = join(this.root, "trash");
     this.ballast = join(this.root, "ballast");
+  }
+
+  /** What the registry keeps so later commands rebuild this layout from the root alone. */
+  saved(): SavedLayout {
+    return { runtimeRoot: this.runtimeRoot, systemdDir: this.systemdDir, unitPrefix: this.units.prefix, groups: { ...this.groups } };
+  }
+
+  /** `<runtime root>/<version>/incibase`. */
+  runtimeDir(version: string): string {
+    return join(this.runtimeRoot, checkRuntimeVersion(version));
+  }
+
+  runtimeBinary(version: string): string {
+    return join(this.runtimeDir(version), "incibase");
+  }
+
+  /** A unit file in the systemd directory. */
+  unitFile(name: string): string {
+    return join(this.systemdDir, name);
+  }
+
+  /** The drop-in incibase renders for one instance, e.g. `incibase-branch@<id>.service.d/10-incibase.conf`. */
+  dropIn(unit: string): string {
+    return join(this.systemdDir, `${unit}.d`, "10-incibase.conf");
+  }
+
+  /** What `systemctl enable` would create for a branch: started at boot. */
+  wantsLink(id: string): { path: string; target: string } {
+    return {
+      path: join(this.systemdDir, "multi-user.target.wants", this.units.branch(id)),
+      target: join(this.systemdDir, this.units.branchTemplate),
+    };
+  }
+
+  releaseDir(id: string, seq: number): string {
+    if (!Number.isSafeInteger(seq) || seq < 1) throw new NameError(`Invalid release number ${seq}`);
+    return join(this.branch(id).releases, String(seq));
+  }
+
+  releaseFile(id: string, seq: number): string {
+    return join(this.releaseDir(id, seq), "app.ib");
+  }
+
+  /** `backups/<id>/<name>.db`, a snapshot such as `pre-7`. */
+  snapshot(id: string, name: string): string {
+    if (!SNAPSHOT_NAME.test(name)) throw new NameError(`Invalid snapshot name ${JSON.stringify(name)}: expected e.g. pre-7`);
+    return join(this.branch(id).backups, `${name}.db`);
   }
 
   /** The directories every host has, in creation order. */

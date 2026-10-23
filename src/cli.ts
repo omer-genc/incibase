@@ -137,6 +137,15 @@ function requestedLogFormat(argv: string[]): string | undefined {
 }
 
 export async function runCli(argv: string[], options: CliOptions = {}) {
+  // Host commands have their own flags; loaded only when asked for.
+  if (argv[0] === "host") {
+    if (options.embedded) {
+      console.error(`"host" is not available in a built app. Use: serve, admin-key`);
+      process.exit(ExitCode.CONFIG);
+    }
+    const { hostCli } = await import("./host/cli.ts");
+    return hostCli(argv.slice(1));
+  }
   let parsed: ReturnType<typeof parse>;
   try {
     parsed = parse(argv);

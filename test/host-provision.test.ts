@@ -109,6 +109,7 @@ describe("createBranch", () => {
     expect(Object.keys(a).sort()).toEqual(
       [
         "INCIBASE_ADMIN_KEY",
+        "INCIBASE_AUTH_CONCURRENCY",
         "INCIBASE_BRANCH_KIND",
         "INCIBASE_BRANCH_LABEL",
         "INCIBASE_S3_PREFIX",
@@ -128,6 +129,9 @@ describe("createBranch", () => {
     expect(a.INCIBASE_S3_PREFIX).toBe(`shop/${prod.id}/`);
     expect(s3PrefixFrom(a.INCIBASE_S3_PREFIX)).toBe(a.INCIBASE_S3_PREFIX!);
     expect(a.INCIBASE_SERVICE_KEYS_FILE).toBe(host.layout.branch(prod.id).serviceKeys);
+    // ⌊(MemoryMax − 128M) / 64M⌋ from 1 to 4: 512M gives 4, 256M gives 2.
+    expect(a.INCIBASE_AUTH_CONCURRENCY).toBe("4");
+    expect(b.INCIBASE_AUTH_CONCURRENCY).toBe("2");
 
     // The rows are system rows; the secrets never reach the audit log.
     const rows = host.registry.listEnv(prod.id);

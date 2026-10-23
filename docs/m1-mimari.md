@@ -200,6 +200,9 @@ Internet ─:443─▶ nginx (TLS, limit_req/limit_conn, JSON log)
 -- control/registry.db  root 0600, WAL, user_version=1. Yalnız istenen durum; gerçeği `systemctl show` verir.
 -- Uygulamada (adım 9): kind IN ('prod','dev','preview'); os_uid < 100000 (Ubuntu SUB_UID_MIN); branches'ta
 -- created_at/updated_at, releases ve service_keys'te created_at; settings'te uid_base.
+-- Adım 10: branches.generation (drop-in'deki INCIBASE_GENERATION); releases'ta bytes, preflight,
+-- allow_field_removal, generation, preflight_ms, finished_at, pruned_at (dosyası silinen release'in satırı kalır);
+-- alerts.message; settings'te layout (unit öneki, gruplar, runtime ve systemd dizinleri) ve slice_memory_max.
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   -- domain, timezone, trust_proxy, alert_webhook, cli_version, uid_next (70000+), tunnel_port_next
 CREATE TABLE projects (slug TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -284,6 +287,18 @@ IPAddressAllow=127.0.0.53/32
   - `INCIBASE_GENERATION`, `INCIBASE_BRANCH_LABEL`/`KIND`, `TZ`.
   - `INCIBASE_MAX_{DB,STORAGE,UPLOAD}_BYTES`, `INCIBASE_AUTH_CONCURRENCY`.
   - `INCIBASE_S3_PREFIX`, `S3_*` ve uygulama env'leri.
+
+**Adım 10'da doğrulanan sapmalar** (OrbStack Ubuntu 24.04, systemd 255):
+- `TemporaryFileSystem=/tmp:size=64M,mode=1777` [P]. Seçeneksiz tmpfs root 0755 bağlanıyor; branch kullanıcısı `/tmp`'ye yazamıyordu.
+- `incibase-preflight@.service` `Type=exec`, oneshot değil [P]: systemd `Type=oneshot` ile `RestartForceExitStatus=` kabul etmiyor ("isn't allowed for Type=oneshot services. Refusing"). Job, unit bitene kadar `systemctl show`'u yoklar; asılı kalan preflight'ı `RuntimeMaxSec=900` durdurur. Başarılı bir `Type=exec` unit'i bittikten sonra `ExecMainCode=0` gösterir, 1 değil [P].
+- `INCIBASE_GENERATION` env dosyasında değil, drop-in'de `Environment=` olarak durur; env dosyası release'ler arasında değişmez.
+- Unit adları bir önekten gelir (varsayılan `incibase`): test host'ları `incibase-s10-branch@<id>.service` gibi kendi adlarını kullanır. `incibase-s10.slice` systemd'nin ad hiyerarşisi yüzünden `incibase.slice`'ın altına düşer.
+- Gate, generation'ı en az 1 s arayla iki kez ve arada restart olmadan görmeden geçmez: hazır olup hemen çöken bir release'i yakalar. `migration_committed`, restart'tan önce alınan journal cursor'ından sonraki ve sürecin kendisinin yazdığı (`_SYSTEMD_INVOCATION_ID` olan) satırlarda, en üst düzeyde `ev` olarak aranır; uygulamanın `console` çıktısı sayılmaz. `journalctl -o json` 4096 byte'tan uzun alanları `--all` olmadan `null` basıyor [P].
+- Çöken release: `Restart=on-failure` ile 8 restart, ≈19 s içinde `failed` (`NRestarts=8`) [P]; migration commit edilmediği için önceki release'e dönülür.
+- `env set` satır sonu ve sekme dışındaki kontrol karakterlerini reddeder. systemd tırnak içindeki satır sonunu değerin parçası sayıyor [P], ama dosyada kendi başına değişken gibi okunan bir satır oluşurdu; çok satırlı değerler base64 ile verilir.
+- Onay kelimesi branch'in hostname'idir (`prod--shop.<domain>`). Silme, korunmasa da her production branch'inde onay ister.
+- Release olmadan drop-in'de `ExecStart` yok; unit `bad-setting` görünür ve başlamaz [P]. `systemctl reset-failed` yüklenmemiş bir instance için 1 ile çıkar, `stop` 5 ile [P].
+- OrbStack container'ında `/run/systemd/system/service.d/zzz-lxc-service.conf` her servis için ProtectSystem, ProtectHome, PrivateDevices, NoNewPrivileges, ReadWritePaths ve ProtectProc'u kapatıyor; SocketBindDeny etkisiz. Etkili olanlar: IPAddressDeny (127.0.0.1 ve 169.254.169.254 zaman aşımı), TemporaryFileSystem, InaccessiblePaths, boş CapabilityBoundingSet [P]. `test/host-systemd.test.ts` hangi direktifin etkisiz olduğunu ve onu neyin kapattığını raporlar; adım 15'teki gerçek VM'de `INCIBASE_TEST_REQUIRE_SANDBOX=1` ile hepsi zorunludur.
 
 **`/etc/nginx/conf.d/incibase.conf`** (branch başına satır içermez):
 ```nginx

@@ -2,9 +2,9 @@
 // (under a temp root), but owners and modes are recorded in memory, and users
 // and groups live in maps. It can crash on purpose before any change, to test
 // that provisioning resumes from every point.
-import { lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { checkAccountName, SystemCommandError, type FileInfo, type GroupEntry, type HostSystem, type NewUser, type PasswdEntry } from "./system.ts";
+import { checkAccountName, listDir, SystemCommandError, type FileInfo, type GroupEntry, type HostSystem, type NewUser, type PasswdEntry } from "./system.ts";
 
 export class SimulatedCrash extends Error {
   constructor(readonly op: string) {
@@ -23,6 +23,8 @@ export class FakeSystem implements HostSystem {
   readonly log: string[] = [];
   /** Throw SimulatedCrash instead of making change number `crashAt` (0-based). */
   crashAt: number | null = null;
+  /** What freeBytes reports. */
+  free = 100 * 1024 ** 3;
   private changes = 0;
   private nextSystemGid = 999;
 
@@ -101,7 +103,7 @@ export class FakeSystem implements HostSystem {
     }
     const type = st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : st.isFile() ? "file" : "other";
     const meta = this.meta.get(path);
-    return { type, uid: meta?.uid ?? 0, gid: meta?.gid ?? 0, mode: meta?.mode ?? st.mode & 0o7777 };
+    return { type, uid: meta?.uid ?? 0, gid: meta?.gid ?? 0, mode: meta?.mode ?? st.mode & 0o7777, size: st.size, mtimeMs: st.mtimeMs };
   }
 
   mkdir(path: string, mode: number) {
@@ -155,12 +157,29 @@ export class FakeSystem implements HostSystem {
     this.meta.set(path, { ...owner });
   }
 
+  copyFile(from: string, to: string, owner: { uid: number; gid: number; mode: number }) {
+    this.change(`copy ${from} ${to}`);
+    if (this.lstat(from)?.type !== "file") throw new Error(`${from} is not a regular file`);
+    const temp = join(dirname(to), `.${basename(to)}.tmp`);
+    copyFileSync(from, temp);
+    renameSync(temp, to);
+    this.meta.set(to, { ...owner });
+  }
+
   readFile(path: string) {
     try {
       return readFileSync(path, "utf8");
     } catch {
       return null;
     }
+  }
+
+  readdir(path: string) {
+    return listDir(path);
+  }
+
+  freeBytes(_path: string) {
+    return this.free;
   }
 
   rename(from: string, to: string) {

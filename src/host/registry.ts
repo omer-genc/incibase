@@ -9,7 +9,7 @@
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { DataDirLock, DataDirLockedError } from "../engine/store.ts";
-import type { HostLayout } from "./layout.ts";
+import type { HostLayout, SavedLayout } from "./layout.ts";
 import type { BranchKind } from "./names.ts";
 
 /** uids below this are left to the distribution and the admin. */
@@ -24,6 +24,7 @@ export const LOCK_TIMEOUT_MS = 30_000;
 
 export type BranchPhase = "provisioning" | "ready" | "deleting" | "deleted";
 export type DesiredState = "running" | "stopped";
+export type ReleaseStatus = "staged" | "preflight" | "live" | "failed" | "superseded" | "interrupted";
 
 export interface BranchRow {
   id: string;
@@ -45,6 +46,39 @@ export interface BranchRow {
   copied_from_branch_id: string | null;
   created_at: number;
   updated_at: number;
+  /** INCIBASE_GENERATION of the process the unit runs: `<seq>.<nonce>`, new for every start the host asks for. */
+  generation: string | null;
+}
+
+export interface ReleaseRow {
+  branch_id: string;
+  seq: number;
+  sha256: string;
+  bytes: number;
+  manifest_json: string;
+  status: ReleaseStatus;
+  /** Whether this release runs a preflight before it goes live. */
+  preflight: number;
+  allow_field_removal: number;
+  snapshot: string | null;
+  generation: string | null;
+  preflight_ms: number | null;
+  migration_committed: number | null;
+  exit_code: number | null;
+  error: string | null;
+  origin: string;
+  created_at: number;
+  finished_at: number | null;
+  /** When its files were removed (beyond the last 5); the row stays. */
+  pruned_at: number | null;
+}
+
+export interface AlertRow {
+  key: string;
+  state: string;
+  since: number;
+  notified_at: number | null;
+  message: string | null;
 }
 
 export interface ProjectRow {
@@ -79,6 +113,33 @@ export interface AuditEntry {
   ok: boolean;
 }
 
+type BranchPatchKey = "desired_state" | "release_seq" | "runtime_version" | "busy_unit" | "limits_json" | "config_json" | "generation" | "protected";
+const BRANCH_PATCH_KEYS: readonly BranchPatchKey[] = [
+  "desired_state",
+  "release_seq",
+  "runtime_version",
+  "busy_unit",
+  "limits_json",
+  "config_json",
+  "generation",
+  "protected",
+];
+const RELEASE_COLUMNS = new Set([
+  "bytes",
+  "manifest_json",
+  "status",
+  "preflight",
+  "allow_field_removal",
+  "snapshot",
+  "generation",
+  "preflight_ms",
+  "migration_committed",
+  "exit_code",
+  "error",
+  "finished_at",
+  "pruned_at",
+]);
+
 /** Schema migrations; `PRAGMA user_version` is the number applied. Never edit a released one: add the next. */
 const MIGRATIONS: string[] = [
   `
@@ -103,21 +164,29 @@ const MIGRATIONS: string[] = [
     config_json TEXT NOT NULL,
     copied_from_branch_id TEXT REFERENCES branches(id),
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    generation TEXT
   );
   CREATE UNIQUE INDEX branches_live_label ON branches(label) WHERE phase <> 'deleted';
   CREATE TABLE releases (
     branch_id TEXT NOT NULL REFERENCES branches(id),
     seq INTEGER NOT NULL,
     sha256 TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
     manifest_json TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('staged', 'preflight', 'live', 'failed', 'superseded', 'interrupted')),
+    preflight INTEGER NOT NULL,
+    allow_field_removal INTEGER NOT NULL DEFAULT 0,
     snapshot TEXT,
+    generation TEXT,
+    preflight_ms INTEGER,
     migration_committed INTEGER,
     exit_code INTEGER,
     error TEXT,
     origin TEXT NOT NULL,
     created_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    pruned_at INTEGER,
     PRIMARY KEY (branch_id, seq)
   );
   CREATE TABLE env (
@@ -136,7 +205,7 @@ const MIGRATIONS: string[] = [
     created_at INTEGER NOT NULL,
     revoked_at INTEGER
   );
-  CREATE TABLE alerts (key TEXT PRIMARY KEY, state TEXT NOT NULL, since INTEGER NOT NULL, notified_at INTEGER);
+  CREATE TABLE alerts (key TEXT PRIMARY KEY, state TEXT NOT NULL, since INTEGER NOT NULL, notified_at INTEGER, message TEXT);
   CREATE TABLE audit_log (
     id INTEGER PRIMARY KEY,
     at INTEGER NOT NULL,
@@ -179,10 +248,14 @@ export interface InitSettings {
   tunnelPortBase?: number;
   domain?: string;
   timezone?: string;
+  /** Bytes the slice of all branches may use (incibase.slice MemoryMax). */
+  sliceMemoryMax?: number;
 }
 
 export class Registry {
   readonly db: Database;
+  /** How long withLock waits for another command by default. */
+  lockTimeoutMs = LOCK_TIMEOUT_MS;
   private lock: DataDirLock | null = null;
   private lockDepth = 0;
 
@@ -232,7 +305,7 @@ export class Registry {
    * Runs `fn` holding control/LOCK, waiting up to `timeoutMs` for another
    * command to release it. Re-entrant within this Registry.
    */
-  async withLock<T>(fn: () => T | Promise<T>, { timeoutMs = LOCK_TIMEOUT_MS } = {}): Promise<T> {
+  async withLock<T>(fn: () => T | Promise<T>, { timeoutMs = this.lockTimeoutMs } = {}): Promise<T> {
     if (this.lockDepth === 0) {
       const started = Date.now();
       for (let delay = 10; ; delay = Math.min(delay * 2, 250)) {
@@ -279,6 +352,7 @@ export class Registry {
       if (key === "uid_next" || key === "tunnel_port_next" || key === "uid_base") {
         throw new RegistryError(`${key} only grows through allocation`);
       }
+      if (key === "layout") throw new RegistryError("The layout is fixed when the host is initialized");
       if (key === "domain" && this.getSetting("domain") !== value && this.countBranches() > 0) {
         throw new RegistryError("The domain is fixed once a branch exists: its hostnames and cookies depend on it");
       }
@@ -303,7 +377,20 @@ export class Registry {
       put.run("tunnel_port_next", String(portBase));
       put.run("timezone", init.timezone ?? "UTC");
       if (init.domain !== undefined) put.run("domain", init.domain);
+      if (init.sliceMemoryMax !== undefined) put.run("slice_memory_max", String(init.sliceMemoryMax));
+      const saved = JSON.stringify(this.layout.saved());
+      const current = this.getSetting("layout");
+      if (current !== null && current !== saved) {
+        throw new RegistryError(`This host was initialized with the layout ${current}; it cannot change to ${saved}`);
+      }
+      put.run("layout", saved);
     });
+  }
+
+  /** The layout options the host was initialized with, or null before `host init`. */
+  savedLayout(): SavedLayout | null {
+    const value = this.getSetting("layout");
+    return value === null ? null : (JSON.parse(value) as SavedLayout);
   }
 
   private counter(key: string): number {
@@ -358,9 +445,9 @@ export class Registry {
       this.db
         .query(
           `INSERT INTO branches (id, project, name, kind, protected, label, os_uid, tunnel_port, phase, desired_state, release_seq,
-           runtime_version, busy_unit, s3_prefix, limits_json, config_json, copied_from_branch_id, created_at, updated_at)
+           runtime_version, busy_unit, s3_prefix, limits_json, config_json, copied_from_branch_id, created_at, updated_at, generation)
          VALUES ($id, $project, $name, $kind, $protected, $label, $os_uid, $tunnel_port, $phase, $desired_state, $release_seq,
-           $runtime_version, $busy_unit, $s3_prefix, $limits_json, $config_json, $copied_from_branch_id, $created_at, $updated_at)`,
+           $runtime_version, $busy_unit, $s3_prefix, $limits_json, $config_json, $copied_from_branch_id, $created_at, $updated_at, $generation)`,
         )
         .run(row as unknown as Record<string, string | number | null>);
     });
@@ -407,6 +494,101 @@ export class Registry {
     });
   }
 
+  /** Changes some of a branch's columns; updated_at follows. */
+  updateBranch(id: string, patch: Partial<Pick<BranchRow, BranchPatchKey>>, at: number) {
+    const keys = Object.keys(patch) as BranchPatchKey[];
+    for (const key of keys) if (!BRANCH_PATCH_KEYS.includes(key)) throw new RegistryError(`Cannot change ${key}`);
+    this.tx(() => {
+      const sets = keys.map((k) => `${k} = $${k}`).join(", ");
+      const result = this.db
+        .query(`UPDATE branches SET ${sets}${sets ? ", " : ""}updated_at = $updated_at WHERE id = $id`)
+        .run({ ...(patch as Record<string, string | number | null>), updated_at: at, id });
+      if (result.changes !== 1) throw new RegistryError(`No branch ${id}`);
+    });
+  }
+
+  /**
+   * Marks a ready branch busy with a long operation (a release job), unless
+   * it already is: then null. Every op that changes the branch refuses while
+   * `busy_unit` is set.
+   */
+  claimBusy(id: string, unit: string, at: number): boolean {
+    return this.tx(
+      () => this.db.run(`UPDATE branches SET busy_unit = ?, updated_at = ? WHERE id = ? AND phase = 'ready' AND busy_unit IS NULL`, [unit, at, id]).changes === 1,
+    );
+  }
+
+  /** Clears `busy_unit` if it is still `unit`. */
+  releaseBusy(id: string, unit: string, at: number): boolean {
+    return this.tx(() => this.db.run(`UPDATE branches SET busy_unit = NULL, updated_at = ? WHERE id = ? AND busy_unit = ?`, [at, id, unit]).changes === 1);
+  }
+
+  // ---- releases ------------------------------------------------------------
+
+  insertRelease(row: ReleaseRow) {
+    this.tx(() => {
+      this.db
+        .query(
+          `INSERT INTO releases (branch_id, seq, sha256, bytes, manifest_json, status, preflight, allow_field_removal, snapshot, generation,
+             preflight_ms, migration_committed, exit_code, error, origin, created_at, finished_at, pruned_at)
+           VALUES ($branch_id, $seq, $sha256, $bytes, $manifest_json, $status, $preflight, $allow_field_removal, $snapshot, $generation,
+             $preflight_ms, $migration_committed, $exit_code, $error, $origin, $created_at, $finished_at, $pruned_at)`,
+        )
+        .run(row as unknown as Record<string, string | number | null>);
+    });
+  }
+
+  getRelease(branchId: string, seq: number): ReleaseRow | null {
+    return this.db.query(`SELECT * FROM releases WHERE branch_id = ? AND seq = ?`).get(branchId, seq) as ReleaseRow | null;
+  }
+
+  /** Newest first. */
+  listReleases(branchId: string): ReleaseRow[] {
+    return this.db.query(`SELECT * FROM releases WHERE branch_id = ? ORDER BY seq DESC`).all(branchId) as ReleaseRow[];
+  }
+
+  /** The next release number; numbers are never reused. */
+  nextReleaseSeq(branchId: string): number {
+    const row = this.db.query(`SELECT max(seq) AS seq FROM releases WHERE branch_id = ?`).get(branchId) as { seq: number | null };
+    return (row.seq ?? 0) + 1;
+  }
+
+  updateRelease(branchId: string, seq: number, patch: Partial<Omit<ReleaseRow, "branch_id" | "seq" | "sha256" | "origin" | "created_at">>) {
+    const keys = Object.keys(patch);
+    if (!keys.length) return;
+    for (const key of keys) if (!/^[a-z_0-9]+$/.test(key) || !RELEASE_COLUMNS.has(key)) throw new RegistryError(`Cannot change ${key}`);
+    this.tx(() => {
+      const result = this.db
+        .query(`UPDATE releases SET ${keys.map((k) => `${k} = $${k}`).join(", ")} WHERE branch_id = $branch_id AND seq = $seq`)
+        .run({ ...(patch as Record<string, string | number | null>), branch_id: branchId, seq });
+      if (result.changes !== 1) throw new RegistryError(`No release ${branchId}#${seq}`);
+    });
+  }
+
+  // ---- alerts --------------------------------------------------------------
+
+  raiseAlert(key: string, message: string, at: number) {
+    this.tx(() =>
+      this.db.run(
+        `INSERT INTO alerts (key, state, since, notified_at, message) VALUES (?, 'firing', ?, NULL, ?)
+         ON CONFLICT (key) DO UPDATE SET message = excluded.message,
+           since = CASE WHEN alerts.state = 'firing' THEN alerts.since ELSE excluded.since END,
+           notified_at = CASE WHEN alerts.state = 'firing' THEN alerts.notified_at ELSE NULL END, state = 'firing'`,
+        [key, at, message],
+      ),
+    );
+  }
+
+  resolveAlert(key: string, at: number) {
+    this.tx(() => this.db.run(`UPDATE alerts SET state = 'resolved', since = ? WHERE key = ? AND state = 'firing'`, [at, key]));
+  }
+
+  listAlerts(state?: string): AlertRow[] {
+    return (
+      state === undefined ? this.db.query(`SELECT * FROM alerts ORDER BY key`).all() : this.db.query(`SELECT * FROM alerts WHERE state = ? ORDER BY key`).all(state)
+    ) as AlertRow[];
+  }
+
   // ---- env, service keys -------------------------------------------------
 
   setEnv(branchId: string, name: string, value: string, system: boolean) {
@@ -423,8 +605,48 @@ export class Registry {
     return this.db.query(`SELECT * FROM env WHERE branch_id = ? ORDER BY system DESC, name`).all(branchId) as EnvRow[];
   }
 
+  getEnv(branchId: string, name: string): EnvRow | null {
+    return this.db.query(`SELECT * FROM env WHERE branch_id = ? AND name = ?`).get(branchId, name) as EnvRow | null;
+  }
+
+  /** Removes an app env row; system rows stay. */
+  deleteEnv(branchId: string, name: string): boolean {
+    return this.tx(() => this.db.run(`DELETE FROM env WHERE branch_id = ? AND name = ? AND system = 0`, [branchId, name]).changes === 1);
+  }
+
+  /** Branches (not deleted) whose env has `name` = `value`. */
+  branchesWithEnv(name: string, value: string): string[] {
+    return (
+      this.db
+        .query(`SELECT e.branch_id AS id FROM env e JOIN branches b ON b.id = e.branch_id WHERE e.name = ? AND e.value = ? AND b.phase <> 'deleted'`)
+        .all(name, value) as { id: string }[]
+    ).map((r) => r.id);
+  }
+
   listServiceKeys(branchId: string): ServiceKeyRow[] {
     return this.db.query(`SELECT * FROM service_keys WHERE branch_id = ? ORDER BY id`).all(branchId) as ServiceKeyRow[];
+  }
+
+  getServiceKey(id: string): ServiceKeyRow | null {
+    return this.db.query(`SELECT * FROM service_keys WHERE id = ?`).get(id) as ServiceKeyRow | null;
+  }
+
+  insertServiceKey(row: ServiceKeyRow) {
+    this.tx(() =>
+      this.db.run(`INSERT INTO service_keys (id, branch_id, sha256, scopes, label, created_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, [
+        row.id,
+        row.branch_id,
+        row.sha256,
+        row.scopes,
+        row.label,
+        row.created_at,
+        row.revoked_at,
+      ]),
+    );
+  }
+
+  revokeServiceKey(id: string, at: number): boolean {
+    return this.tx(() => this.db.run(`UPDATE service_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, [at, id]).changes === 1);
   }
 
   // ---- audit -------------------------------------------------------------

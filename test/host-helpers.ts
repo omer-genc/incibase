@@ -1,10 +1,17 @@
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { manifestLine, sha256Hex, type BundleManifest } from "../src/engine/manifest.ts";
+import { VERSION } from "../src/engine/version.ts";
+import type { OpsContext } from "../src/host/context.ts";
+import { FakeDriver } from "../src/host/fake-driver.ts";
 import { FakeSystem } from "../src/host/fake-system.ts";
 import { HostLayout } from "../src/host/layout.ts";
+import * as ops from "../src/host/ops.ts";
 import { initHost, type HostContext } from "../src/host/provision.ts";
-import { Registry, type InitSettings } from "../src/host/registry.ts";
+import { Registry, type BranchRow, type InitSettings } from "../src/host/registry.ts";
+import { runJob } from "../src/host/release.ts";
 
 export interface TestHost extends HostContext {
   sys: FakeSystem;
@@ -77,4 +84,100 @@ export function parseEnvFile(text: string): Record<string, string> {
     out[name] = value;
   }
   return out;
+}
+
+// ---- ops on a fake host --------------------------------------------------------
+
+export interface OpsTestHost extends OpsContext {
+  sys: FakeSystem;
+  driver: FakeDriver;
+  dir: string;
+  /** What the ops and jobs logged. */
+  lines: string[];
+  close(): void;
+}
+
+/**
+ * A host for the owner operations: FakeSystem, FakeDriver (whose transient
+ * jobs run in this process), unit files under a temp dir with the
+ * production names, the current runtime installed, and gates that poll
+ * every millisecond and give up after `gateFloorMs` (200 ms).
+ */
+export async function fakeOpsHost(options: { unitPrefix?: string } = {}): Promise<OpsTestHost> {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "incibase-ops-")));
+  const layout = new HostLayout({
+    root: join(dir, "root"),
+    runtimeRoot: join(dir, "runtime"),
+    systemdDir: join(dir, "systemd"),
+    ...(options.unitPrefix ? { unitPrefix: options.unitPrefix } : {}),
+  });
+  const sys = new FakeSystem();
+  const driver = new FakeDriver(layout);
+  let t = 1_800_000_000_000;
+  const lines: string[] = [];
+  const ctx = {
+    layout,
+    sys,
+    driver,
+    self: ["/usr/local/bin/incibase"],
+    now: () => (t += 1000),
+    actor: "root:test",
+    log: (line: string) => void lines.push(line),
+    pollMs: 1,
+    settleMs: 0,
+    gateFloorMs: 200,
+    sleep: () => Bun.sleep(1),
+    health: (socket: string) => driver.health(socket),
+  } as unknown as OpsTestHost;
+  sys.mkdir(layout.root, 0o755);
+  ctx.registry = Registry.open(layout);
+  ctx.registry.lockTimeoutMs = 500;
+  driver.onTransient = (job) => runJob(ctx, job.argv.slice(job.argv.indexOf("_job") + 3));
+  await ops.initHost(ctx, { domain: "incibase.example.net", timezone: "Europe/Istanbul", uidBase: 70000, sliceMemoryMax: 3 * 1024 ** 3 });
+  const binary = join(dir, "incibase-bin");
+  writeFileSync(binary, `#!/bin/sh\necho ${VERSION}\n`, { mode: 0o755 });
+  await ops.installRuntime(ctx, { binary, version: VERSION });
+  Object.assign(ctx, {
+    dir,
+    lines,
+    close() {
+      ctx.registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  });
+  opsHosts.push(ctx);
+  return ctx;
+}
+
+const opsHosts: OpsTestHost[] = [];
+
+export function closeOpsHosts() {
+  for (const host of opsHosts.splice(0)) host.close();
+}
+
+/** A valid release bundle that nothing runs (the fake driver only reads its path); `body` makes each one different. */
+export function fakeBundle(dir: string, name: string, body = `export default ${JSON.stringify(name)};\n`): string {
+  const manifest: BundleManifest = {
+    format: 1,
+    incibaseVersion: VERSION,
+    sha256: sha256Hex(body),
+    createdAt: new Date().toISOString(),
+    app: { functions: [], tables: {}, crons: [], http: [] },
+    envNames: [],
+  };
+  const path = join(dir, `${name}.ib`);
+  writeFileSync(path, `${manifestLine(manifest)}\n${body}`);
+  return path;
+}
+
+/** A real SQLite database in the branch's data dir, as serve would leave it. */
+export function seedDatabase(host: OpsTestHost, branch: BranchRow, rows = 3) {
+  const path = join(host.layout.branch(branch.id).data, "data.db");
+  const db = new Database(path, { create: true });
+  db.run("PRAGMA journal_mode = WAL");
+  db.run("CREATE TABLE IF NOT EXISTS docs (id INTEGER PRIMARY KEY, body TEXT)");
+  for (let i = 0; i < rows; i++) db.run("INSERT INTO docs (body) VALUES (?)", [`doc ${i}`]);
+  db.close();
+  host.sys.own(path, branch.os_uid, branch.os_uid, 0o600);
+  return path;
 }

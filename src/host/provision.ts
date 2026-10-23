@@ -13,8 +13,8 @@
 //   4. no file under the host root belongs to that uid or gid, outside the
 //      branch's own directory (which only this provisioning creates);
 //   5. the branch tree with exact owners and modes, service-keys.json, the
-//      env file (0600) and the hosts/ and admin/ links (the systemd drop-in
-//      joins here with the systemd driver);
+//      env file (0600), the systemd drop-in and `daemon-reload` (with a
+//      driver), and the hosts/ and admin/ links;
 //   6. phase 'ready', then admin/index.json.
 //
 // A crash between any two steps leaves the branch in 'provisioning';
@@ -40,14 +40,27 @@ import {
   randomBytes,
   type BranchKind,
 } from "./names.ts";
+import type { Driver } from "./driver.ts";
 import { currentActor, RegistryError, type BranchRow, type InitSettings, type Registry } from "./registry.ts";
-import { adminIndexContent, branchEnv, envFileContent, serviceKeysContent } from "./render.ts";
+import {
+  adminIndexContent,
+  branchEnv,
+  derivedEnv,
+  envFileContent,
+  removeBranchUnits,
+  renderBranchUnits,
+  renderHostUnits,
+  serviceKeysContent,
+  writeIfChanged,
+} from "./render.ts";
 import type { HostSystem } from "./system.ts";
 
 export interface HostContext {
   layout: HostLayout;
   sys: HostSystem;
   registry: Registry;
+  /** The service manager; without one (provisioning tests) no unit is rendered, started or stopped. */
+  driver?: Driver;
   now?: () => number;
   random?: (n: number) => Uint8Array;
   actor?: string;
@@ -131,13 +144,14 @@ export function ensureHostTree(ctx: HostContext) {
   for (const spec of ctx.layout.hostTree()) applyDir(ctx, spec);
 }
 
-/** The registry settings and the host tree (the part of `host init` this layer owns); safe to run again. */
+/** The registry settings, the host tree and the host's units (the part of `host init` this layer owns); safe to run again. */
 export async function initHost(ctx: HostContext, settings: InitSettings = {}) {
   if (settings.domain !== undefined) checkDomain(settings.domain);
   if (settings.timezone !== undefined) checkTimezone(settings.timezone);
   await ctx.registry.withLock(() => {
     ctx.registry.initSettings(settings);
     ensureHostTree(ctx);
+    if (ctx.driver && renderHostUnits(ctx)) ctx.driver.daemonReload();
   });
 }
 
@@ -225,6 +239,7 @@ export function registerBranch(ctx: HostContext, input: CreateBranchInput): Bran
       copied_from_branch_id: null,
       created_at: at,
       updated_at: at,
+      generation: null,
     };
     registry.insertBranch(row);
     const env: [string, string][] = [
@@ -282,23 +297,29 @@ function ensureBranchAccount(ctx: HostContext, branch: BranchRow) {
   }
 }
 
-/** Writes a derived file unless it already has this content, owner and mode. */
-function writeDerived(ctx: HostContext, path: string, content: string, owner: { uid: number; gid: number; mode: number }) {
-  const info = ctx.sys.lstat(path);
-  if (info?.type === "file" && info.uid === owner.uid && info.gid === owner.gid && info.mode === owner.mode && ctx.sys.readFile(path) === content) return;
-  ctx.sys.writeFile(path, content, owner);
-}
-
-/** The branch's derived files: service-keys.json, the env file and the links. Run again by renderHost. */
-function renderBranchFiles(ctx: HostContext, branch: BranchRow) {
+/**
+ * The branch's derived files: service-keys.json, the env file, its units
+ * (with a driver) and the links. Run again by renderHost. True when a unit
+ * file changed and `daemon-reload` is still to run (`reload: false`).
+ */
+export function renderBranchFiles(ctx: HostContext, branch: BranchRow, { reload = true } = {}): boolean {
   const { sys, layout, registry } = ctx;
   const paths = layout.branch(branch.id);
   const uid = branch.os_uid;
   step(ctx, "service-keys");
-  writeDerived(ctx, paths.serviceKeys, serviceKeysContent(registry.listServiceKeys(branch.id)), { uid: 0, gid: uid, mode: 0o640 });
+  writeIfChanged(ctx, paths.serviceKeys, serviceKeysContent(registry.listServiceKeys(branch.id)), { uid: 0, gid: uid, mode: 0o640 });
   step(ctx, "env-file");
-  const env = branchEnv(registry.listEnv(branch.id), { INCIBASE_SERVICE_KEYS_FILE: paths.serviceKeys });
-  writeDerived(ctx, paths.envFile, envFileContent(env), { uid: 0, gid: 0, mode: 0o600 });
+  const env = branchEnv(registry.listEnv(branch.id), derivedEnv(layout, branch));
+  writeIfChanged(ctx, paths.envFile, envFileContent(env), { uid: 0, gid: 0, mode: 0o600 });
+  let unitsChanged = false;
+  if (ctx.driver) {
+    step(ctx, "units");
+    unitsChanged = renderBranchUnits(ctx, branch);
+    if (unitsChanged && reload) {
+      ctx.driver.daemonReload();
+      unitsChanged = false;
+    }
+  }
   step(ctx, "links");
   for (const link of layout.branchLinks(branch.id, branch.label)) {
     if (sys.readlink(link.path) === link.target) continue;
@@ -306,11 +327,12 @@ function renderBranchFiles(ctx: HostContext, branch: BranchRow) {
     if (info && info.type !== "symlink") throw new ProvisionConflictError(`${link.path} exists and is not a link`);
     sys.symlink(link.target, link.path);
   }
+  return unitsChanged;
 }
 
-function renderAdminIndex(ctx: HostContext) {
+export function renderAdminIndex(ctx: HostContext) {
   const content = adminIndexContent(ctx.registry.listBranches({ phase: "ready" }), ctx.registry.getSetting("domain"));
-  writeDerived(ctx, ctx.layout.adminIndex, content, { uid: 0, gid: groupId(ctx, ctx.layout.groups.admin, 0), mode: 0o640 });
+  writeIfChanged(ctx, ctx.layout.adminIndex, content, { uid: 0, gid: groupId(ctx, ctx.layout.groups.admin, 0), mode: 0o640 });
 }
 
 /**
@@ -412,6 +434,15 @@ async function teardownBranch(ctx: HostContext, id: string) {
   }
   renderAdminIndex(ctx);
 
+  if (ctx.driver) {
+    step(ctx, "units");
+    for (const unit of [layout.units.branch(id), layout.units.preflight(id)]) {
+      ctx.driver.stop(unit);
+      ctx.driver.resetFailed(unit);
+    }
+    if (removeBranchUnits(ctx, id)) ctx.driver.daemonReload();
+  }
+
   step(ctx, "processes");
   const pids = sys.processesOf(branch.os_uid);
   if (pids.length) throw new BranchBusyError(id, pids);
@@ -420,9 +451,17 @@ async function teardownBranch(ctx: HostContext, id: string) {
   if (sys.lstat(paths.envFile)) sys.remove(paths.envFile);
 
   step(ctx, "tree");
-  if (sys.lstat(paths.dir)) {
-    if (branch.kind === "prod") sys.rename(paths.dir, layout.trashEntry(id, now(ctx)));
-    else sys.remove(paths.dir);
+  if (branch.kind === "prod") {
+    // The data and its snapshots go to one trash entry, kept 7 days (gcTrash).
+    const entry = layout.trashEntry(id, now(ctx));
+    if (sys.lstat(paths.dir)) sys.rename(paths.dir, entry);
+    if (sys.lstat(paths.backups)) {
+      const keep = sys.lstat(entry) ? `${entry}/backups` : `${entry}-backups`;
+      sys.rename(paths.backups, keep);
+    }
+  } else {
+    if (sys.lstat(paths.dir)) sys.remove(paths.dir);
+    if (sys.lstat(paths.backups)) sys.remove(paths.backups);
   }
 
   step(ctx, "user");
@@ -444,6 +483,8 @@ export interface RenderReport {
   deleted: string[];
   rendered: string[];
   failed: { id: string; error: string }[];
+  /** Whether a unit file changed (and `daemon-reload` ran). */
+  unitsChanged?: boolean;
 }
 
 /**
@@ -456,6 +497,7 @@ export async function renderHost(ctx: HostContext): Promise<RenderReport> {
   const report: RenderReport = { provisioned: [], rolledBack: [], deleted: [], rendered: [], failed: [] };
   await registry.withLock(async () => {
     ensureHostTree(ctx);
+    let unitsChanged = ctx.driver ? renderHostUnits(ctx) : false;
     for (const branch of registry.listBranches({ phase: ["provisioning", "deleting", "ready"] })) {
       try {
         if (branch.phase === "provisioning") {
@@ -471,13 +513,15 @@ export async function renderHost(ctx: HostContext): Promise<RenderReport> {
           report.deleted.push(branch.id);
         } else {
           for (const spec of layout.branchTree(branch.id)) applyDir(ctx, spec, branch.os_uid);
-          renderBranchFiles(ctx, branch);
+          if (renderBranchFiles(ctx, branch, { reload: false })) unitsChanged = true;
           report.rendered.push(branch.id);
         }
       } catch (err) {
         report.failed.push({ id: branch.id, error: (err as Error).message });
       }
     }
+    if (unitsChanged) ctx.driver!.daemonReload();
+    report.unitsChanged = unitsChanged;
     renderAdminIndex(ctx);
   });
   return report;
