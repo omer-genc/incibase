@@ -4,7 +4,7 @@
 // that provisioning resumes from every point.
 import { copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { checkAccountName, listDir, SystemCommandError, type FileInfo, type GroupEntry, type HostSystem, type NewUser, type PasswdEntry } from "./system.ts";
+import { checkAccountName, listDir, SystemCommandError, type FileInfo, type GroupEntry, type HostSystem, type NewUser, type PasswdEntry, type PinnedFile } from "./system.ts";
 
 export class SimulatedCrash extends Error {
   constructor(readonly op: string) {
@@ -106,6 +106,15 @@ export class FakeSystem implements HostSystem {
     return { type, uid: meta?.uid ?? 0, gid: meta?.gid ?? 0, mode: meta?.mode ?? st.mode & 0o7777, size: st.size, mtimeMs: st.mtimeMs };
   }
 
+  openPinned(path: string): PinnedFile | null {
+    const info = this.lstat(path);
+    if (!info) return null;
+    if (info.type === "symlink") throw new Error(`${path} is a symlink; refusing to open it`);
+    // No TOCTOU to simulate on a single-threaded fake: the real file under the
+    // temp root is handed back by its own path, with the recorded owner.
+    return { path, info, close: () => {} };
+  }
+
   mkdir(path: string, mode: number) {
     this.change(`mkdir ${path}`);
     try {
@@ -152,8 +161,13 @@ export class FakeSystem implements HostSystem {
   writeFile(path: string, content: string, owner: { uid: number; gid: number; mode: number }) {
     this.change(`write ${path}`);
     const temp = join(dirname(path), `.${basename(path)}.tmp`);
-    writeFileSync(temp, content, { mode: 0o600 });
-    renameSync(temp, path);
+    try {
+      writeFileSync(temp, content, { mode: 0o600 });
+      renameSync(temp, path);
+    } catch (err) {
+      rmSync(temp, { force: true });
+      throw err;
+    }
     this.meta.set(path, { ...owner });
   }
 
@@ -161,8 +175,13 @@ export class FakeSystem implements HostSystem {
     this.change(`copy ${from} ${to}`);
     if (this.lstat(from)?.type !== "file") throw new Error(`${from} is not a regular file`);
     const temp = join(dirname(to), `.${basename(to)}.tmp`);
-    copyFileSync(from, temp);
-    renameSync(temp, to);
+    try {
+      copyFileSync(from, temp);
+      renameSync(temp, to);
+    } catch (err) {
+      rmSync(temp, { force: true });
+      throw err;
+    }
     this.meta.set(to, { ...owner });
   }
 

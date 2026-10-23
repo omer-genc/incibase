@@ -9,6 +9,7 @@ import {
   closeSync,
   fchmodSync,
   fchownSync,
+  fstatSync,
   fsyncSync,
   lchownSync,
   lstatSync,
@@ -61,6 +62,19 @@ export interface NewUser {
   comment: string;
 }
 
+/**
+ * A file opened read-only with its inode pinned: `path` reads that inode
+ * however the directory entry is swapped afterwards (a branch cannot make a
+ * reader follow a symlink planted in its place). The caller must `close()`.
+ */
+export interface PinnedFile {
+  /** A path that opens the pinned inode (`/proc/self/fd/<fd>` on Linux). */
+  path: string;
+  /** The inode as fstat reports it (not the directory entry). */
+  info: FileInfo;
+  close(): void;
+}
+
 export interface HostSystem {
   getpwnam(name: string): PasswdEntry | null;
   getpwuid(uid: number): PasswdEntry | null;
@@ -76,6 +90,12 @@ export interface HostSystem {
 
   /** The path itself, never what a symlink points at; null when missing. */
   lstat(path: string): FileInfo | null;
+  /**
+   * Opens `path` read-only without following a symlink and pins the inode;
+   * null when `path` is missing. Throws when `path` is a symlink. The caller
+   * reads `.path` (bound to the inode, race-free) and `close()`s it.
+   */
+  openPinned(path: string): PinnedFile | null;
   /** One directory level; an existing directory is fine. */
   mkdir(path: string, mode: number): void;
   /** Owner of the path itself (lchown). */
@@ -262,6 +282,39 @@ export class LinuxSystem implements HostSystem {
     return fileInfo(checkPath(path));
   }
 
+  openPinned(path: string): PinnedFile | null {
+    let fd: number;
+    try {
+      fd = openSync(checkPath(path), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === "ENOENT") return null;
+      // O_NOFOLLOW turns a symlink final component into ELOOP: the caller never follows it.
+      if (code === "ELOOP") throw new Error(`${path} is a symlink; refusing to open it`);
+      throw err;
+    }
+    try {
+      const st = fstatSync(fd);
+      const type = st.isDirectory() ? "dir" : st.isFile() ? "file" : "other";
+      const info: FileInfo = { type, uid: st.uid, gid: st.gid, mode: st.mode & 0o7777, size: st.size, mtimeMs: st.mtimeMs };
+      // The kernel resolved O_NOFOLLOW at open, so the fd is never a symlink.
+      return {
+        path: `/proc/self/fd/${fd}`,
+        info,
+        close: () => {
+          try {
+            closeSync(fd);
+          } catch {
+            // Already closed.
+          }
+        },
+      };
+    } catch (err) {
+      closeSync(fd);
+      throw err;
+    }
+  }
+
   mkdir(path: string, mode: number) {
     try {
       mkdirSync(checkPath(path), { mode });
@@ -303,6 +356,7 @@ export class LinuxSystem implements HostSystem {
   writeFile(path: string, content: string, owner: { uid: number; gid: number; mode: number }) {
     const temp = tempPath(checkPath(path));
     removeQuietly(temp);
+    // O_CREAT|O_EXCL (wx) refuses a planted symlink or a pre-existing temp.
     const fd = openSync(temp, "wx", 0o600);
     try {
       fchownSync(fd, checkId(owner.uid), checkId(owner.gid));
@@ -311,10 +365,18 @@ export class LinuxSystem implements HostSystem {
       let written = 0;
       while (written < bytes.length) written += writeSync(fd, bytes, written);
       fsyncSync(fd);
-    } finally {
+    } catch (err) {
       closeSync(fd);
+      removeQuietly(temp); // Leave no half-written temp behind (e.g. ENOSPC).
+      throw err;
     }
-    renameSync(temp, path);
+    closeSync(fd);
+    try {
+      renameSync(temp, path);
+    } catch (err) {
+      removeQuietly(temp);
+      throw err;
+    }
     fsyncDir(dirname(path));
   }
 
@@ -323,16 +385,22 @@ export class LinuxSystem implements HostSystem {
     if (info?.type !== "file") throw new Error(`${from} is not a regular file`);
     const temp = tempPath(checkPath(to));
     removeQuietly(temp);
-    copyFileSync(from, temp, fsConstants.COPYFILE_EXCL);
-    const fd = openSync(temp, "r+");
+    // COPYFILE_EXCL refuses a planted symlink or a pre-existing temp.
     try {
-      fchownSync(fd, checkId(owner.uid), checkId(owner.gid));
-      fchmodSync(fd, owner.mode);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
+      copyFileSync(from, temp, fsConstants.COPYFILE_EXCL);
+      const fd = openSync(temp, "r+");
+      try {
+        fchownSync(fd, checkId(owner.uid), checkId(owner.gid));
+        fchmodSync(fd, owner.mode);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temp, to);
+    } catch (err) {
+      removeQuietly(temp); // A partial copy (e.g. ENOSPC) is never left behind.
+      throw err;
     }
-    renameSync(temp, to);
     fsyncDir(dirname(to));
   }
 

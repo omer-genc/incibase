@@ -71,8 +71,12 @@ export function adminIndexContent(branches: BranchRow[], domain: string | null):
 // ---- systemd units ---------------------------------------------------------
 
 const HEADER = "# Rendered by incibase from control/registry.db; changes here are overwritten.\n";
-/** Network the sandbox denies: loopback, private ranges, link-local (cloud metadata); the DNS stub stays reachable. */
-export const IP_ADDRESS_DENY = "localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10";
+/**
+ * Network the sandbox denies: loopback, private ranges (IPv4 and IPv6
+ * unique-local), the shared/CGNAT range an overlay such as Tailscale uses,
+ * and link-local (cloud metadata); the DNS stub stays reachable.
+ */
+export const IP_ADDRESS_DENY = "localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 fc00::/7 fe80::/10";
 export const IP_ADDRESS_ALLOW = "127.0.0.53/32";
 /** Set for every branch process: no home, no colors, no transpiler cache outside the data dir. */
 const BRANCH_ENVIRONMENT = "HOME=/nonexistent NO_COLOR=1 BUN_RUNTIME_TRANSPILER_CACHE_PATH=0";

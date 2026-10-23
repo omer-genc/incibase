@@ -31,7 +31,7 @@ import {
 } from "./names.ts";
 import * as provision from "./provision.ts";
 import { currentActor, RegistryLockedError, type BranchRow, type ReleaseRow, type ServiceKeyRow } from "./registry.ts";
-import { followJob, gateBranch, newGeneration, stageRelease, startJob, type GateResult } from "./release.ts";
+import { cleanupPreflight, followJob, gateBranch, newGeneration, recoverSwitchedBranch, stageRelease, startJob, type GateResult } from "./release.ts";
 import { branchUrl, removeIfPresent } from "./render.ts";
 
 /** Why an op refused: `code` for M4's HTTP mapping, the message for people. */
@@ -190,6 +190,14 @@ export async function render(ctx: OpsContext, _input: Record<string, never> = {}
       }
       return freed;
     });
+    // For each freed branch: clean up any preflight the dead job orphaned, and if the job had already switched
+    // the branch to a release that never passed its gate, make sure the branch is healthy on it or revert.
+    for (const id of interrupted) {
+      const branch = ctx.registry.getBranch(id)!;
+      await cleanupPreflight(ctx, branch);
+      const current = branch.release_seq === null ? null : ctx.registry.getRelease(id, branch.release_seq);
+      if (current && current.status === "interrupted" && current.generation) await recoverSwitchedBranch(ctx, id);
+    }
     const report = await provision.renderHost(ctx);
     await ctx.registry.withLock(() =>
       ctx.registry.audit(
@@ -518,7 +526,21 @@ export async function rollback(ctx: OpsContext, input: z.input<typeof rollbackSc
     });
     if (data.wait) await followJob(ctx, unit);
     const branch = ctx.registry.getBranch(existing.id)!;
-    return { branch, unit, to, ok: branch.release_seq === to && ctx.registry.getRelease(branch.id, to)?.status === "live" };
+    // Derive ok from the job's own outcome, not from the registry state: a restore onto the current release
+    // leaves release_seq unchanged, so `release_seq === to` alone would report ok even when the job failed.
+    // The rollback job tags its final audit row with its unit; the newest such row is this job's result.
+    const outcome = ctx.registry
+      .listAudit(existing.id)
+      .reverse()
+      .find((a) => {
+        if (a.action !== "release.rollback") return false;
+        try {
+          return (JSON.parse(a.detail_json ?? "{}") as { unit?: string }).unit === unit;
+        } catch {
+          return false;
+        }
+      });
+    return { branch, unit, to, ok: outcome?.ok === 1 };
   });
 }
 

@@ -166,7 +166,7 @@ Internet ─:443─▶ nginx (TLS, limit_req/limit_conn, JSON log)
 | A → B'nin `data.db` ve `storage/`'ı | Ayrı uid, 0700/0600, uid'nin daha önce kullanılmadığı doğrulanır | [P] |
 | A → B'nin env, argv ve süreçleri | environ sahibe özel; ProtectProc=invisible; argv'de sır yok | environ [P], ProtectProc [I] |
 | A → B'nin soketleri | 2750 dizin, `chmod 0770` | [P] |
-| A → host-local servisler ve metadata | `IPAddressDeny=localhost 10/8 172.16/12 192.168/16 169.254/16 fe80::/10`, `IPAddressAllow=127.0.0.53` | [I] |
+| A → host-local servisler ve metadata | `IPAddressDeny=localhost 10/8 172.16/12 192.168/16 100.64/10 169.254/16 fc00::/7 fe80::/10`, `IPAddressAllow=127.0.0.53` | [I] |
 | A'nın TCP listener açması | `SocketBindDeny=any` | [I] |
 | A → bellek, CPU, PID, disk | slice, MemoryMax/High, CPUQuota, TasksMax, `max_page_count`, kota, ballast | OOM [P] |
 | `.env` / `bunfig.toml` ile kalıcılık | Root'a ait cwd; ProtectSystem=strict | autoload [P] |
@@ -272,7 +272,7 @@ RestartForceExitStatus=SIGHUP
 ExecReload=/bin/kill -HUP $MAINPID
 TemporaryFileSystem=/tmp:size=64M
 SocketBindDeny=any
-IPAddressDeny=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10
+IPAddressDeny=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 fc00::/7 fe80::/10
 IPAddressAllow=127.0.0.53/32
 ```
 

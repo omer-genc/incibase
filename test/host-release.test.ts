@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import type { FakeOutcome, FakeRun } from "../src/host/fake-driver.ts";
 import * as ops from "../src/host/ops.ts";
+import * as provision from "../src/host/provision.ts";
 import { Registry, type BranchRow } from "../src/host/registry.ts";
 import { closeOpsHosts, fakeBundle, fakeOpsHost, seedDatabase, type OpsTestHost } from "./host-helpers.ts";
 
@@ -461,5 +462,128 @@ describe("runtime upgrades", () => {
     await expect(ops.installRuntime(host, { binary, version: "2.0.0; rm -rf /" })).rejects.toMatchObject({ code: "INVALID" });
     await withRuntime(host, "1.0.0");
     expect(host.sys.lstat(host.layout.runtimeBinary("1.0.0"))).toMatchObject({ type: "file", uid: 0, gid: 0, mode: 0o755 });
+  });
+});
+
+describe("a failed deploy never leaves a healthy branch down", () => {
+  test("a gate failure stops the new process and syncs the journal before deciding on a revert", async () => {
+    const host = await shop(["dev"]);
+    const dev = branchOf(host, "dev");
+    await release(host, "dev", fakeBundle(host.dir, "v1"));
+    const from = host.driver.calls.length;
+    when(host, 2, "branch", { hang: true }); // never healthy, no migration committed
+    await release(host, "dev", fakeBundle(host.dir, "v2"));
+    const calls = host.driver.calls.slice(from);
+    const branchUnit = host.layout.units.branch(dev.id);
+    const stopIdx = calls.indexOf(`stop ${branchUnit}`);
+    const syncIdx = calls.indexOf("sync-journal");
+    // The commit decision (and any revert) happens only after the new process is stopped and the journal flushed.
+    expect(stopIdx).toBeGreaterThanOrEqual(0);
+    expect(syncIdx).toBeGreaterThan(stopIdx);
+    expect(calls.lastIndexOf(`restart ${branchUnit}`)).toBeGreaterThan(syncIdx);
+    expect(branchOf(host, "dev").release_seq).toBe(1);
+  });
+
+  test("a rollback whose target fails its gate reverts to the release it replaced", async () => {
+    const host = await shop(["dev"]);
+    const dev = branchOf(host, "dev");
+    await release(host, "dev", fakeBundle(host.dir, "v1"));
+    await release(host, "dev", fakeBundle(host.dir, "v2"));
+    when(host, 1, "branch", { exit: 65 }); // release 1 is now broken on start
+    const result = await ops.rollback(host, { project: "shop", branch: "dev" }); // default target: release 1
+    expect(result.ok).toBe(false);
+    const after = branchOf(host, "dev");
+    expect(after).toMatchObject({ release_seq: 2, busy_unit: null });
+    expect(after.generation).toMatch(/^2\./);
+    expect(host.registry.getRelease(dev.id, 2)!.status).toBe("live");
+    expect(await host.driver.health(host.layout.branch(dev.id).adminSock)).toMatchObject({ generation: after.generation });
+  });
+
+  test("a restore that runs out of space fails the rollback and keeps the data", async () => {
+    const host = await shop(["prod"]);
+    const prod = branchOf(host, "prod");
+    await release(host, "prod", fakeBundle(host.dir, "v1"));
+    seedDatabase(host, prod, 4);
+    when(host, 2, "branch", { migrationCommitted: true, exit: 1 });
+    await release(host, "prod", fakeBundle(host.dir, "v2")); // commits, fails; pre-2 taken
+    seedDatabase(host, prod, 6); // data moved on since the snapshot
+    host.sys.free = 1024; // no room to copy the snapshot back
+    const result = await ops.rollback(host, { project: "shop", branch: "prod", to: 1, restore: "pre-2", confirm: "prod--shop.incibase.example.net" });
+    expect(result.ok).toBe(false);
+    // The data dir still holds a real database (the restore never destroyed it), with no leftover temp.
+    const data = host.layout.branch(prod.id).data;
+    expect(host.sys.lstat(join(data, "data.db"))!.type).toBe("file");
+    expect(existsSync(join(data, "data.db.restoring"))).toBe(false);
+  });
+
+  test("render recovers a branch whose deploy job died after the switch", async () => {
+    const host = await shop(["dev"]);
+    const dev = branchOf(host, "dev");
+    await release(host, "dev", fakeBundle(host.dir, "v1")); // release 1 live
+    const gen = "2.deadbeefcaf0";
+    // A job that stages release 2, switches the branch to it, restarts (it crashes on start), then dies before the gate.
+    host.driver.onTransient = async () => {
+      await host.registry.withLock(() =>
+        host.registry.tx(() => {
+          host.registry.updateRelease(dev.id, 2, { status: "preflight", generation: gen });
+          host.registry.updateBranch(dev.id, { release_seq: 2, generation: gen, desired_state: "running" }, Date.now());
+        }),
+      );
+      provision.renderBranchFiles(host, host.registry.getBranch(dev.id)!);
+      host.driver.resetFailed(host.layout.units.branch(dev.id));
+      host.driver.restart(host.layout.units.branch(dev.id));
+      throw new Error("job killed after the switch");
+    };
+    when(host, 2, "branch", { exit: 65 });
+    const { unit } = await release(host, "dev", fakeBundle(host.dir, "v2"), { wait: false });
+    for (let i = 0; i < 500 && !(branchOf(host, "dev").release_seq === 2 && host.driver.show(unit).loadState === "not-found"); i++) await Bun.sleep(2);
+    expect(branchOf(host, "dev")).toMatchObject({ release_seq: 2, busy_unit: unit });
+
+    host.driver.onTransient = null;
+    const report = await ops.render(host);
+    expect(report.interrupted).toEqual([dev.id]);
+    const after = branchOf(host, "dev");
+    expect(after.release_seq).toBe(1); // reverted to the last good release
+    expect(host.registry.getRelease(dev.id, 2)!.status).toBe("interrupted");
+    expect(host.registry.getRelease(dev.id, 1)!.status).toBe("live");
+    expect(host.registry.listAlerts("firing").map((a) => a.key)).toContain(`release:${dev.id}`);
+    expect(await host.driver.health(host.layout.branch(dev.id).adminSock)).toMatchObject({ generation: after.generation });
+  });
+});
+
+describe("retention keeps what a rollback needs", () => {
+  test("a committed-but-failed release's snapshot survives later failed releases", async () => {
+    const host = await shop(["prod"]);
+    const prod = branchOf(host, "prod");
+    await release(host, "prod", fakeBundle(host.dir, "v1")); // first release, no data, no snapshot
+    seedDatabase(host, prod, 3);
+    when(host, 2, "branch", { migrationCommitted: true, exit: 1 });
+    await release(host, "prod", fakeBundle(host.dir, "v2")); // commits, fails; alert names pre-2
+    expect(host.registry.listAlerts("firing")[0]!.message).toContain("--restore pre-2");
+    // Three more releases fail at preflight, each taking a fresh snapshot of the already-migrated data.
+    for (const v of ["v3", "v4", "v5"]) {
+      const seq = host.registry.nextReleaseSeq(prod.id);
+      when(host, seq, "preflight", { exit: 65 });
+      await release(host, "prod", fakeBundle(host.dir, v));
+    }
+    // pre-2 and release 1's files are still there, so the suggested --restore works.
+    expect(existsSync(host.layout.snapshot(prod.id, "pre-2"))).toBe(true);
+    expect(existsSync(host.layout.releaseDir(prod.id, 1))).toBe(true);
+    const result = await ops.rollback(host, { project: "shop", branch: "prod", to: 1, restore: "pre-2", confirm: "prod--shop.incibase.example.net" });
+    expect(result).toMatchObject({ ok: true, to: 1 });
+  });
+
+  test("a good rollback target survives a run of failed releases", async () => {
+    const host = await shop(["dev"]);
+    const dev = branchOf(host, "dev");
+    await release(host, "dev", fakeBundle(host.dir, "v1")); // release 1 live
+    for (let i = 2; i <= 6; i++) {
+      when(host, i, "branch", { exit: 65 });
+      await release(host, "dev", fakeBundle(host.dir, `v${i}`));
+    }
+    await release(host, "dev", fakeBundle(host.dir, "v7")); // release 7 live
+    expect(existsSync(host.layout.releaseDir(dev.id, 1))).toBe(true);
+    const result = await ops.rollback(host, { project: "shop", branch: "dev" });
+    expect(result).toMatchObject({ ok: true, to: 1 });
   });
 });

@@ -40,7 +40,7 @@ const HEADER = "# Rendered by incibase from control/registry.db; changes here ar
 const SANDBOX = (writable: string) => `UMask=0007
 TemporaryFileSystem=/tmp:size=64M,mode=1777
 SocketBindDeny=any
-IPAddressDeny=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fe80::/10
+IPAddressDeny=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 fc00::/7 fe80::/10
 IPAddressAllow=127.0.0.53/32
 ProtectSystem=strict
 ReadWritePaths=${writable}

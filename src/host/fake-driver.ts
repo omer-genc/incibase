@@ -222,6 +222,10 @@ export class FakeDriver implements Driver {
     return this.nextCursor > 1 ? `c${this.nextCursor - 1}` : null;
   }
 
+  syncJournal() {
+    this.calls.push("sync-journal");
+  }
+
   journalCommand(query: { unit: string; follow?: boolean; lines?: number; since?: string; json?: boolean }): string[] {
     return ["journalctl", "--unit", query.unit, ...(query.follow ? ["--follow"] : [])];
   }

@@ -375,13 +375,14 @@ export async function provisionBranch(ctx: HostContext, id: string): Promise<Bra
 /** Gives up on a branch in 'provisioning': phase 'deleting', then the same teardown as a delete. */
 export async function rollbackBranch(ctx: HostContext, id: string, reason: string) {
   const { registry } = ctx;
-  await registry.withLock(async () => {
+  await registry.withLock(() => {
     registry.tx(() => {
       registry.setPhase(id, "provisioning", "deleting", now(ctx));
       registry.audit({ actor: actor(ctx), action: "branch.rollback", branchId: id, detail: { reason }, ok: false }, now(ctx));
     });
-    await teardownBranch(ctx, id);
   });
+  // The tree is small and nothing runs yet, so this is quick even under a caller's lock.
+  await teardownBranch(ctx, id);
 }
 
 export interface DeleteBranchInput {
@@ -399,27 +400,36 @@ export interface DeleteBranchInput {
  */
 export async function deleteBranch(ctx: HostContext, input: DeleteBranchInput) {
   const { registry } = ctx;
-  return registry.withLock(async () => {
-    const branch = registry.findBranch(checkProjectSlug(input.project), checkBranchName(input.name));
-    if (!branch) throw new RegistryError(`No branch ${branchRef(input.project, input.name)}`);
-    if (branch.protected) {
+  // Mark the branch 'deleting' in one short transaction, then release the lock: the long teardown
+  // (systemctl stop can wait a whole drain, plus rm -rf and userdel) must not starve other commands.
+  const branch = await registry.withLock(() => {
+    const b = registry.findBranch(checkProjectSlug(input.project), checkBranchName(input.name));
+    if (!b) throw new RegistryError(`No branch ${branchRef(input.project, input.name)}`);
+    if (b.protected) {
       const domain = registry.getSetting("domain");
-      const expected = domain ? `${branch.label}.${domain}` : branch.label;
+      const expected = domain ? `${b.label}.${domain}` : b.label;
       if (input.confirm !== expected) {
-        throw new RegistryError(`${branchRef(branch.project, branch.name)} is protected: confirm with its hostname ${expected}`);
+        throw new RegistryError(`${branchRef(b.project, b.name)} is protected: confirm with its hostname ${expected}`);
       }
     }
-    if (branch.busy_unit) throw new RegistryError(`${branchRef(branch.project, branch.name)} is busy (${branch.busy_unit})`);
+    if (b.busy_unit) throw new RegistryError(`${branchRef(b.project, b.name)} is busy (${b.busy_unit})`);
     registry.tx(() => {
-      registry.setPhase(branch.id, ["ready", "provisioning"], "deleting", now(ctx));
-      registry.audit({ actor: actor(ctx), action: "branch.delete", branchId: branch.id, detail: { label: branch.label }, ok: true }, now(ctx));
+      registry.setPhase(b.id, ["ready", "provisioning"], "deleting", now(ctx));
+      registry.audit({ actor: actor(ctx), action: "branch.delete", branchId: b.id, detail: { label: b.label }, ok: true }, now(ctx));
     });
-    await teardownBranch(ctx, branch.id);
-    return registry.getBranch(branch.id)!;
+    return registry.getBranch(b.id)!;
   });
+  await teardownBranch(ctx, branch.id);
+  return registry.getBranch(branch.id)!;
 }
 
-/** Removes what a branch has on the machine; every step can run again. Ends in phase 'deleted'. */
+/**
+ * Removes what a branch has on the machine; every step can run again. The
+ * 'deleting' phase is a durable marker, so this runs without holding
+ * control/LOCK (it takes the lock only for the short registry writes), and
+ * the slow `systemctl stop` and `rm -rf` never block other commands. Ends in
+ * phase 'deleted'.
+ */
 async function teardownBranch(ctx: HostContext, id: string) {
   const { registry, sys, layout } = ctx;
   const branch = registry.getBranch(id);
@@ -432,7 +442,7 @@ async function teardownBranch(ctx: HostContext, id: string) {
     // A later branch with the same label may own the link by now.
     if (sys.readlink(link.path) === link.target) sys.remove(link.path);
   }
-  renderAdminIndex(ctx);
+  await registry.withLock(() => renderAdminIndex(ctx));
 
   if (ctx.driver) {
     step(ctx, "units");
@@ -471,10 +481,12 @@ async function teardownBranch(ctx: HostContext, id: string) {
   if (group && group.gid === branch.os_uid) sys.groupdel(user);
 
   step(ctx, "commit");
-  registry.tx(() => {
-    registry.setPhase(id, "deleting", "deleted", now(ctx));
-    registry.audit({ actor: actor(ctx), action: "branch.deleted", branchId: id, ok: true }, now(ctx));
-  });
+  await registry.withLock(() =>
+    registry.tx(() => {
+      registry.setPhase(id, "deleting", "deleted", now(ctx));
+      registry.audit({ actor: actor(ctx), action: "branch.deleted", branchId: id, ok: true }, now(ctx));
+    }),
+  );
 }
 
 export interface RenderReport {
@@ -495,6 +507,7 @@ export interface RenderReport {
 export async function renderHost(ctx: HostContext): Promise<RenderReport> {
   const { registry, layout } = ctx;
   const report: RenderReport = { provisioned: [], rolledBack: [], deleted: [], rendered: [], failed: [] };
+  const deleting: string[] = [];
   await registry.withLock(async () => {
     ensureHostTree(ctx);
     let unitsChanged = ctx.driver ? renderHostUnits(ctx) : false;
@@ -509,8 +522,8 @@ export async function renderHost(ctx: HostContext): Promise<RenderReport> {
             report.rolledBack.push(branch.id);
           }
         } else if (branch.phase === "deleting") {
-          await teardownBranch(ctx, branch.id);
-          report.deleted.push(branch.id);
+          // Deferred to after the lock: its teardown is slow and must not hold up the host.
+          deleting.push(branch.id);
         } else {
           for (const spec of layout.branchTree(branch.id)) applyDir(ctx, spec, branch.os_uid);
           if (renderBranchFiles(ctx, branch, { reload: false })) unitsChanged = true;
@@ -524,5 +537,14 @@ export async function renderHost(ctx: HostContext): Promise<RenderReport> {
     report.unitsChanged = unitsChanged;
     renderAdminIndex(ctx);
   });
+  // Finish deletes without holding control/LOCK, so a drain-long `systemctl stop` never starves other commands.
+  for (const id of deleting) {
+    try {
+      await teardownBranch(ctx, id);
+      report.deleted.push(id);
+    } catch (err) {
+      report.failed.push({ id, error: (err as Error).message });
+    }
+  }
   return report;
 }

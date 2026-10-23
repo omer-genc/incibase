@@ -236,6 +236,23 @@ describe("deleteBranch", () => {
     expect(host.registry.getBranch(prod.id)!.phase).toBe("deleted");
   });
 
+  test("stops and tears the branch down without holding control/LOCK (so a drain-long stop cannot starve other commands)", async () => {
+    const host = await shop(["dev"]);
+    const dev = branchOf(host, "dev");
+    await ops.addRelease(host, { project: "shop", branch: "dev", file: fakeBundle(host.dir, "v1") });
+    const unit = host.layout.units.branch(dev.id);
+    const seen: { locked: boolean | null } = { locked: null };
+    const origStop = host.driver.stop.bind(host.driver);
+    host.driver.stop = (name: string) => {
+      // The real `systemctl stop` can block for a whole drain; capture whether the lock is held while it runs.
+      if (name === unit && seen.locked === null) seen.locked = host.registry.locked;
+      origStop(name);
+    };
+    await ops.deleteBranch(host, { project: "shop", branch: "dev" });
+    expect(seen.locked).toBe(false);
+    expect(host.registry.getBranch(dev.id)!.phase).toBe("deleted");
+  });
+
   test("an unprotected production branch still needs its hostname to be deleted", async () => {
     const host = await shop(["prod"]);
     await ops.setBranch(host, { project: "shop", branch: "prod", protected: false, confirm: HOSTNAME });

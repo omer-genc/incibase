@@ -75,6 +75,17 @@ async function locked<T>(ctx: OpsContext, fn: () => T | Promise<T>): Promise<T> 
   return ctx.registry.withLock(fn);
 }
 
+/**
+ * A job's own bookkeeping (claiming, reverting, releasing busy_unit) must not
+ * be abandoned because another short-lived command holds control/LOCK, so it
+ * waits much longer than an owner op before giving up.
+ */
+export const JOB_LOCK_TIMEOUT_MS = 10 * 60_000;
+
+async function jobLocked<T>(ctx: OpsContext, fn: () => T | Promise<T>): Promise<T> {
+  return ctx.registry.withLock(fn, { timeoutMs: Math.max(JOB_LOCK_TIMEOUT_MS, ctx.registry.lockTimeoutMs) });
+}
+
 function branchOf(ctx: OpsContext, id: string): BranchRow {
   const branch = ctx.registry.getBranch(id);
   if (!branch) throw new RegistryError(`No branch ${id}`);
@@ -311,7 +322,7 @@ export async function runJob(ctx: OpsContext, args: string[]): Promise<void> {
 
 /** Takes the branch for a job: it must be busy with exactly this job's unit. */
 async function claimJob(ctx: OpsContext, id: string, unit: string): Promise<BranchRow> {
-  return locked(ctx, () => {
+  return jobLocked(ctx, () => {
     const branch = branchOf(ctx, id);
     if (branch.busy_unit !== unit) throw new ReleaseError(`${ref(branch)} is not busy with ${unit} (busy: ${branch.busy_unit ?? "no"}); not running it`);
     return branch;
@@ -319,7 +330,8 @@ async function claimJob(ctx: OpsContext, id: string, unit: string): Promise<Bran
 }
 
 async function finishJob(ctx: OpsContext, id: string, unit: string) {
-  await locked(ctx, () => ctx.registry.releaseBusy(id, unit, now(ctx)));
+  // Always clear busy_unit, even if another command is holding the lock right now.
+  await jobLocked(ctx, () => ctx.registry.releaseBusy(id, unit, now(ctx)));
 }
 
 // ---- deploy ------------------------------------------------------------------
@@ -434,6 +446,16 @@ async function deploy(ctx: OpsContext, id: string, input: DeployInput): Promise<
     return { ok: true, generation, snapshot, preflightMs };
   }
 
+  // Stop the new process before deciding whether its migration committed. On a gate timeout it may still be
+  // running, possibly mid-migration; a commit landing between the journal read and a later SIGTERM would be
+  // misread as "not committed" and the host would revert over migrated data. Stop first (synchronous), let
+  // journald catch up, and only then read the commit marker.
+  try {
+    driver.stop(unit);
+  } catch (err) {
+    log(`${input.what}: stopping the unhealthy start failed: ${(err as Error).message}`);
+  }
+  driver.syncJournal();
   const described = describeStatus(gate.status);
   const why = gate.reason === "timeout" ? `it did not report generation ${generation} within ${Math.round(timeout / 1000)} s` : described.text;
   const tail = journalTail(ctx, unit, cursor);
@@ -502,6 +524,71 @@ async function revert(
   return { reverted: "stopped", revertHealthy: null };
 }
 
+/**
+ * Repairs a branch whose deploy job died after it had switched the branch to a
+ * release but before the gate finished (the release is now 'interrupted' with a
+ * generation recorded). If the branch is healthy on that generation it is
+ * marked live; otherwise the branch goes back to the newest release that went
+ * live or was superseded (restarted and gated). An alert fires either way, so
+ * the owner learns the deploy did not complete.
+ */
+export async function recoverSwitchedBranch(ctx: OpsContext, id: string): Promise<{ reverted: boolean; healthy: boolean }> {
+  const { registry, layout, sys } = ctx;
+  const log = defaults.log(ctx);
+  const branch = branchOf(ctx, id);
+  if (branch.release_seq === null || !branch.generation) return { reverted: false, healthy: false };
+  const seq = branch.release_seq;
+  const what = `release ${ref(branch)}#${seq}`;
+  const gate = branch.desired_state === "running" ? await gateBranch(ctx, id, branch.generation, defaults.gateFloorMs(ctx)) : { ok: false as const };
+  if (gate.ok) {
+    // The branch is actually serving the switched release; make the registry match and flag it for a look.
+    await locked(ctx, () =>
+      registry.tx(() => {
+        registry.updateRelease(id, seq, { status: "live", finished_at: now(ctx) });
+        supersedeOthers(ctx, id, seq);
+        registry.audit({ actor: actor(ctx), action: "release.recovered", branchId: id, detail: { seq, healthy: true }, ok: true }, now(ctx));
+        registry.raiseAlert(`release:${id}`, `${what}: its deploy job was interrupted but the branch is healthy on it; verify it and re-run the release if needed`, now(ctx));
+      }),
+    );
+    log(`${what}: deploy job interrupted; the branch is healthy on it, kept and marked live (alert raised)`);
+    return { reverted: false, healthy: true };
+  }
+  const back = registry
+    .listReleases(id)
+    .find((r) => r.seq !== seq && (r.status === "live" || r.status === "superseded") && r.pruned_at === null && sys.lstat(layout.releaseFile(id, r.seq))?.type === "file");
+  const prev = back
+    ? { seq: back.seq, runtime: branch.runtime_version, desired: "running" as const }
+    : { seq: null, runtime: branch.runtime_version, desired: branch.desired_state };
+  log(`${what}: deploy job interrupted and the branch is not healthy; reverting to release ${back?.seq ?? "none"}`);
+  await revert(ctx, id, prev, what);
+  await locked(ctx, () =>
+    registry.tx(() => {
+      registry.audit({ actor: actor(ctx), action: "release.recovered", branchId: id, detail: { seq, healthy: false, revertedTo: back?.seq ?? null }, ok: false }, now(ctx));
+      registry.raiseAlert(`release:${id}`, `${what}: its deploy job was interrupted and the branch was not healthy; reverted to release ${back?.seq ?? "none"}`, now(ctx));
+    }),
+  );
+  return { reverted: true, healthy: false };
+}
+
+/** Stops a branch's preflight unit if it is running and waits until it settles; true when it settled. */
+async function stopPreflight(ctx: OpsContext, unit: string): Promise<boolean> {
+  const { driver } = ctx;
+  const sleep = defaults.sleep(ctx);
+  if (!settled(driver.show(unit))) {
+    driver.stop(unit);
+    for (let i = 0; i < 300 && !settled(driver.show(unit)); i++) await sleep(100);
+  }
+  const ok = settled(driver.show(unit));
+  if (ok) driver.resetFailed(unit);
+  return ok;
+}
+
+/** Stops a branch's preflight unit and empties preflight/, so a killed job leaves no orphan process or copy behind. */
+export async function cleanupPreflight(ctx: OpsContext, branch: BranchRow): Promise<void> {
+  await stopPreflight(ctx, ctx.layout.units.preflight(branch.id));
+  emptyDir(ctx, ctx.layout.branch(branch.id).preflight);
+}
+
 /** `serve --migrate-only` with the target, as the branch, on a copy of its data (or none). */
 async function preflight(
   ctx: OpsContext,
@@ -515,6 +602,12 @@ async function preflight(
   const dir = layout.branch(branch.id).preflight;
   const owner = { uid: branch.os_uid, gid: branch.os_uid, mode: 0o600 };
   const sleep = defaults.sleep(ctx);
+  // An earlier preflight for this branch may still be running (its job was killed mid-run). `start` would be a
+  // no-op on that active unit and the loop below would then wait for the OLD process finishing on the NEW copy,
+  // and count its exit as this release's preflight. Stop any orphan and wait until it settles before starting ours.
+  if (!(await stopPreflight(ctx, unit))) {
+    return { ok: false, ms: 0, exitCode: null, error: `preflight: an earlier preflight (${unit}) is still running and would not stop` };
+  }
   emptyDir(ctx, dir);
   if (hasData) {
     try {
@@ -545,6 +638,8 @@ async function preflight(
       await sleep(defaults.pollMs(ctx));
     }
   } finally {
+    // Never leave our preflight running: an orphan would be mistaken for the next release's preflight.
+    if (!settled(driver.show(unit))) driver.stop(unit);
     emptyDir(ctx, dir);
   }
   const ms = performance.now() - started;
@@ -564,19 +659,36 @@ async function preflight(
   return { ok: false, ms, exitCode, error: `preflight failed: ${text}.${hint}${tail ? `\n${tail}` : ""}` };
 }
 
-/** Removes the files of releases beyond the newest KEEP_RELEASES (never the one the branch runs); rows stay. */
+/**
+ * Removes release files the branch no longer needs: it keeps the newest
+ * KEEP_RELEASES releases that went live or were superseded, always the branch's
+ * current release and the newest usable release before it (a rollback target),
+ * and prunes failed releases' files before successful ones. Rows stay.
+ */
 function pruneReleases(ctx: OpsContext, id: string): number[] {
   const { registry, layout, sys } = ctx;
   const branch = branchOf(ctx, id);
+  const all = registry.listReleases(id); // newest first
+  const succeeded = (r: ReleaseRow) => r.status === "live" || r.status === "superseded";
+  const successful = all.filter(succeeded);
+  const keep = new Set<number>(successful.slice(0, KEEP_RELEASES).map((r) => r.seq));
+  if (branch.release_seq !== null) {
+    keep.add(branch.release_seq);
+    // Always keep a rollback target: the newest successful release before the current one.
+    const target = successful.find((r) => r.seq < branch.release_seq!);
+    if (target) keep.add(target.seq);
+  }
+  // Prune failed releases' files before successful ones, oldest first.
+  const order = [...all].sort((a, b) => Number(succeeded(a)) - Number(succeeded(b)) || a.seq - b.seq);
   const pruned: number[] = [];
-  for (const release of registry.listReleases(id).slice(KEEP_RELEASES)) {
-    if (release.pruned_at !== null || release.seq === branch.release_seq) continue;
+  for (const release of order) {
+    if (keep.has(release.seq) || release.pruned_at !== null) continue;
     const dir = layout.releaseDir(id, release.seq);
     if (sys.lstat(dir)) sys.remove(dir);
     registry.updateRelease(id, release.seq, { pruned_at: now(ctx) });
     pruned.push(release.seq);
   }
-  return pruned;
+  return pruned.sort((a, b) => a - b);
 }
 
 /** Every other release the branch had live is now superseded. */
@@ -653,8 +765,17 @@ export async function runReleaseJob(ctx: OpsContext, id: string, seq: number): P
     }
   } catch (err) {
     const current = registry.getRelease(id, seq);
-    if (current && (current.status === "staged" || current.status === "preflight")) await fail({ error: `the release job failed: ${(err as Error).message}` });
-    log(`${what}: the release job failed: ${(err as Error).message}`);
+    const message = `the release job failed: ${(err as Error).message}`;
+    if (current && (current.status === "staged" || current.status === "preflight")) await fail({ error: message }, `${what}: ${message}`);
+    else {
+      // The job died somewhere the normal paths do not cover; the branch may be in an unknown state, so alert.
+      try {
+        await jobLocked(ctx, () => registry.raiseAlert(`release:${id}`, `${what}: ${message}`, now(ctx)));
+      } catch {
+        // best effort
+      }
+    }
+    log(`${what}: ${message}`);
   } finally {
     await finishJob(ctx, id, unit);
   }
@@ -667,6 +788,12 @@ export async function runReleaseJob(ctx: OpsContext, id: string, seq: number): P
  * Switches the branch to release `to` (restart and gate). With `restore`,
  * the branch is stopped first and its database replaced by that snapshot
  * (the replaced one is kept in backups/<id>/replaced-<at>/).
+ *
+ * On a gate failure without `--restore`, or on any failure before the data
+ * was replaced, the branch goes back to the release it ran before (switched
+ * back, restarted and gated), so a failed rollback never leaves a healthy
+ * branch down. With `--restore` the data has already been replaced, so the
+ * branch is left as it is with an alert.
  */
 export async function runRollbackJob(ctx: OpsContext, id: string, n: number, to: number, restore: string | null): Promise<{ ok: boolean; error?: string }> {
   const { registry, layout, sys, driver } = ctx;
@@ -675,6 +802,10 @@ export async function runRollbackJob(ctx: OpsContext, id: string, n: number, to:
   const branch = await claimJob(ctx, id, unit);
   const what = `rollback ${ref(branch)} to #${to}${restore ? ` with ${restore}` : ""}`;
   const branchUnit = layout.units.branch(id);
+  const prev = { seq: branch.release_seq, runtime: branch.runtime_version, desired: branch.desired_state };
+  let dataReplaced = false;
+  const auditResult = (ok: boolean, detail: Record<string, unknown>) =>
+    locked(ctx, () => registry.audit({ actor: actor(ctx), action: "release.rollback", branchId: id, detail: { ...detail, unit }, ok }, now(ctx)));
   try {
     const target = registry.getRelease(id, to);
     if (!target || target.pruned_at !== null || sys.lstat(layout.releaseFile(id, to))?.type !== "file") throw new ReleaseError(`Release ${to} has no files to go back to`);
@@ -686,6 +817,7 @@ export async function runRollbackJob(ctx: OpsContext, id: string, n: number, to:
       const sleep = defaults.sleep(ctx);
       for (let i = 0; sys.processesOf(branch.os_uid).length && i < 300; i++) await sleep(100);
       const kept = restoreDatabase(ctx, branch, snapshot, now(ctx));
+      dataReplaced = true;
       log(`${what}: data.db replaced by ${restore}${kept ? `; the replaced database is kept in ${kept}` : ""}`);
     }
     const generation = newGeneration(to, ctx.random);
@@ -698,13 +830,17 @@ export async function runRollbackJob(ctx: OpsContext, id: string, n: number, to:
     const gate = await gateBranch(ctx, id, generation, defaults.gateFloorMs(ctx));
     if (!gate.ok) {
       const error = `${what}: release ${to} did not become healthy: ${gate.reason === "timeout" ? "no answer in time" : describeStatus(gate.status).text}`;
-      await locked(ctx, () =>
-        registry.tx(() => {
-          registry.raiseAlert(`branch:${id}`, error, now(ctx));
-          registry.audit({ actor: actor(ctx), action: "release.rollback", branchId: id, detail: { to, restore, error }, ok: false }, now(ctx));
-        }),
-      );
       log(error);
+      if (restore) {
+        // The data was replaced; there is no safe revert. Leave the branch on the target with an alert.
+        await locked(ctx, () => registry.raiseAlert(`branch:${id}`, error, now(ctx)));
+        await auditResult(false, { to, restore, error });
+        return { ok: false, error };
+      }
+      // No data changed: put the branch back on the release it ran before and gate it.
+      log(`${what}: reverting to release ${prev.seq ?? "none"}`);
+      await revert(ctx, id, prev, what);
+      await auditResult(false, { to, restore, error, reverted: prev.seq });
       return { ok: false, error };
     }
     await locked(ctx, () =>
@@ -713,15 +849,25 @@ export async function runRollbackJob(ctx: OpsContext, id: string, n: number, to:
         supersedeOthers(ctx, id, to);
         registry.resolveAlert(`release:${id}`, now(ctx));
         registry.resolveAlert(`branch:${id}`, now(ctx));
-        registry.audit({ actor: actor(ctx), action: "release.rollback", branchId: id, detail: { to, restore, generation }, ok: true }, now(ctx));
+        registry.audit({ actor: actor(ctx), action: "release.rollback", branchId: id, detail: { to, restore, generation, unit }, ok: true }, now(ctx));
       }),
     );
     log(`${what}: release ${to} is live`);
     return { ok: true };
   } catch (err) {
     const error = `${what} failed: ${(err as Error).message}`;
-    await locked(ctx, () => registry.audit({ actor: actor(ctx), action: "release.rollback", branchId: id, detail: { to, restore, error }, ok: false }, now(ctx)));
     log(error);
+    if (!dataReplaced) {
+      // Nothing was replaced on disk; bring the branch back up on the release it ran before.
+      try {
+        await revert(ctx, id, prev, what);
+      } catch (revertErr) {
+        log(`${what}: reverting to release ${prev.seq ?? "none"} failed: ${(revertErr as Error).message}`);
+      }
+    } else {
+      await locked(ctx, () => registry.raiseAlert(`branch:${id}`, error, now(ctx)));
+    }
+    await auditResult(false, { to, restore, error });
     return { ok: false, error };
   } finally {
     await finishJob(ctx, id, unit);
@@ -768,8 +914,18 @@ export async function runUpgradeJob(ctx: OpsContext, id: string, n: number, vers
     log(result.ok ? `${what}: done` : `${what} FAILED: ${printable(result.error, 4000)}`);
     return result;
   } catch (err) {
-    log(`${what} failed: ${(err as Error).message}`);
-    await locked(ctx, () => registry.audit({ actor: actor(ctx), action: "branch.upgrade", branchId: id, detail: { to: version, error: (err as Error).message }, ok: false }, now(ctx)));
+    const message = `${what} failed: ${(err as Error).message}`;
+    log(message);
+    try {
+      await jobLocked(ctx, () =>
+        registry.tx(() => {
+          registry.audit({ actor: actor(ctx), action: "branch.upgrade", branchId: id, detail: { to: version, error: (err as Error).message }, ok: false }, now(ctx));
+          registry.raiseAlert(`release:${id}`, message, now(ctx));
+        }),
+      );
+    } catch {
+      // best effort
+    }
     return null;
   } finally {
     await finishJob(ctx, id, unit);

@@ -156,6 +156,11 @@ export class SystemdDriver implements Driver {
     return match ? match[1]! : null;
   }
 
+  syncJournal() {
+    // journalctl --sync returns once journald has flushed everything written so far.
+    this.run(["journalctl", "--sync"], [0, 1]);
+  }
+
   journalCommand(query: { unit: string; follow?: boolean; lines?: number; since?: string; json?: boolean }): string[] {
     const args = ["journalctl", "--unit", checkUnitName(query.unit), "--output", query.json ? "json" : "cat", "--no-pager"];
     if (query.lines !== undefined) args.push("--lines", String(Math.max(1, Math.trunc(query.lines))));
