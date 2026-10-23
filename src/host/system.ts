@@ -83,7 +83,11 @@ export interface IngestOptions {
 
 /** A file a branch left for root was refused; nothing was copied. */
 export class IngestError extends Error {
-  constructor(message: string) {
+  /** `tooLarge`: refused for its size alone (larger than `maxBytes`). */
+  constructor(
+    message: string,
+    readonly tooLarge = false,
+  ) {
     super(message);
     this.name = "IngestError";
   }
@@ -305,7 +309,7 @@ export function ingestByFd(from: string, to: string, options: IngestOptions, pla
     const uid = platform.uidOf(st);
     if (uid !== options.uid) throw new IngestError(`${from} is owned by uid ${uid}, not ${options.uid}; refusing to read it`);
     if (st.nlink !== 1) throw new IngestError(`${from} has ${st.nlink} links; refusing to read it`);
-    if (st.size > options.maxBytes) throw new IngestError(`${from} is ${st.size} bytes, more than the ${options.maxBytes} allowed; refusing to copy it`);
+    if (st.size > options.maxBytes) throw new IngestError(`${from} is ${st.size} bytes, more than the ${options.maxBytes} allowed; refusing to copy it`, true);
     if (options.check) {
       const head = Buffer.alloc(Math.min(100, st.size));
       const n = head.length ? readSync(src, head, 0, head.length, 0) : 0;

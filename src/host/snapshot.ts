@@ -18,7 +18,8 @@
 //   2. Root takes the staging file in by fd (HostSystem.ingestFile): opened
 //      once with O_NOFOLLOW|O_NONBLOCK, checked from that fd (a regular file
 //      of the branch's uid with one link, no larger than the database, its
-//      INCIBASE_MAX_DB_BYTES and the free space allow, an SQLite header that
+//      INCIBASE_MAX_DB_BYTES (at most MAX_DB_OVER_LIMIT times that for one
+//      already over it) and the free space allow, an SQLite header that
 //      agrees with its size) and copied, sparse-preserving (blocks of zeros
 //      stay holes, so a sparse file costs root no disk), into a fresh temp in
 //      backups/ (root 0700) that gets its final owner and mode and an fsync,
@@ -47,6 +48,13 @@ import { IngestError, type Owner } from "./system.ts";
 export const SNAPSHOT_HEADROOM = 100 * MiB;
 /** Snapshots kept per branch (besides any a firing alert or a committed-but-failed release still needs). */
 export const KEEP_SNAPSHOTS = 3;
+/**
+ * How far over its INCIBASE_MAX_DB_BYTES a branch's snapshot may be: a
+ * database already over a lowered limit is snapshotted up to this many times
+ * the limit. Its size is the apparent one, which the branch can inflate, so
+ * this is also all a hostile branch can lift its cap to.
+ */
+export const MAX_DB_OVER_LIMIT = 2;
 export const DB_FILES = ["data.db", "data.db-wal", "data.db-shm"] as const;
 /** What the job waits for a snapshot unit: its RuntimeMaxSec and a little more. */
 const SNAPSHOT_WAIT_MS = (SNAPSHOT_RUNTIME_MAX_SEC + 60) * 1000;
@@ -61,12 +69,11 @@ export class SnapshotError extends Error {
 /**
  * The size of the database and its WAL in bytes (st_size, lstat: never
  * followed; 0 when the branch has no database yet). A VACUUM INTO copy is
- * never larger. It is the apparent size, which a branch can inflate with a
- * sparse file, so it only bounds the copy of a database that is not hostile:
- * the copy is sparse-preserving (a hole costs root no disk), and how much
- * root reads is held by the free space and INCIBASE_MAX_DB_BYTES, which the
- * branch cannot raise. (Never st_blocks: on a compressing file system, ZFS or
- * btrfs with compression, it is the compressed size.)
+ * never larger. It is the apparent size, which a branch can inflate for free
+ * with a sparse file, so it only bounds the copy of a database that is not
+ * hostile; see snapshotDatabase for what holds a hostile one. (Never
+ * st_blocks: on a compressing file system, ZFS or btrfs with compression, it
+ * is the compressed size.)
  */
 export function databaseBytes(ctx: HostContext, dataDir: string): number {
   return ["data.db", "data.db-wal"].reduce((sum, name) => {
@@ -229,21 +236,31 @@ export async function snapshotDatabase(ctx: OpsContext, branch: BranchRow, dest:
     // A unit that fails or is killed (OOM, RuntimeMaxSec, a stop) while this job lives on leaves a partial
     // snapshot.db.tmp and its -journal, as large as the database; the finally below clears them too.
     await runSnapshotUnit(ctx, branch);
-    // How much root reads: no more than the database could hold (twice, as it keeps growing meanwhile), no more
-    // than the branch's own INCIBASE_MAX_DB_BYTES (a VACUUM copy is at most the live database, which
-    // max_page_count holds to that; one already over a lowered limit keeps its size), and room for the headroom
-    // in backups/. The database's size is the apparent one, which a branch can inflate; the free space and the
-    // limit are not, and the copy keeps holes, so neither a sparse nor a zero-filled file costs root disk.
+    // How much root reads, the least of (the copy keeps holes, so a sparse or zero-filled file costs root only
+    // the reading; what root writes is the file's non-zero blocks):
+    //   - twice the database (it keeps growing meanwhile) plus the headroom. That is the apparent size, which
+    //     the branch inflates for free, so it bounds only an honest copy;
+    //   - the free space in backups/ less the headroom;
+    //   - with an INCIBASE_MAX_DB_BYTES, that limit: a VACUUM copy is at most the live database, which
+    //     max_page_count holds to it. A database already over a lowered limit keeps its own size, up to
+    //     MAX_DB_OVER_LIMIT times the limit, since that size too is the apparent one: inflating data.db lifts
+    //     the branch's cap to at most that, never to the free space.
     const after = databaseBytes(ctx, paths.data);
     const maxDbBytes = resolveLimits(parseLimits(branch.limits_json)).maxDbBytes;
     const caps = [2 * Math.max(before, after) + SNAPSHOT_HEADROOM, sys.freeBytes(layout.backups) - SNAPSHOT_HEADROOM];
-    if (maxDbBytes !== undefined) caps.push(Math.max(maxDbBytes, before));
-    const maxBytes = Math.max(0, Math.min(...caps));
+    const limitCap = maxDbBytes === undefined ? Infinity : Math.max(maxDbBytes, Math.min(before, MAX_DB_OVER_LIMIT * maxDbBytes));
+    const maxBytes = Math.max(0, Math.min(...caps, limitCap));
     temp = snapshotTemp(ctx, branch.id);
     try {
       sys.ingestFile(paths.snapshotFile, temp, { uid: branch.os_uid, maxBytes, owner, check: sqliteHeaderProblem });
     } catch (err) {
-      if (err instanceof IngestError) throw new SnapshotError(`The snapshot of ${branch.project}/${branch.name} was refused: ${err.message}`);
+      if (err instanceof IngestError) {
+        const limit =
+          err.tooLarge && maxBytes === limitCap
+            ? ` (its INCIBASE_MAX_DB_BYTES is ${maxDbBytes}; a database already over it is snapshotted up to ${MAX_DB_OVER_LIMIT} times that)`
+            : "";
+        throw new SnapshotError(`The snapshot of ${branch.project}/${branch.name} was refused: ${err.message}${limit}`);
+      }
       throw new SnapshotError(`Taking in the snapshot of ${branch.project}/${branch.name} failed: ${(err as Error).message}`);
     }
     sys.rename(temp, dest);

@@ -7,7 +7,7 @@
 // header), copies it by fd (sparse-preserving) into a root-only temp and
 // renames it into place.
 //
-// The tests, in order, all run against a branch uid with real units:
+// The tests, in the order they run, all against a branch uid with real units:
 //   1. ingestFile refuses every hostile staging file a branch can plant (a
 //      symlink to /etc/shadow, the control registry or another branch's
 //      database, a FIFO, a second hard link, a file over the cap, a
@@ -16,22 +16,34 @@
 //      cap becomes a copy with almost nothing allocated, and a database with
 //      long runs of zeros goes through ingestFile, copyFile and a whole
 //      snapshotDatabase byte for byte (sha256), its zeros left as holes.
-//   3. The snapshot unit runs as the branch: a data.db, -wal or -shm swapped
+//   3. Inflating data.db (a 2 GiB sparse file) lifts the branch's
+//      INCIBASE_MAX_DB_BYTES cap to twice the limit and no further: a dense
+//      file the branch swaps in just before root's ingest (injected there, so
+//      no race) is refused, and a real database over a lowered limit is
+//      still snapshotted.
+//   4. The snapshot unit runs as the branch: a data.db, -wal or -shm swapped
 //      for a symlink to the registry is refused or yields the branch's own data.
-//   4. The regression guard for the removed root-side read, deterministic:
-//      the branch unlinks data.db after root pinned it and plants
-//      `data.db (deleted)` -> the registry; the old algorithm (SQLite over
-//      /proc/self/fd/N, kept in this file as oldSnapshotByName) leaks the
-//      registry's marker every round, and snapshotDatabase in the same setup
-//      takes the branch's own data and leaks nothing.
 //   5. A branch process races root (flipping data.db and the staging output
 //      through every shape above) while root snapshots in a loop: no snapshot
 //      ever holds a secret or a foreign database, and none hangs. Nothing is
-//      asserted about how the race goes.
+//      asserted about how the race goes; the racer clobbers the staging file
+//      so often that a run may take no snapshot at all, so this guards
+//      against hangs, not against the root-side read (test 7 does).
 //   6. A real snapshot and `rollback --restore` still work end to end.
-//   7. The unit runs the newer of this host's runtime and the branch's pin: a
+//   7. The regression guard for the removed root-side read, deterministic:
+//      the branch's move (unlink data.db, plant `data.db (deleted)` -> the
+//      registry, put its own database back) is injected before each of root's
+//      HostSystem calls in turn (withMoveBefore), with no race. The old
+//      algorithm (oldSnapshotByName, kept in this file with the same calls
+//      between its pin and SQLite's open as commit 2f794ad) leaks the
+//      registry's marker at every one of them; snapshotDatabase gives the
+//      branch's own data at every one and leaks nothing, and at none of its
+//      calls does root hold anything open in the branch's data/ (the old
+//      algorithm holds its pin across all of them). Put the old algorithm
+//      back into snapshotDatabase and this test fails.
+//   8. The unit runs the newer of this host's runtime and the branch's pin: a
 //      branch pinned to a stub without _snapshot snapshots with this host's.
-//   8. A unit SIGKILLed while the job lives on leaves its staging dir empty:
+//   9. A unit SIGKILLed while the job lives on leaves its staging dir empty:
 //      once deterministically (a 99.0.0 wrapper runtime, picked as the newer
 //      for a branch pinned to it, leaves a partial snapshot.db.tmp and its
 //      -journal and waits to be killed), and once during a real VACUUM INTO
@@ -45,15 +57,15 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { closeSync, constants as fsConstants, chownSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { sha256Hex } from "../src/engine/manifest.ts";
 import { VERSION } from "../src/engine/version.ts";
 import { openHost, type OpsContext } from "../src/host/context.ts";
 import { DEFAULT_ROOT, HostLayout } from "../src/host/layout.ts";
 import * as ops from "../src/host/ops.ts";
 import { Registry, type BranchRow } from "../src/host/registry.ts";
-import { restoreDatabase, snapshotDatabase, SnapshotError } from "../src/host/snapshot.ts";
-import { IngestError, LinuxSystem } from "../src/host/system.ts";
+import { databaseBytes, DB_FILES, restoreDatabase, snapshotDatabase, SnapshotError } from "../src/host/snapshot.ts";
+import { IngestError, LinuxSystem, type HostSystem } from "../src/host/system.ts";
 
 const enabled = process.env.INCIBASE_TEST_HOST === "1" && process.platform === "linux" && process.getuid?.() === 0;
 const ROOT = process.env.INCIBASE_TEST_HOST_ROOT ?? "/var/lib/incibase-snp";
@@ -126,20 +138,62 @@ const asBranch = (uid: number, argv: string[], opts: { timeout?: number } = {}) 
   Bun.spawnSync(["setpriv", `--reuid=${uid}`, `--regid=${uid}`, "--clear-groups", "--", ...argv], { stdout: "pipe", stderr: "pipe", timeout: opts.timeout });
 
 /**
+ * Runs `run` with ctx.sys wrapped so that `move` (something the branch does)
+ * runs just before each of root's HostSystem calls that `when` picks (its
+ * method name and its 1-based place among the calls `run` makes). Root's
+ * calls are synchronous, so the move lands exactly between two of them: a
+ * window the branch could only hope to hit by racing, hit every time.
+ * Returns how many calls `run` made and how often `move` ran.
+ */
+async function withMoveBefore(when: (method: string, call: number) => boolean, move: () => void, run: () => Promise<unknown>): Promise<{ calls: number; moves: number }> {
+  const real = ctx.sys;
+  let calls = 0;
+  let moves = 0;
+  const hooked = new Proxy(real, {
+    get(target, prop) {
+      const value: unknown = Reflect.get(target, prop);
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        if (when(String(prop), ++calls)) {
+          moves++;
+          move();
+        }
+        return (value as (...a: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  });
+  (ctx as { sys: HostSystem }).sys = hooked;
+  try {
+    await run();
+  } finally {
+    (ctx as { sys: HostSystem }).sys = real;
+  }
+  return { calls, moves };
+}
+
+/**
  * The removed root-side algorithm (commit 2f794ad), kept here only as the
  * regression guard's positive control: root pins data.db with O_NOFOLLOW,
- * checks from the fd that it is the branch's regular file, and hands SQLite
- * `/proc/self/fd/N` to VACUUM INTO `out`. SQLite's unix VFS readlinks that
- * path and reopens the database BY the name it reads. `afterPin` is what the
- * branch does between root's pin and SQLite's open.
+ * checks from the fd that it is the branch's regular file, then makes the
+ * HostSystem calls 2f794ad made before opening it (the database's size, the
+ * free space, the temp and the database's entries, through ctx.sys, so
+ * withMoveBefore can put the branch's move between any two of them), and
+ * hands SQLite `/proc/self/fd/N` to VACUUM INTO `out`. SQLite's unix VFS
+ * readlinks that path and reopens the database BY the name it reads, which
+ * this returns.
  */
-function oldSnapshotByName(dataDir: string, uid: number, out: string, afterPin: (fd: number) => void): void {
+async function oldSnapshotByName(branch: BranchRow, out: string): Promise<string> {
+  const data = ctx.layout.branch(branch.id).data;
   rmSync(out, { force: true });
-  const fd = openSync(join(dataDir, "data.db"), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  const fd = openSync(join(data, "data.db"), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   try {
     const st = fstatSync(fd);
-    if (!st.isFile() || st.uid !== uid) throw new Error("not the branch's own database");
-    afterPin(fd);
+    if (!st.isFile() || st.uid !== branch.os_uid) throw new Error("not the branch's own database");
+    databaseBytes(ctx, data);
+    ctx.sys.freeBytes(dirname(out));
+    if (ctx.sys.lstat(out)) ctx.sys.remove(out);
+    for (const name of DB_FILES) ctx.sys.lstat(join(data, name));
+    const opened = readlinkSync(`/proc/self/fd/${fd}`);
     const db = new Database(`/proc/self/fd/${fd}`, { readonly: true });
     try {
       db.run("PRAGMA trusted_schema = OFF");
@@ -147,6 +201,7 @@ function oldSnapshotByName(dataDir: string, uid: number, out: string, afterPin: 
     } finally {
       db.close();
     }
+    return opened;
   } finally {
     closeSync(fd);
   }
@@ -344,6 +399,60 @@ describe.skipIf(!enabled)("privilege-separated snapshots defeat a branch racing 
     seed(prod, "branchdata");
   }, SLOW);
 
+  test("inflating data.db lifts the INCIBASE_MAX_DB_BYTES cap to at most twice the limit; a database over a lowered limit still snapshots", async () => {
+    const MiB = 1024 * 1024;
+    const q = JSON.stringify;
+    const owner = { uid: 0, gid: 0, mode: 0o600 };
+    const limited = (maxDbBytes: number) => ({ ...prod, limits_json: JSON.stringify({ ...JSON.parse(prod.limits_json), maxDbBytes }) });
+    const dest = join(ctx.layout.branch(prod.id).backups, "pre-cap.db");
+    const temps = () => readdirSync(ctx.layout.backups).filter((n) => n.startsWith(".snap-"));
+    wipeData(prod);
+    seed(prod, "branchdata");
+    for (const db of live.splice(0)) db.close();
+    // As the branch: data.db made to look 2 GiB (a sparse file costs it nothing), and a dense 64 MiB file with
+    // a valid header left as the staging file just before root takes it in, as a branch winning the race
+    // between the unit's exit and the ingest would. The move is injected there, so nothing is left to timing.
+    asBranchJs(prod.os_uid, `fs.truncateSync(${q(dataDb())}, 2 * 1024 ** 3)`);
+    expect(statSync(dataDb()).size).toBe(2 * 1024 * MiB);
+    const swapDense = () =>
+      asBranchJs(
+        prod.os_uid,
+        `const size=64*1024*1024,h=Buffer.alloc(100);h.write("SQLite format 3\\0",0,"latin1");h.writeUInt16BE(4096,16);h.writeUInt32BE(1,24);h.writeUInt32BE(size/4096,28);h.writeUInt32BE(1,92);` +
+          `fs.rmSync(${q(stagingFile())},{force:true});fs.writeFileSync(${q(stagingFile())},Buffer.concat([h,Buffer.alloc(size-100,0x41)]))`,
+      );
+    const beforeIngest = (method: string) => method === "ingestFile";
+    let swapped = 0;
+    await expect(
+      withMoveBefore(beforeIngest, () => (swapDense(), swapped++), () => snapshotDatabase(ctx, limited(8 * MiB), dest, owner)),
+    ).rejects.toThrow(/is 67108864 bytes, more than the 16777216 allowed; refusing to copy it \(its INCIBASE_MAX_DB_BYTES is 8388608;/);
+    expect(swapped).toBe(1);
+    expect(existsSync(dest)).toBe(false);
+    expect(temps()).toEqual([]);
+    expect(readdirSync(ctx.layout.branch(prod.id).snapshot)).toEqual([]);
+    // The same database, honestly snapshotted: the unit's own copy is small and goes through.
+    await snapshotDatabase(ctx, limited(8 * MiB), dest, owner);
+    expect(isBranchOwn(dest)).toBe(true);
+    rmSync(dest, { force: true });
+
+    // A database really over a limit lowered under it (12 MiB of rows, an 8 MiB limit): its own size is allowed.
+    wipeData(prod);
+    asBranchJs(
+      prod.os_uid,
+      `const {Database}=require("bun:sqlite");const db=new Database(${q(dataDb())},{create:true});db.run("CREATE TABLE t (v BLOB)");db.run("INSERT INTO t VALUES ('branchdata')");` +
+        `for(let i=0;i<12;i++)db.run("INSERT INTO t VALUES (randomblob(1048576))");db.close();`,
+    );
+    await snapshotDatabase(ctx, limited(8 * MiB), dest, owner);
+    expect(statSync(dest).size).toBeGreaterThan(12 * MiB);
+    expect(isBranchOwn(dest)).toBe(true);
+    rmSync(dest, { force: true });
+    // More than twice over its limit (4 MiB): refused, naming the limit.
+    await expect(snapshotDatabase(ctx, limited(4 * MiB), dest, owner)).rejects.toThrow(/more than the 8388608 allowed; refusing to copy it \(its INCIBASE_MAX_DB_BYTES is 4194304;/);
+    expect(existsSync(dest)).toBe(false);
+    expect(temps()).toEqual([]);
+    wipeData(prod);
+    seed(prod, "branchdata");
+  }, SLOW);
+
   test("the snapshot unit runs as the branch: a redirected data.db, -wal or -shm gains nothing", async () => {
     const data = ctx.layout.branch(prod.id).data;
     const dest = join(ctx.layout.branch(prod.id).backups, "pre-probe.db");
@@ -442,11 +551,12 @@ describe.skipIf(!enabled)("privilege-separated snapshots defeat a branch racing 
     after.close();
   }, SLOW);
 
-  test("the removed root-side read leaks the registry every time through `data.db (deleted)`; snapshotDatabase never does", async () => {
+  test("the removed root-side read leaks the registry through `data.db (deleted)` wherever the branch moves; snapshotDatabase never does", async () => {
     const data = ctx.layout.branch(prod.id).data;
     const planted = `${dataDb()} (deleted)`;
     const keep = join(data, "keep.db");
     const q = JSON.stringify;
+    const owner = { uid: 0, gid: 0, mode: 0o600 };
     wipeData(prod);
     seed(prod, "branchdata");
     for (const db of live.splice(0)) db.close(); // a checkpointed, closed database: data.db is all there is
@@ -454,44 +564,81 @@ describe.skipIf(!enabled)("privilege-separated snapshots defeat a branch racing 
     // The secret is in the registry's main file.
     ctx.registry.db.run("PRAGMA wal_checkpoint(TRUNCATE)");
     expect(readFileSync(ctx.layout.registry).includes(MARKER)).toBe(true);
-    // The branch's move, between root's pin and SQLite's open: unlink data.db (the pinned fd now reads back as
-    // "<path> (deleted)") and plant that very name as a symlink to the registry.
-    const unlinkAndPlant = () => asBranchJs(prod.os_uid, `fs.unlinkSync(${q(dataDb())});fs.symlinkSync(${q(ctx.layout.registry)}, ${q(planted)})`);
+    // The branch's move: unlink data.db (an fd root pinned on it now reads back as "<path> (deleted)"), plant that
+    // very name as a symlink to the registry, and put its own database back as data.db.
+    const move = () =>
+      asBranchJs(prod.os_uid, `fs.unlinkSync(${q(dataDb())});fs.symlinkSync(${q(ctx.layout.registry)}, ${q(planted)});fs.copyFileSync(${q(keep)}, ${q(dataDb())})`);
     const restore = () => {
-      for (const name of readdirSync(data)) if (name.startsWith("data.db")) rmSync(join(data, name), { force: true }); // the plant, and what root's SQLite made next to it
+      for (const name of readdirSync(data)) if (name.startsWith("data.db")) rmSync(join(data, name), { force: true }); // the plant, and what SQLite made next to it
       asBranchJs(prod.os_uid, `fs.copyFileSync(${q(keep)}, ${q(dataDb())})`);
     };
-
-    // The old algorithm: every round leaks the registry's marker. Nothing here is a race.
-    const out = join(ROOT, "old-by-name.db");
-    const ROUNDS = 5;
-    let leakedRounds = 0;
-    for (let i = 0; i < ROUNDS; i++) {
-      oldSnapshotByName(data, prod.os_uid, out, (fd) => {
-        unlinkAndPlant();
-        expect(readlinkSync(`/proc/self/fd/${fd}`)).toBe(planted);
-      });
-      if (leaks(out)) leakedRounds++;
+    /** What root (this process) holds open in the branch's data dir right now, by /proc/self/fd. */
+    const heldInData = (into: Set<string>) => {
+      for (const fd of readdirSync("/proc/self/fd")) {
+        let target: string;
+        try {
+          target = readlinkSync(`/proc/self/fd/${fd}`);
+        } catch {
+          continue; // the fd readdir itself used, closed since
+        }
+        if (target.startsWith(`${data}/`)) into.add(target);
+      }
+      return false;
+    };
+    /**
+     * Runs `take` twice with no move: a warm-up (so a drop-in written once is not counted), then to count root's
+     * HostSystem calls, noting what root holds open in data/ at each. Then once with the branch's move before
+     * each of those calls in turn, judging each. Nothing here is a race: the move runs between two of root's
+     * calls, at a place fixed in advance.
+     */
+    const sweep = async (take: () => Promise<unknown>, judge: (at: number) => void): Promise<{ calls: number; held: string[] }> => {
+      await withMoveBefore(() => false, move, take);
       restore();
-    }
-    rmSync(out, { force: true });
-    console.log(`[old by-name read] ${leakedRounds}/${ROUNDS} rounds leaked the registry`);
-    expect(leakedRounds).toBe(ROUNDS);
+      const held = new Set<string>();
+      const { calls } = await withMoveBefore(() => heldInData(held), move, take);
+      restore();
+      expect(calls).toBeGreaterThan(0);
+      for (let at = 1; at <= calls; at++) {
+        expect(await withMoveBefore((_, call) => call === at, move, take)).toEqual({ calls, moves: 1 });
+        judge(at);
+        restore();
+      }
+      return { calls, held: [...held] };
+    };
 
-    // The same setup against snapshotDatabase. With data.db unlinked and the plant in place, there is no
-    // database to snapshot: refused, nothing written.
+    // The old algorithm: every one of its HostSystem calls falls between its pin and SQLite's open, and the move
+    // before any of them makes it read the registry. It leaks the marker at every place.
+    const out = join(ROOT, "old-by-name.db");
+    let opened = "";
+    const leakedAt: number[] = [];
+    const { calls: oldCalls, held: oldHeld } = await sweep(
+      async () => (opened = await oldSnapshotByName(prod, out)),
+      (at) => {
+        expect(opened).toBe(planted);
+        if (leaks(out)) leakedAt.push(at);
+      },
+    );
+    rmSync(out, { force: true });
+    console.log(`[old by-name read] leaked the registry with the move before ${leakedAt.length} of its ${oldCalls} HostSystem calls; held open in data/: ${oldHeld.join(", ")}`);
+    expect(oldCalls).toBeGreaterThanOrEqual(5);
+    expect(leakedAt.length).toBe(oldCalls);
+    expect(oldHeld).toEqual([dataDb()]); // its pin, across every one of those calls
+
+    // snapshotDatabase, the same move before each of its HostSystem calls: always the branch's own data, no secret.
     const dest = join(ctx.layout.branch(prod.id).backups, "pre-deleted.db");
-    unlinkAndPlant();
-    await expect(snapshotDatabase(ctx, prod, dest, { uid: 0, gid: 0, mode: 0o600 })).rejects.toThrow(/has no database to snapshot/);
-    expect(existsSync(dest)).toBe(false);
-    // With the branch's data.db back and the plant still beside it: a real snapshot of the branch's own data.
-    for (const name of readdirSync(data)) if (name !== "data.db (deleted)" && name.startsWith("data.db")) rmSync(join(data, name), { force: true });
-    asBranchJs(prod.os_uid, `fs.copyFileSync(${q(keep)}, ${q(dataDb())})`);
-    expect(readlinkSync(planted)).toBe(ctx.layout.registry);
-    await snapshotDatabase(ctx, prod, dest, { uid: 0, gid: 0, mode: 0o600 });
-    expect(leaks(dest)).toBe(false);
-    expect(isBranchOwn(dest)).toBe(true);
+    const outcomes: string[] = [];
+    const { calls: newCalls, held: newHeld } = await sweep(
+      async () => {
+        rmSync(dest, { force: true });
+        await snapshotDatabase(ctx, prod, dest, owner);
+      },
+      (at) => outcomes.push(leaks(dest) ? `leaked at ${at}` : isBranchOwn(dest) ? "own" : `foreign at ${at}`),
+    );
+    console.log(`[deleted] snapshotDatabase with the move before each of its ${newCalls} HostSystem calls: ${outcomes.filter((o) => o === "own").length} own`);
+    expect(outcomes).toEqual(Array(newCalls).fill("own"));
+    expect(newHeld).toEqual([]); // root never holds anything open in the branch's data dir
     rmSync(dest, { force: true });
+    rmSync(keep, { force: true });
     wipeData(prod);
     seed(prod, "branchdata");
   }, SLOW);

@@ -9,7 +9,9 @@
 // owner, hard link, a file larger than the cap, garbage) and check it is
 // refused without a copy, a hang or a stray temp; check that the by-fd copy
 // keeps holes (a sparse staging file costs root no disk) and gives back the
-// same bytes; that a unit that fails or is killed leaves its staging dir
+// same bytes; that inflating data.db lifts the INCIBASE_MAX_DB_BYTES cap to
+// at most twice the limit while a database really over a lowered limit
+// still snapshots; that a unit that fails or is killed leaves its staging dir
 // empty; that the preflight copy and a restore are made in backups/ and
 // renamed in; and that a restore never opens the entries it moves aside. The
 // race against a real branch uid runs in test/host-snapshot-linux.test.ts.
@@ -346,6 +348,47 @@ describe("snapshotDatabase: the snapshot unit copies as the branch, root takes t
       host.sys.own(path, b.os_uid, b.os_uid, 0o600);
     });
     await expect(snapshotDatabase(host, limited, host.layout.snapshot(limited.id, "pre-1"), ROOT_FILE)).rejects.toThrow(/more than the 10485760 allowed/);
+    expect(strayTemps(host)).toEqual([]);
+  });
+
+  test("inflating data.db lifts the INCIBASE_MAX_DB_BYTES cap to at most twice the limit; a database over a lowered limit still snapshots", async () => {
+    const { host, branch } = await prodBranch();
+    const MiB = 1024 * 1024;
+    const limited = (maxDbBytes: number) => ({ ...branch, limits_json: JSON.stringify({ memoryMax: 512 * MiB, maxDbBytes }) });
+    const dense = (size: number) =>
+      stagingIs(host, (path, b) => {
+        writeFileSync(path, Buffer.concat([sqliteHeader(size), Buffer.alloc(size - 100, 0x41)]));
+        host.sys.own(path, b.os_uid, b.os_uid, 0o600);
+      });
+    const path = seedDatabase(host, branch, 2);
+    // The branch makes its data.db look 2 GiB (a sparse file costs it nothing) and leaves a dense 64 MiB file:
+    // the cap is twice its 8 MiB limit, not the 2 GiB its database seems to be, nor the 100 GiB free.
+    truncateSync(path, 2 * 1024 * MiB);
+    dense(64 * MiB);
+    await expect(snapshotDatabase(host, limited(8 * MiB), host.layout.snapshot(branch.id, "pre-1"), ROOT_FILE)).rejects.toThrow(
+      /is 67108864 bytes, more than the 16777216 allowed; refusing to copy it \(its INCIBASE_MAX_DB_BYTES is 8388608; a database already over it is snapshotted up to 2 times that\)/,
+    );
+    expect(strayTemps(host)).toEqual([]);
+    // A database really over a limit lowered under it: 12 MiB of rows with an 8 MiB limit. Its own size is allowed.
+    rmSync(path);
+    const db = new Database(path, { create: true });
+    db.run("CREATE TABLE docs (id INTEGER PRIMARY KEY, body BLOB)");
+    for (let i = 0; i < 12; i++) db.run("INSERT INTO docs (body) VALUES (randomblob(1024 * 1024))");
+    db.close();
+    host.sys.own(path, branch.os_uid, branch.os_uid, 0o600);
+    host.driver.snapshot = (run) => host.driver.copySnapshot(run);
+    const dest = host.layout.snapshot(branch.id, "pre-2");
+    await snapshotDatabase(host, limited(8 * MiB), dest, ROOT_FILE);
+    expect(statSync(dest).size).toBeGreaterThan(12 * MiB);
+    expect(count(dest)).toBe(12);
+    // More than twice over that limit (a 4 MiB limit): refused, saying it is the limit that holds it.
+    await expect(snapshotDatabase(host, limited(4 * MiB), host.layout.snapshot(branch.id, "pre-3"), ROOT_FILE)).rejects.toThrow(
+      /more than the 8388608 allowed; refusing to copy it \(its INCIBASE_MAX_DB_BYTES is 4194304;/,
+    );
+    // A refusal for any other cap, or for anything else, does not blame the limit.
+    dense(64 * MiB);
+    host.sys.free = 150 * MiB;
+    await expect(snapshotDatabase(host, limited(1024 * MiB), host.layout.snapshot(branch.id, "pre-4"), ROOT_FILE)).rejects.toThrow(/more than the 52428800 allowed; refusing to copy it$/);
     expect(strayTemps(host)).toEqual([]);
   });
 
