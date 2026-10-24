@@ -34,7 +34,7 @@ import * as nginx from "./nginx.ts";
 import * as provision from "./provision.ts";
 import { currentActor, RegistryLockedError, type BranchRow, type Registry, type ReleaseRow, type ServiceKeyRow } from "./registry.ts";
 import { cleanupPreflight, followJob, gateBranch, newGeneration, recoverSwitchedBranch, stageRelease, startJob, type GateResult } from "./release.ts";
-import { branchUrl, cliCondition, recordedRoot, removeIfPresent, rootOnlyDir } from "./render.ts";
+import { branchUrl, cliCondition, cliLinkPlaceFix, recordedRoot, removeIfPresent, rootOnlyDir } from "./render.ts";
 import { setSetting } from "./alerts.ts";
 import { check, ensureCheckTimer } from "./check.ts";
 import { doctor } from "./doctor.ts";
@@ -318,10 +318,11 @@ export function checkCliLinkPlace(ctx: Pick<MachineContext, "layout" | "sys">, m
   const dir = dirname(ctx.layout.cliLink);
   const bad = rootOnlyDir(ctx.sys, dir, missing);
   if (!bad) return;
+  const fix = cliLinkPlaceFix(ctx.sys, bad);
   throw new OpError(
     "CONFLICT",
     `The CLI link ${ctx.layout.cliLink}, which the check timer runs as root, would be in ${dir}, which someone other than root can change: ${bad.path} ${bad.why}. ` +
-      `Make ${bad.path} root's and writable by root alone (chown root:root ${bad.path}; chmod go-w ${bad.path}), or give the host a CLI link in a directory only root can write`,
+      `${fix[0]!.toUpperCase()}${fix.slice(1)}`,
   );
 }
 

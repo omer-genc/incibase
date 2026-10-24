@@ -57,13 +57,15 @@ const REQUIRE_SANDBOX = process.env.INCIBASE_TEST_REQUIRE_SANDBOX === "1";
 const MARKER = ".incibase-test-root";
 const LABEL = basename(ROOT).slice(0, 24);
 const APPS = `/tmp/${LABEL}-apps`;
+const BIN = `/usr/local/lib/${LABEL}-bin`;
 const LAYOUT = {
   unitPrefix: LABEL,
   groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` },
   runtimeRoot: `/usr/local/lib/${LABEL}`,
   systemdDir: "/etc/systemd/system",
-  // What the check service runs, never the machine's own /usr/local/bin/incibase (nothing links it here).
-  cliLink: `${APPS}/bin/incibase`,
+  // What the check service runs, in a directory only root can create or change (never under /tmp, where anyone
+  // could make it again once it is gone), never the machine's own /usr/local/bin/incibase.
+  cliLink: `${BIN}/incibase`,
 };
 const DOMAIN = "incibase.example.net";
 const SLOW = 300_000;
@@ -262,6 +264,7 @@ function cleanup() {
   rmSync(ROOT, { recursive: true, force: true });
   rmSync(LAYOUT.runtimeRoot, { recursive: true, force: true });
   rmSync(APPS, { recursive: true, force: true });
+  rmSync(BIN, { recursive: true, force: true });
 }
 
 // ---- the network probes' targets and controls ----------------------------------

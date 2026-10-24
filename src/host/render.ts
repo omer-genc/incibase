@@ -411,56 +411,49 @@ export interface NotRootOnly {
  * Whether root alone controls what the directory `dir` holds: every
  * directory on the way from /, through the links on the way, root's and
  * writable by no one else, since whoever can write one can rename what is
- * below it and put their own in its place. A sticky one (/tmp) is fine
- * above `dir`, as no one else can rename root's entries in it. With
- * `missing`, a part of the way that does not exist yet is fine when only
- * root can create it. The first part that fails; null when none does.
+ * below it and put their own in its place. Not even a sticky one (/tmp):
+ * no one else can rename root's entries in it, but a unit names the path
+ * long after this check, and once root's entry is gone (a reboot clears
+ * /tmp) anyone can make it again. With `missing`, a part of the way that
+ * does not exist yet is fine when only root can create it. The first part
+ * that fails; null when none does.
  */
 export function rootOnlyDir(sys: HostSystem, dir: string, missing = false): NotRootOnly | null {
   if (!isAbsolute(dir)) return { path: dir, why: "is not an absolute path" };
   const rest = dir.split("/").filter(Boolean);
   let at = "/";
-  let parent = sys.lstat(at);
   let links = 0;
-  const notOnly = (path: string, info: FileInfo | null, last: boolean): string | null => {
+  const notOnly = (info: FileInfo | null): string | null => {
     if (!info) return "does not exist";
     if (info.type !== "dir") return `is a ${info.type}, not a directory`;
     if (info.uid !== 0) return `belongs to uid ${info.uid}, not root`;
-    if ((info.mode & 0o022) !== 0 && (last || (info.mode & 0o1000) === 0)) return "is writable by someone other than root";
+    if ((info.mode & 0o022) !== 0) return "is writable by someone other than root";
     return null;
   };
-  const first = notOnly(at, parent, rest.length === 0);
+  const first = notOnly(sys.lstat(at));
   if (first) return { path: at, why: first };
   while (rest.length) {
     const name = rest.shift()!;
     if (name === ".") continue;
     if (name === "..") {
       at = dirname(at);
-      parent = sys.lstat(at);
       continue;
     }
     const path = join(at, name);
     const info = sys.lstat(path);
-    if (!info && missing) {
-      // Not there yet: only who can write its parent can create it (a sticky parent lets anyone).
-      return (parent!.mode & 0o022) === 0 ? null : { path, why: `does not exist, and someone other than root can create it in ${at}` };
-    }
+    // Not there yet: its parent is root's alone (checked on the way), so only root can create it.
+    if (!info && missing) return null;
     if (info?.type === "symlink") {
-      // In a sticky directory a link's owner can replace it.
       if (info.uid !== 0) return { path, why: `is a link that belongs to uid ${info.uid}, not root` };
       if (++links > MAX_LINKS) return { path, why: `leads through more than ${MAX_LINKS} links` };
       const target = sys.readlink(path) ?? "";
       rest.unshift(...target.split("/").filter(Boolean));
-      if (isAbsolute(target)) {
-        at = "/";
-        parent = sys.lstat(at);
-      }
+      if (isAbsolute(target)) at = "/";
       continue;
     }
-    const why = notOnly(path, info, rest.length === 0);
+    const why = notOnly(info);
     if (why) return { path, why };
     at = path;
-    parent = info;
   }
   return null;
 }
@@ -482,10 +475,47 @@ function follow(sys: HostSystem, path: string): { path: string; info: FileInfo |
  * (stat(), so through every link), so systemd skips its runs. `fix` is what
  * puts it right when `host use-cli` cannot; null when use-cli does.
  */
-export type CliLinkRuntime = { ok: true; version: string } | { ok: false; skipped: boolean; problem: string; fix: string | null };
+export type CliLinkRuntime =
+  | { ok: true; version: string }
+  | {
+      ok: false;
+      skipped: boolean;
+      problem: string;
+      fix: string | null;
+      /** The link's directory, which does not exist yet: root creates it (only root can) before use-cli. */
+      createDir?: string;
+    };
 
 /** "chown root:root <path>; chmod go-w <path>": root's, and writable by root alone. */
 const rootOnlyFix = (path: string) => `chown root:root ${path}; chmod go-w ${path}`;
+
+/**
+ * What puts right a part of the way to the CLI link's directory that root
+ * does not control alone (rootOnlyDir). chown and chmod only for a plain
+ * directory: never a sticky one (go-w would break /tmp for everyone), nor a
+ * link, a file or a path that is not there.
+ */
+export function cliLinkPlaceFix(sys: HostSystem, bad: NotRootOnly): string {
+  const elsewhere = "give the host a CLI link in a directory only root can write";
+  const info = sys.lstat(bad.path);
+  return info?.type === "dir" && (info.mode & 0o1000) === 0 ? `make ${bad.path} root's and writable by root alone (${rootOnlyFix(bad.path)}), or ${elsewhere}` : elsewhere;
+}
+
+/** What makes the installed runtime `version` root's alone (trustedRuntimes), as use-cli needs. */
+export function runtimeFilesFix(layout: HostLayout, version: string): string {
+  const target = layout.runtimeBinary(version);
+  return `make ${target}, ${dirname(target)} and ${layout.runtimeRoot} root's and writable by root alone (${rootOnlyFix(target)}, and the same for the two directories)`;
+}
+
+/**
+ * Whether the runtime `version` is installed (recorded, its binary there)
+ * but not root's alone: use-cli refuses it, and install-runtime of the same
+ * bytes leaves its files as they are, so runtimeFilesFix is what to do.
+ */
+export function untrustedRuntime(ctx: HostContext, version: string): boolean {
+  const { sys, layout, registry } = ctx;
+  return registry.getRuntime(version) !== null && sys.lstat(layout.runtimeBinary(version))?.type === "file" && !trustedRuntimes(ctx).includes(version);
+}
 
 /**
  * What root runs when it runs the CLI link (the check service every 30 s,
@@ -500,15 +530,12 @@ export function cliLinkRuntime(ctx: HostContext): CliLinkRuntime {
   const end = follow(sys, link);
   const skipped = end.info?.type !== "file" || (end.info.mode & 0o111) === 0;
   // Whoever can change its directory can put their own incibase there, linked or not.
-  const dir = rootOnlyDir(sys, dirname(link));
+  const dir = rootOnlyDir(sys, dirname(link), true);
   if (dir) {
-    return {
-      ok: false,
-      skipped,
-      problem: `is in ${dirname(link)}, which someone other than root can change (${dir.path} ${dir.why})`,
-      fix: `make ${dir.path} root's and writable by root alone (${rootOnlyFix(dir.path)}), or give the host a CLI link in a directory only root can write`,
-    };
+    return { ok: false, skipped, problem: `is in ${dirname(link)}, which someone other than root can change (${dir.path} ${dir.why})`, fix: cliLinkPlaceFix(sys, dir) };
   }
+  // Root's alone, but not there yet (a custom layout): root creates it, then use-cli.
+  if (rootOnlyDir(sys, dirname(link))) return { ok: false, skipped: true, problem: `is in ${dirname(link)}, which does not exist`, fix: null, createDir: dirname(link) };
   if (!info) return { ok: false, skipped: true, problem: "does not exist", fix: null };
   if (info.type !== "symlink") {
     const what = info.type === "file" && skipped ? "a file no one can execute" : `a ${info.type}`;
@@ -529,7 +556,7 @@ export function cliLinkRuntime(ctx: HostContext): CliLinkRuntime {
     ok: false,
     skipped,
     problem: `points at ${target}, a runtime in ${layout.runtimeRoot} that someone other than root can change`,
-    fix: `make ${target}, ${dirname(target)} and ${layout.runtimeRoot} root's and writable by root alone (${rootOnlyFix(target)}, and the same for the two directories), or point it at another installed runtime (host use-cli <version>)`,
+    fix: `${runtimeFilesFix(layout, basename(dirname(target)))}, or point it at another installed runtime (host use-cli <version>)`,
   };
 }
 

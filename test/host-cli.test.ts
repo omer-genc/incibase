@@ -3,9 +3,9 @@
 // root requirement, release from stdin, env import, admin-key's two
 // meanings, logs, help; and `incibase tunnel` against a fake ssh on PATH.
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { manifestLine, sha256Hex, type BundleManifest } from "../src/engine/manifest.ts";
 import { VERSION } from "../src/engine/version.ts";
 import { hostedAdminKey } from "../src/cli.ts";
@@ -275,16 +275,25 @@ describe("host", () => {
     s.host.self = [download];
     expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
     expect(s.last().out).toContain(`  check timer: every 30 s, runs ${link} (runtime ${VERSION})\nNext: sudo incibase host add-admin <you>`);
-    // The first init, from a download: no link yet, the runtime not installed.
+    // The first init, from a download: no link yet, the runtime not installed (its file gone).
+    const installed = s.host.layout.runtimeBinary(VERSION);
     s.host.sys.remove(link);
-    s.host.sys.own(s.host.layout.runtimeBinary(VERSION), 1000, 1000);
+    renameSync(installed, `${installed}.away`);
     expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
     expect(s.last().out).toContain(
       `  check timer: waits for ${link} (host use-cli), skipping every run until then\n` +
         `Next: sudo ${download} host install-runtime ${download} --version ${VERSION} --sums SHA256SUMS, then sudo ${download} host use-cli ${VERSION}`,
     );
+    renameSync(`${installed}.away`, installed);
+    // Installed but someone else's: install-runtime of the same bytes would leave it so, and use-cli refuses it.
+    s.host.sys.own(installed, 1000, 1000);
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toContain(
+      `Next: make ${installed}, ${s.host.layout.runtimeDir(VERSION)} and ${s.host.layout.runtimeRoot} root's and writable by root alone ` +
+        `(chown root:root ${installed}; chmod go-w ${installed}, and the same for the two directories), then sudo ${download} host use-cli ${VERSION}`,
+    );
     // Installed: only use-cli is left; a file in the link's place needs --replace.
-    s.host.sys.own(s.host.layout.runtimeBinary(VERSION), 0, 0);
+    s.host.sys.own(installed, 0, 0);
     writeFileSync(link, "#!/bin/sh\n", { mode: 0o755 });
     expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
     expect(s.last().out).toContain(`  check timer: runs ${link}, which is a file, not a link to an installed runtime\nNext: sudo ${download} host use-cli ${VERSION} --replace`);
@@ -300,6 +309,12 @@ describe("host", () => {
     );
     s.host.sys.own(binary, 0, 0);
     s.host.sys.remove(link);
+    // The link's directory not there yet (a custom layout): root creates it first.
+    const dir = dirname(link);
+    rmSync(dir, { recursive: true });
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toContain(`  check timer: waits for ${link} (host use-cli), skipping every run until then\nNext: sudo install -d -m 0755 ${dir}, then sudo ${download} host use-cli ${VERSION}`);
+    s.host.sys.mkdir(dir, 0o755);
     expect(await s.run("host", "init", "--domain", "incibase.example.net", "--no-check-timer")).toBe(0);
     expect(s.last().out).toContain(`  check timer: off\nNext: sudo ${download} host use-cli ${VERSION}`);
   });

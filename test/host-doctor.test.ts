@@ -4,7 +4,7 @@
 // machine is what an Ubuntu 24.04 VM shows, systemd built without the BPF
 // framework included.
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { VERSION } from "../src/engine/version.ts";
 import { runCheck, type CheckContext } from "../src/host/check.ts";
@@ -303,11 +303,19 @@ describe("host doctor", () => {
     expect(detail(missing, "cli link")).toBe(`${link} does not exist: point it at an installed runtime (host use-cli ${VERSION}); until then the check timer skips every run`);
     expect(detail(missing, "check timer")).toBe(`every run of ${checkService} is skipped: ${link} does not exist (see cli link)`);
     expect(missing.ok).toBe(false);
-    // No runtime at all: install one first.
+    // An installed runtime someone else can write: use-cli refuses it and install-runtime of the same bytes leaves it as it is,
+    // so its files are the fix.
     const binary = host.layout.runtimeBinary(VERSION);
     host.sys.own(binary, 0, 0, 0o775);
-    expect(detail(await runDoctor(host), "cli link")).toBe(`${link} does not exist: install a runtime and point it there (host install-runtime, then host use-cli <version>); until then the check timer skips every run`);
+    expect(detail(await runDoctor(host), "cli link")).toBe(
+      `${link} does not exist: make ${binary}, ${host.layout.runtimeDir(VERSION)} and ${host.layout.runtimeRoot} root's and writable by root alone ` +
+        `(chown root:root ${binary}; chmod go-w ${binary}, and the same for the two directories), then point it there (host use-cli ${VERSION}); until then the check timer skips every run`,
+    );
     host.sys.own(binary, 0, 0, 0o755);
+    // No runtime at all (its file gone): install one first.
+    renameSync(binary, `${binary}.away`);
+    expect(detail(await runDoctor(host), "cli link")).toBe(`${link} does not exist: install a runtime and point it there (host install-runtime, then host use-cli <version>); until then the check timer skips every run`);
+    renameSync(`${binary}.away`, binary);
     // With the timer off nothing runs it later: a WARN.
     await host.registry.withLock(() => host.registry.setSetting("check_timer", "off"));
     expect(verdicts(await runDoctor(host))["cli link"]).toBe("WARN");
@@ -375,7 +383,24 @@ describe("host doctor", () => {
     );
     host.sys.own(dir, 0, 0, 0o775);
     expect(detail(await runDoctor(host), "cli link")).toStartWith(`${link} is in ${dir}, which someone other than root can change (${dir} is writable by someone other than root), and root runs it`);
+    // A sticky one is no better (once root's link is gone anyone can put one there), and chmod go-w would break it for everyone.
+    host.sys.own(dir, 0, 0, 0o1777);
+    expect(detail(await runDoctor(host), "cli link")).toBe(
+      `${link} is in ${dir}, which someone other than root can change (${dir} is writable by someone other than root), and root runs it (the check timer, sudo incibase): ` +
+        "give the host a CLI link in a directory only root can write",
+    );
     host.sys.own(dir, 0, 0, 0o755);
+    // Not there yet (a custom layout): root creates it first; only root can.
+    host.sys.remove(link);
+    rmSync(dir, { recursive: true });
+    const absent = await runDoctor(host);
+    expect(verdicts(absent)).toMatchObject({ "cli link": "FAIL", "check timer": "FAIL" });
+    expect(detail(absent, "cli link")).toBe(
+      `${link} is in ${dir}, which does not exist: create ${dir}, root's alone (install -d -m 0755 ${dir}), then point it at an installed runtime (host use-cli ${VERSION}); ` +
+        "until then the check timer skips every run",
+    );
+    host.sys.mkdir(dir, 0o755);
+    await ops.useCli(host, { version: VERSION });
     // A user's grandparent: they rename the parent away and put their own incibase in its place.
     host.sys.own(host.dir, 1000, 1000);
     expect(detail(await runDoctor(host), "cli link")).toBe(

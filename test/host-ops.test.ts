@@ -620,14 +620,18 @@ describe("one machine, one host", () => {
       `The CLI link ${userLink}, which the check timer runs as root, would be in ${users}, which someone other than root can change: ${users} belongs to uid 1000, not root. ` +
         `Make ${users} root's and writable by root alone (chown root:root ${users}; chmod go-w ${users}), or give the host a CLI link in a directory only root can write`,
     );
-    // Not there yet: fine where only root can create it, not in a directory anyone can write (sticky or not).
+    // Not in or under a directory anyone can write, sticky or not: once root's directory in /tmp is gone (a reboot),
+    // anyone could make it again, and the check unit still names the link.
     const shared = join(host.dir, "tmp");
     mkdirSync(shared);
     host.sys.own(shared, 0, 0, 0o1777);
-    expect((await refusedInit(own("t", join(shared, "bin", "incibase")))).message).toContain(`${join(shared, "bin")} does not exist, and someone other than root can create it in ${shared}`);
-    // Above the link's directory, a sticky one is fine: no one else can rename root's directory in it.
+    expect((await refusedInit(own("t", join(shared, "bin", "incibase")))).message).toContain(`${shared} is writable by someone other than root`);
     mkdirSync(join(shared, "bin"));
-    await ops.initHost(own("s", join(shared, "bin", "incibase")), { domain: DOMAIN });
+    // Never chmod go-w for a sticky directory: that would break it for everyone.
+    expect((await refusedInit(own("s", join(shared, "bin", "incibase")))).message).toEndWith(
+      `${shared} is writable by someone other than root. Give the host a CLI link in a directory only root can write`,
+    );
+    // Not there yet: fine where only root can create it.
     await ops.initHost(own("m", join(host.dir, "opt", "bin", "incibase")), { domain: DOMAIN });
     expect(existsSync(join(host.dir, "opt"))).toBe(false);
   });

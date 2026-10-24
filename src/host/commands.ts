@@ -28,7 +28,7 @@ import * as ops from "./ops.ts";
 import { OpError } from "./ops.ts";
 import type { AlertRow, BranchRow, ReleaseRow } from "./registry.ts";
 import { MAX_BUNDLE_BYTES, type GateResult } from "./release.ts";
-import { cliLinkRuntime, trustedRuntimes } from "./render.ts";
+import { cliLinkRuntime, runtimeFilesFix, trustedRuntimes, untrustedRuntime } from "./render.ts";
 import { LinuxSystem } from "./system.ts";
 
 /** A command line that cannot mean anything: exit 2 with the command's usage. */
@@ -390,7 +390,9 @@ function initInput(values: Values) {
  * `host init`'s check timer line and next step. The check service runs the
  * CLI link, which the first init (from a download) cannot have made yet:
  * until it leads to an installed runtime, the next step is install-runtime
- * and use-cli, with this binary as the owner ran it.
+ * and use-cli, with this binary as the owner ran it (after creating the
+ * link's directory, or instead of install-runtime making root's alone a
+ * runtime that is installed but not, when need be).
  */
 function initNext(ctx: OpsContext): string[] {
   const link = ctx.layout.cliLink;
@@ -405,7 +407,10 @@ function initNext(ctx: OpsContext): string[] {
   if (cli.fix) return [timer, `Next: ${cli.fix}`];
   const me = ctx.self.join(" ");
   const binary = ctx.self.length === 1 ? ctx.self[0]! : "<incibase-linux-arch>";
-  const steps = trustedRuntimes(ctx).includes(VERSION) ? [] : [`sudo ${me} host install-runtime ${binary} --version ${VERSION} --sums SHA256SUMS`];
+  const steps = cli.createDir ? [`sudo install -d -m 0755 ${cli.createDir}`] : [];
+  // Installed but not root's alone: install-runtime of the same bytes leaves it as it is, and use-cli refuses it.
+  if (untrustedRuntime(ctx, VERSION)) steps.push(runtimeFilesFix(ctx.layout, VERSION));
+  else if (!trustedRuntimes(ctx).includes(VERSION)) steps.push(`sudo ${me} host install-runtime ${binary} --version ${VERSION} --sums SHA256SUMS`);
   steps.push(`sudo ${me} host use-cli ${VERSION}${ctx.sys.lstat(link)?.type === "file" ? " --replace" : ""}`);
   return [timer, `Next: ${steps.join(", then ")}`];
 }

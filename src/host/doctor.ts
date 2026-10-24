@@ -23,6 +23,7 @@
 // Everything outside the host's own files goes through DoctorHooks, so the
 // macOS tests feed it the machine they want.
 import { lstatSync, readFileSync } from "node:fs";
+import { VERSION } from "../engine/version.ts";
 import { readCheckState, statDisk, type DiskUsage } from "./check.ts";
 import { ALERT_WEBHOOK } from "./alerts.ts";
 import type { OpsContext } from "./context.ts";
@@ -30,7 +31,7 @@ import { printable } from "./driver.ts";
 import { branchRef } from "./names.ts";
 import { OpError } from "./ops.ts";
 import { verifyBranch, verifyHostTree } from "./provision.ts";
-import { checkServiceUnit, cliLinkRuntime, hostRuntime } from "./render.ts";
+import { checkServiceUnit, cliLinkRuntime, hostRuntime, runtimeFilesFix, untrustedRuntime } from "./render.ts";
 import { checkUnitName } from "./systemd.ts";
 import type { FileInfo } from "./system.ts";
 
@@ -397,9 +398,18 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
   else {
     // What use-cli cannot put right (the link's directory, the runtime's files) has a fix of its own.
     const installed = hostRuntime(ctx, null)?.version;
+    // Installed but not root's alone: use-cli refuses it, and install-runtime of the same bytes leaves it as it is.
+    const untrusted = installed ? undefined : untrustedRuntime(ctx, VERSION) ? VERSION : registry.listRuntimes().map((r) => r.version).filter((v) => untrustedRuntime(ctx, v)).sort(Bun.semver.order).at(-1);
     const replace = sys.lstat(link)?.type === "file" ? " --replace" : "";
+    const create = cli.createDir ? `create ${cli.createDir}, root's alone (install -d -m 0755 ${cli.createDir}), then ` : "";
     const fix =
-      cli.fix ?? (installed ? `point it at an installed runtime (host use-cli ${installed}${replace})` : `install a runtime and point it there (host install-runtime, then host use-cli <version>${replace})`);
+      cli.fix ??
+      create +
+        (installed
+          ? `point it at an installed runtime (host use-cli ${installed}${replace})`
+          : untrusted
+            ? `${runtimeFilesFix(layout, untrusted)}, then point it there (host use-cli ${untrusted}${replace})`
+            : `install a runtime and point it there (host install-runtime, then host use-cli <version>${replace})`);
     if (cli.skipped) add("cli link", timerOff ? "WARN" : "FAIL", `${link} ${cli.problem}: ${fix}${timerOff ? "" : "; until then the check timer skips every run"}`);
     else add("cli link", "FAIL", `${link} ${cli.problem}, and root runs it (the check timer, sudo incibase): ${fix}`);
   }

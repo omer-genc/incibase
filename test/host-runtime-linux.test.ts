@@ -28,12 +28,15 @@ const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const MARKER = ".incibase-test-root";
 const LABEL = basename(ROOT).slice(0, 24);
 const APPS = `/tmp/${LABEL}-apps`;
+const BIN = `/usr/local/lib/${LABEL}-bin`;
 const LAYOUT = {
   unitPrefix: LABEL,
   groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` },
   runtimeRoot: `/usr/local/lib/${LABEL}`,
   systemdDir: "/etc/systemd/system",
-  cliLink: `${APPS}/bin/incibase`,
+  // What the check service runs, in a directory only root can create or change (never under /tmp, where anyone
+  // could make it again once it is gone), never the machine's own /usr/local/bin/incibase.
+  cliLink: `${BIN}/incibase`,
 };
 const SECOND = `${VERSION}-r14b`;
 const BROKEN = "0.0.1-broken";
@@ -80,6 +83,7 @@ function cleanup() {
   rmSync(ROOT, { recursive: true, force: true });
   rmSync(LAYOUT.runtimeRoot, { recursive: true, force: true });
   rmSync(APPS, { recursive: true, force: true });
+  rmSync(BIN, { recursive: true, force: true });
 }
 
 /** The example app bundled as `nobody`: bundling runs the app's top-level code, which root never does. */
@@ -121,8 +125,9 @@ describe.skipIf(!enabled)("runtimes on systemd", () => {
     cleanup();
     mkdirSync(ROOT, { mode: 0o755 });
     writeFileSync(join(ROOT, MARKER), "");
-    mkdirSync(join(APPS, "bin"), { recursive: true, mode: 0o755 });
+    mkdirSync(APPS, { mode: 0o755 });
     chmodSync(APPS, 0o755);
+    mkdirSync(BIN, { mode: 0o755 });
     cpSync(BINARY, join(APPS, "incibase"));
     chmodSync(join(APPS, "incibase"), 0o755);
     // A release directory as the workflow makes it.
