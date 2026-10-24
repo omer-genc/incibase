@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { manifestLine, sha256Hex, type BundleManifest } from "../src/engine/manifest.ts";
 import { VERSION } from "../src/engine/version.ts";
 import type { OpsContext } from "../src/host/context.ts";
@@ -21,11 +21,26 @@ export interface TestHost extends HostContext {
 
 const hosts: TestHost[] = [];
 
+/**
+ * A FakeSystem for a host under the temp dir `dir`, to which the dir's
+ * ancestors are root's alone, as /usr/local is on a real host: on Linux
+ * tmpdir() is /tmp, sticky and world-writable, and root refuses to run a
+ * CLI link under it (rootOnlyDir).
+ */
+function fakeSystemIn(dir: string): FakeSystem {
+  const sys = new FakeSystem();
+  for (let at = dirname(dir); ; at = dirname(at)) {
+    const info = sys.lstat(at);
+    if (info?.type === "dir") sys.own(at, 0, 0, info.mode & 0o755);
+    if (at === "/") return sys;
+  }
+}
+
 /** A host on a temp root with a FakeSystem, initialized like `host init` would. */
 export async function fakeHost(init: InitSettings = {}): Promise<TestHost> {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "incibase-host-")));
   const layout = new HostLayout({ root: join(dir, "root") });
-  const sys = new FakeSystem();
+  const sys = fakeSystemIn(dir);
   let t = 1_800_000_000_000;
   const ctx = { layout, sys, now: () => (t += 1000), actor: "root:test" } as HostContext & { sys: FakeSystem };
   sys.mkdir(layout.root, 0o755);
@@ -115,7 +130,7 @@ export async function fakeOpsHost(options: { unitPrefix?: string; cli?: boolean 
     ...(options.unitPrefix ? { unitPrefix: options.unitPrefix } : {}),
   });
   mkdirSync(join(dir, "bin"));
-  const sys = new FakeSystem();
+  const sys = fakeSystemIn(dir);
   const driver = new FakeDriver(layout, sys);
   let t = 1_800_000_000_000;
   const lines: string[] = [];
