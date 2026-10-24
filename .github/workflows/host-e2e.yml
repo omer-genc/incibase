@@ -72,6 +72,7 @@ jobs:
               test/host-runtime-linux.test.ts \
               test/host-isolation.test.ts \
               test/binary-autoload.test.ts \
+              test/host-cli-linux.test.ts \
             2>&1 | tee artifacts/host-e2e.log
 
       - name: host doctor on this machine
