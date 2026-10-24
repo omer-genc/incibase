@@ -1,6 +1,6 @@
 # Değişiklikler
 
-## Unreleased
+## 0.4.0
 
 M1 Faz B: tek sunucuda birden fazla proje ve branch barındıran host katmanı. Tasarım: [docs/m1-mimari.md](docs/m1-mimari.md), kurulum ve işletim rehberi: [docs/host.md](docs/host.md). Tek uygulama `serve`/`dev` değişmedi.
 
@@ -14,6 +14,17 @@ M1 Faz B: tek sunucuda birden fazla proje ve branch barındıran host katmanı. 
 - **Check timer ve alarmlar.** 30 s'de bir health, takılan branch'i öldürme, `failed` unit'i bir kez yeniden deneme, disk eşikleri; alarmlar `host set alert_webhook` ile (ör. ntfy.sh). `host doctor` host'un dayandığı her şeyi OK/WARN/FAIL olarak denetler.
 - **Admin yalnızca SSH ile.** Laptopta `incibase tunnel <project>/<branch> --ssh <host>` dashboard'u ve MCP'yi branch'in admin soketine tüneller; `host add-admin` hesabı admin grubuna ekler.
 - **Sırlar ve servis anahtarları.** `env import … -` sırları stdin'den alır; servis anahtarları yalnızca sha256'larıyla tutulur ve restart'sız iptal edilir.
+- **Check timer CLI link'ini çalıştırır.** `incibase-check.service` `/usr/local/bin/incibase`'i (link'in kendisini) çalıştırır, `host init`'i çalıştıran binary'yi değil; `host use-cli` check'i de yeni sürüme geçirir, kurulumda `use-cli`'dan sonra `host render` gerekmez. Link yokken çalıştırmalar atlanır; `host doctor`'ın yeni `cli link` satırı ve `check timer` satırı bunu FAIL olarak söyler, `host init` sonraki adım olarak `install-runtime` ve `use-cli`'ı yazar.
+- **CLI link'i yalnızca root'un değiştirebileceği bir yerde.** `host use-cli` link'in dizini ya da üstündeki herhangi bir dizin root'tan başkasınca değiştirilebiliyorsa, runtime yalnızca root'un değilse ya da link başka bir host'unsa CONFLICT ile reddeder; `host init` de link'in dizinini aynı şekilde denetler. Herkesin yazabildiği bir dizin sticky olsa da (`/tmp`) kabul edilmez. `host doctor`'ın `cli link` satırı her sorun için kendi düzeltmesini yazar (`use-cli`'ın düzeltemediği bir dizin için `chown`/`chmod`, sticky bir dizin için başka bir yerde link ya da runtime root, henüz olmayan bir link dizini için `install -d`, yalnızca root'un olmayan bir runtime için `host install-runtime --version <sürüm>`); `host init`'in `Next:` satırı da öyle. Runtime root'un üstündeki dizinler de denetlenir.
+- **`host install-runtime` kurulu bir sürümün dosyalarını yeniden root'un yapar.** Dosyaları yalnızca root'un değilse önce dizinleri root'un yapar, sonra binary'nin root'a ait bir kopyası kayıtlı sha256'yla aynıysa onu yerine koyar; değilse kayıtlı baytları yeniden kurar. Elle `chown` başkasının değiştirdiği baytları root'un yapabileceğinden doctor ve `host init` artık bunu önerir. `host use-cli` ve doctor'ın `cli link` satırı da binary'nin baytlarını kayıtlı sha256'yla karşılaştırır.
+- **Bir makinede bir host.** `host init`, layout'unun makine çapındaki dosyaları (unit'ler, nginx config'i ve drop-in'i, runtime root, CLI link) başka bir host root'una aitse hiçbir şey yazmadan CONFLICT ile reddeder; başka bir host'un check unit'inin çalıştırdığı bir CLI link de buna dahildir. Unit'ler ve nginx dosyaları `# host root: <root>` satırı taşır. Bir unit prefix'i (`--layout`'ta `unitPrefix`) tek kelimedir, tire içermez: systemd `incibase-b.slice`'ı `incibase.slice`'ın altına koyardı.
+- **`host set alert_webhook -`** URL'yi (ntfy topic'i bir sırdır) komut satırı yerine stdin'den okur; sudo logunda, journal'da ve `ps`'te görünmez.
+
+### Düzeltilen
+
+- **Standalone binary bulunduğu dizindeki `bunfig.toml`'u ve `.env`'i okumaz.** `sudo incibase …` cwd'yi korur; ev dizinindeki bir `bunfig.toml`'un `preload`'u root olarak çalışıyordu, `.env` de komutu yönlendirebiliyordu. `host install-runtime` kurduğu binary'ye sürümünü `/`'te sorar, böylece cwd'yi hâlâ okuyan eski bir sürüm (0.3.1) kurulurken de oradaki bir `preload` root olarak çalışmaz. Yan etki: standalone binary'yle `incibase serve`/`dev` proje dizinindeki `.env`'i artık kendiliğinden yüklemez.
+- `host init`'in ve `project create`'in `Next:` satırı varsayılan olmayan bir host root'u için `--root <dizin>` yazar ve özel bir CLI link'i olan host'ta komutu o link'le adlandırır. Projesi olan bir host'ta tekrar çalıştırılan `host init` artık `host add-admin` ve `project create` önermez.
+- Çıktıyı okuyan süreç kapanınca (`incibase logs shop/prod | head`) CLI EPIPE yığın izi basmadan 0 ile çıkar ve okuduğu alt süreci (journalctl, tunnel'ın ssh'i) durdurur. Diğer yazma hataları stderr'e yazılır ve 1 ile çıkar. Boruya bağlanan komutlar için geçerli (`host …`, `logs`, `status`, `project`/`branch`/`release`/`env`/`service-key`, `tunnel`); `serve`, `dev`, check servisi (`host check`) ve release job'ları (`host _job`) yazma hatasında eskisi gibi 1 ile çıkar, böylece systemd branch'i yeniden başlatır ve job'u başarısız sayar.
 
 ### Bilinen sınırlar
 

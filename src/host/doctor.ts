@@ -11,14 +11,19 @@
 // The check timer is judged by what its runs leave behind (the check cannot
 // alert about itself): a failed check service, or no completed run for two
 // minutes, is a FAIL; so are alerts waiting more than 5 minutes to reach the
-// webhook. The journal's effective Storage= comes from journald.conf and its
-// drop-ins. The probe is incibase's own script run by an
-// installed runtime (BUN_BE_BUN=1 makes the standalone binary act as bun);
-// root runs no tenant code.
+// webhook. So is a check unit other than the one this incibase renders, and
+// a missing CLI link (what the check service runs): systemd then skips every
+// run, and a skipped run is no failure. A CLI link that leads anywhere but a
+// trusted installed runtime FAILs on its own line, as root runs it. The
+// journal's effective Storage= comes from journald.conf and its drop-ins.
+// The probe is incibase's own script run by an installed runtime
+// (BUN_BE_BUN=1 makes the standalone binary act as bun); root runs no tenant
+// code.
 //
 // Everything outside the host's own files goes through DoctorHooks, so the
 // macOS tests feed it the machine they want.
 import { lstatSync, readFileSync } from "node:fs";
+import { VERSION } from "../engine/version.ts";
 import { readCheckState, statDisk, type DiskUsage } from "./check.ts";
 import { ALERT_WEBHOOK } from "./alerts.ts";
 import type { OpsContext } from "./context.ts";
@@ -26,7 +31,8 @@ import { printable } from "./driver.ts";
 import { branchRef } from "./names.ts";
 import { OpError } from "./ops.ts";
 import { verifyBranch, verifyHostTree } from "./provision.ts";
-import { hostRuntime } from "./render.ts";
+import { checkServiceUnit, cliLinkRuntime, hostRuntime, runtimeFix, untrustedRuntime } from "./render.ts";
+import { sha256File } from "./runtime.ts";
 import { checkUnitName } from "./systemd.ts";
 import type { FileInfo } from "./system.ts";
 
@@ -381,14 +387,55 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
     add("disk", "WARN", `cannot read the free space: ${printable((err as Error).message, 200)}`);
   }
 
-  // the check and its alerts
+  // the CLI link (what the check service runs), the check and its alerts
   const at = (ctx.now ?? Date.now)();
   const checkState = readCheckState(ctx);
   const { checkService, checkTimer } = layout.units;
   const ago = (t: number) => `${Math.max(0, Math.round((at - t) / 1000))} s ago`;
-  if (registry.getSetting("check_timer") === "off") add("check timer", "WARN", "turned off (check_timer = off): nothing kills a stalled branch or raises alerts");
-  else if (!ctx.driver.isActive(checkTimer)) add("check timer", "WARN", `${checkTimer} is not running (incibase host render starts it)`);
+  const timerOff = registry.getSetting("check_timer") === "off";
+  const link = layout.cliLink;
+  const cli = cliLinkRuntime(ctx);
+  // Root's alone now, which says nothing of the time it was not (chowned back by hand): the recorded bytes too.
+  const recorded = cli.ok ? registry.getRuntime(cli.version)?.sha256 : undefined;
+  const found = cli.ok && recorded !== undefined ? await sha256File(layout.runtimeBinary(cli.version)).then((r) => r.sha256, () => "(unreadable)") : recorded;
+  if (cli.ok && found !== recorded) {
+    add(
+      "cli link",
+      "FAIL",
+      `${link} runs ${layout.runtimeBinary(cli.version)}, which has sha256 ${found}, not ${recorded} as the runtime ${cli.version} was installed with: ` +
+        `put the recorded bytes back (host install-runtime --version ${cli.version})`,
+    );
+  } else if (cli.ok) add("cli link", "OK", `${link} runs the installed runtime ${cli.version}`);
   else {
+    // What use-cli cannot put right (the link's directory, the runtime's files) has a fix of its own.
+    const installed = hostRuntime(ctx, null)?.version;
+    // Installed but not trusted: use-cli refuses it until runtimeFix.
+    const untrusted = installed ? undefined : untrustedRuntime(ctx, VERSION) ? VERSION : registry.listRuntimes().map((r) => r.version).filter((v) => untrustedRuntime(ctx, v)).sort(Bun.semver.order).at(-1);
+    const replace = sys.lstat(link)?.type === "file" ? " --replace" : "";
+    const create = cli.createDir ? `create ${cli.createDir}, root's alone (install -d -m 0755 ${cli.createDir}), then ` : "";
+    const fix =
+      cli.fix ??
+      create +
+        (installed
+          ? `point it at an installed runtime (host use-cli ${installed}${replace})`
+          : untrusted
+            ? `${runtimeFix(sys, layout, untrusted)}, then point it there (host use-cli ${untrusted}${replace})`
+            : `install a runtime and point it there (host install-runtime, then host use-cli <version>${replace})`);
+    if (cli.skipped) add("cli link", timerOff ? "WARN" : "FAIL", `${link} ${cli.problem}: ${fix}${timerOff ? "" : "; until then the check timer skips every run"}`);
+    else add("cli link", "FAIL", `${link} ${cli.problem}, and root runs it (the check timer, sudo incibase): ${fix}`);
+  }
+  const unitFile = layout.unitFile(checkService);
+  const rendered = sys.lstat(unitFile)?.type === "file" ? sys.readFile(unitFile) : null;
+  if (timerOff) add("check timer", "WARN", "turned off (check_timer = off): nothing kills a stalled branch or raises alerts");
+  else if (!ctx.driver.isActive(checkTimer)) add("check timer", "WARN", `${checkTimer} is not running (incibase host render starts it)`);
+  else if (rendered !== checkServiceUnit(layout)) {
+    // One an older incibase rendered ran the binary host init ran from, often a download its owner can replace.
+    const exec = rendered === null ? null : /^ExecStart=(.*)$/m.exec(rendered)?.[1];
+    add("check timer", "FAIL", `${unitFile} ${rendered === null ? "is missing" : `is not what this incibase renders${exec ? ` (it runs ${printable(exec, 200)})` : ""}`}: incibase host render writes it`);
+  } else if (!cli.ok && cli.skipped) {
+    // systemd skips the run (ConditionFileIsExecutable): the service stays inactive, never failed, and no check completes.
+    add("check timer", "FAIL", `every run of ${checkService} is skipped: ${link} ${cli.problem} (see cli link)`);
+  } else {
     const service = ctx.driver.show(checkService);
     const last = checkState.lastRunAt;
     if (service.activeState === "failed") {
@@ -404,7 +451,7 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
   } catch {
     // Reported below as not set.
   }
-  if (!webhookHost) add("alerts", "WARN", "no alert_webhook: alerts only show in incibase host status (incibase host set alert_webhook https://ntfy.sh/<topic>)");
+  if (!webhookHost) add("alerts", "WARN", "no alert_webhook: alerts only show in incibase host status (sudo incibase host set alert_webhook - --test, with https://ntfy.sh/<topic> on stdin)");
   else {
     const delivery = checkState.delivery;
     const lastError = delivery && !delivery.ok && !delivery.unconfigured ? printable(delivery.error ?? "failed", 300) : null;

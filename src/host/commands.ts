@@ -13,19 +13,23 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { parseDrainTimeout } from "../engine/drain.ts";
+import { stopWithOutput } from "../engine/output.ts";
 import { parseTimeouts } from "../engine/timeouts.ts";
+import { VERSION } from "../engine/version.ts";
 import { MiB, parseSize, resolveLimits, type BranchConfig, type BranchLimits } from "./config.ts";
 import { openHost, type OpsContext } from "./context.ts";
 import { ALERT_WEBHOOK } from "./alerts.ts";
 import { formatDoctor } from "./doctor.ts";
 import { printable } from "./driver.ts";
-import { DEFAULT_ROOT, HostLayout, type LayoutOptions } from "./layout.ts";
+import { DEFAULT_CLI_LINK, DEFAULT_ROOT, HostLayout, type LayoutOptions } from "./layout.ts";
 import { BRANCH_KINDS, branchRef, checkProjectSlug, NameError, parseBranchRef } from "./names.ts";
 import { TRUST_PROXY } from "./nginx.ts";
 import * as ops from "./ops.ts";
 import { OpError } from "./ops.ts";
 import type { AlertRow, BranchRow, ReleaseRow } from "./registry.ts";
 import { MAX_BUNDLE_BYTES, type GateResult } from "./release.ts";
+import { cliLinkRuntime, runtimeRootPlaceFix, trustedRuntimes } from "./render.ts";
+import { LinuxSystem } from "./system.ts";
 
 /** A command line that cannot mean anything: exit 2 with the command's usage. */
 export class UsageError extends Error {
@@ -71,7 +75,7 @@ export const processIO: CommandIO = {
     let total = 0;
     for await (const chunk of Bun.stdin.stream()) {
       total += chunk.byteLength;
-      if (total > maxBytes) throw new OpError("INVALID", `stdin is larger than ${Math.floor(maxBytes / MiB)} MiB`);
+      if (total > maxBytes) throw new OpError("INVALID", `stdin is larger than ${maxBytes >= MiB ? `${Math.floor(maxBytes / MiB)} MiB` : `${maxBytes} bytes`}`);
       chunks.push(chunk);
     }
     return Buffer.concat(chunks);
@@ -79,7 +83,10 @@ export const processIO: CommandIO = {
   isRoot: () => process.getuid?.() === 0,
   open({ create, ...options }) {
     // Registry.open creates a registry where there is none: a mistyped --root would become an empty host.
-    if (!create && !existsSync(new HostLayout({ root: options.root }).registry)) throw notSetUp(options.root);
+    const fresh = !existsSync(new HostLayout({ root: options.root }).registry);
+    if (!create && fresh) throw notSetUp(options.root);
+    // A host init its layout refuses (ops.checkInitLayout) leaves no registry behind either.
+    if (fresh) ops.checkInitLayout({ layout: new HostLayout({ root: options.root, ...options.layout }), sys: new LinuxSystem() });
     const ctx = openHost(options);
     if (!create && ctx.registry.savedLayout() === null) {
       ctx.registry.close();
@@ -91,9 +98,12 @@ export const processIO: CommandIO = {
     // Ctrl-C on `logs -f` reaches journalctl too (one process group); this process waits for it to end.
     const ignore = () => {};
     process.on("SIGINT", ignore);
+    let forget = () => {};
     try {
       // Its output is the tenant's, so it never reaches the terminal unread (escape sequences): see logs.
       const child = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "pipe", env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LC_ALL: "C.UTF-8", SYSTEMD_COLORS: "0" } });
+      // `logs -f | head`: once head exits, this process does (output.ts), and journalctl with it.
+      forget = stopWithOutput(child);
       const stderr = (async () => {
         let text = "";
         for await (const chunk of child.stderr.pipeThrough(new TextDecoderStream())) if (text.length < MAX_STDERR) text += chunk;
@@ -112,6 +122,7 @@ export const processIO: CommandIO = {
       if (rest) line(rest);
       return { code: await child.exited, stderr: await stderr };
     } finally {
+      forget();
       process.off("SIGINT", ignore);
     }
   },
@@ -375,6 +386,52 @@ function initInput(values: Values) {
   };
 }
 
+/**
+ * `host init`'s check timer line and next step. The check service runs the
+ * CLI link, which the first init (from a download) cannot have made yet:
+ * until it leads to an installed runtime, the next step is install-runtime
+ * and use-cli, with this binary as the owner ran it (after creating the
+ * link's directory, or instead of install-runtime making root's alone a
+ * runtime that is installed but not, when need be).
+ */
+function initNext(ctx: OpsContext, root: string): string[] {
+  const link = ctx.layout.cliLink;
+  const cli = cliLinkRuntime(ctx);
+  const off = ctx.registry.getSetting("check_timer") === "off";
+  if (cli.ok) {
+    const timer = `  check timer: ${off ? "off" : `every 30 s, runs ${link} (runtime ${cli.version})`}`;
+    // Run again on a host in use: nothing is next.
+    if (ctx.registry.listProjects().length) return [timer];
+    return [timer, `Next: ${sudoCli(ctx, root, "host add-admin <you>")}, then ${sudoCli(ctx, root, "project create <slug>")}`];
+  }
+  const state = cli.skipped && !cli.fix ? `waits for ${link} (host use-cli), skipping every run until then` : `${cli.skipped ? "skips every run of" : "runs"} ${link}, which ${cli.problem}`;
+  const timer = `  check timer: ${off ? "off" : state}`;
+  // The link's directory or the runtime's files: use-cli would only make the same link again.
+  if (cli.fix) return [timer, `Next: ${cli.fix}`];
+  const me = ctx.self.join(" ");
+  const binary = ctx.self.length === 1 ? ctx.self[0]! : "<incibase-linux-arch>";
+  const steps = cli.createDir ? [`sudo install -d -m 0755 ${cli.createDir}`] : [];
+  // No runtime is trusted while the way to the runtime root is not root's alone.
+  const place = runtimeRootPlaceFix(ctx.sys, ctx.layout);
+  if (place) steps.push(place);
+  // Not installed, or installed but not root's alone: install-runtime installs it, or makes its files root's alone again.
+  if (!trustedRuntimes(ctx).includes(VERSION)) steps.push(`sudo ${me} host install-runtime ${binary} --version ${VERSION} --sums SHA256SUMS${rootFlag(root)}`);
+  steps.push(`sudo ${me} host use-cli ${VERSION}${ctx.sys.lstat(link)?.type === "file" ? " --replace" : ""}${rootFlag(root)}`);
+  return [timer, `Next: ${steps.join(", then ")}`];
+}
+
+/** ` --root <root>` unless it is the default: sudo drops $INCIBASE_HOST_ROOT, and the layout comes from the root. */
+const rootFlag = (root: string) => (root === DEFAULT_ROOT ? "" : ` --root ${root}`);
+
+/**
+ * A command a Next: line names, as the owner types it: through this host's
+ * CLI link (`incibase` for the machine's own), with --root when need be.
+ */
+function sudoCli(ctx: OpsContext, root: string, command: string): string {
+  const cli = ctx.layout.cliLink === DEFAULT_CLI_LINK ? "incibase" : ctx.layout.cliLink;
+  return `sudo ${cli} ${command}${rootFlag(root)}`;
+}
+
 /** `host set <key> <value>`, checked: which setting, and its value. */
 function hostSetting(args: string[], values: Values): { key: "alert_webhook"; value: string | null } | { key: "trust_proxy"; value: (typeof TRUST_PROXY)[number] } | { key: "https_port"; value: number } {
   const [key, value] = args as [string, string];
@@ -386,6 +443,28 @@ function hostSetting(args: string[], values: Values): { key: "alert_webhook"; va
   }
   if (key === "https_port") return { key, value: int("https_port", value, 1, 65535)! };
   throw new UsageError(`Unknown setting ${JSON.stringify(key)}: use alert_webhook, trust_proxy or https_port`);
+}
+
+/** The most `host set alert_webhook -` reads: a URL (at most 2048 characters) and a line break. */
+const MAX_WEBHOOK_STDIN = 4096;
+
+/**
+ * `host set alert_webhook -`: the URL from stdin, so the topic (its secret)
+ * stays out of the sudo log, the journal and ps. One line, trimmed; the
+ * value itself is checked like one from the command line.
+ */
+async function webhookFromStdin(io: CommandIO): Promise<string> {
+  const bytes = await io.readStdin(MAX_WEBHOOK_STDIN);
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new OpError("INVALID", "stdin is not UTF-8 text");
+  }
+  const lines = text.split(/\r?\n/).filter((line) => line.trim());
+  if (!lines.length) throw new OpError("INVALID", "stdin is empty: pipe the URL in, e.g. < ntfy-url.txt ('' removes the setting)");
+  if (lines.length > 1) throw new OpError("INVALID", "stdin has more than one line: give just the URL");
+  return lines[0]!.trim();
 }
 
 /** `branch set`'s flags: the limits, settings and protection to change. */
@@ -436,7 +515,7 @@ const SPECS: Spec[] = [
       "tunnel-port-base": { type: "string", value: "<n>", help: "The first laptop port for incibase tunnel (default 7101)" },
       "slice-memory": { type: "string", value: "<size>", help: "MemoryMax of all branches together (default: the machine's memory less 1G)" },
       "no-check-timer": { type: "boolean", help: "Do not run host check every 30 s" },
-      layout: { type: "string", value: "<json>", help: "Unit prefix, groups and directories of a second host on one machine (tests)" },
+      layout: { type: "string", value: "<json>", help: "The unit prefix, groups, runtime root and CLI link a second host on one machine needs of its own (tests)" },
     },
     layout(values) {
       const text = str(values, "layout");
@@ -459,7 +538,7 @@ const SPECS: Spec[] = [
           front
             ? `  front door: ${front.certificate ? `certificate ${clean((front.certificate as { sha256?: string }).sha256 ?? "installed")}, ` : ""}nginx ${front.nginx.skipped ? `skipped (${clean(front.nginx.skipped)})` : (front.nginx.action ?? "unchanged")}`
             : "  front door: not configured yet (pass --tls-cert and --tls-key)",
-          `Next: sudo incibase host add-admin <you>, then sudo incibase project create <slug>`,
+          ...initNext(ctx, root),
         ],
       };
     },
@@ -602,13 +681,13 @@ const SPECS: Spec[] = [
         ...(values.sha256 === undefined ? {} : { sha256: str(values, "sha256") }),
         skipVersionCheck: bool(values, "skip-version-check"),
       });
-      return { json: r, text: [`${r.installed ? "Installed" : "Already installed:"} runtime ${r.version} at ${r.path} (sha256 ${r.sha256.slice(0, 16)}...)`] };
+      return { json: r, text: [`${r.installed ? "Installed" : r.repaired ? "Already installed, its files made root's alone again:" : "Already installed:"} runtime ${r.version} at ${r.path} (sha256 ${r.sha256.slice(0, 16)}...)`] };
     },
   },
   {
     path: ["host", "use-cli"],
     args: "<version>",
-    summary: "Point /usr/local/bin/incibase at an installed runtime",
+    summary: "Point /usr/local/bin/incibase, which the check timer runs, at an installed runtime",
     positionals: [1, 1],
     flags: { replace: { type: "boolean", help: "Replace a file that is not a link (an incibase copied there by hand)" } },
     async run({ ctx, values, args }) {
@@ -635,15 +714,20 @@ const SPECS: Spec[] = [
   {
     path: ["host", "set"],
     args: "<key> <value>",
-    summary: "Change a host setting: alert_webhook <https url|''>, trust_proxy <none|cloudflare>, https_port <n>",
+    summary: "Change a host setting: alert_webhook <-|https url|''>, trust_proxy <none|cloudflare>, https_port <n>",
     positionals: [2, 2],
     flags: { test: { type: "boolean", help: "alert_webhook: send a test notification" } },
-    details: "alert_webhook is where alerts go, e.g. an ntfy.sh topic; '' removes it.",
+    details:
+      "alert_webhook is where alerts go, e.g. an ntfy.sh topic; '' removes it. The topic is a secret: with -\n" +
+      "the URL is read from stdin (one line), not the command line, which the sudo log, the journal and ps show:\n" +
+      "  sudo incibase host set alert_webhook - --test < ntfy-url.txt\n" +
+      "or run it without < and type the URL, then Enter and Ctrl-D.",
     check: (values, args) => void hostSetting(args, values),
-    async run({ ctx, values, args }) {
+    async run({ ctx, values, args, io }) {
       const setting = hostSetting(args, values);
       if (setting.key === "alert_webhook") {
-        const r = await ops.setSetting(ctx, { key: setting.key, value: setting.value, test: bool(values, "test") });
+        const value = setting.value === "-" ? await webhookFromStdin(io) : setting.value;
+        const r = await ops.setSetting(ctx, { key: setting.key, value, test: bool(values, "test") });
         return { json: r, text: [r.set ? `alert_webhook set (${clean(r.host)})${r.tested ? "; the test notification was sent" : ""}` : "alert_webhook removed"] };
       }
       if (setting.key === "trust_proxy") {
@@ -687,7 +771,7 @@ const SPECS: Spec[] = [
       name: { type: "string", value: "<text>", help: "A display name (default the slug)" },
     },
     check: (_values, args) => void checkProjectSlug(args[0]),
-    async run({ ctx, values, args }) {
+    async run({ ctx, values, args, root }) {
       const list = str(values, "branches");
       const branches = list === undefined ? undefined : list.split(",").map((b) => b.trim()).filter(Boolean);
       const r = await ops.createProject(ctx, { slug: checkProjectSlug(args[0]), ...(str(values, "name") ? { name: str(values, "name") } : {}), ...(branches ? { branches } : {}) });
@@ -697,7 +781,7 @@ const SPECS: Spec[] = [
         text: [
           `Created project ${r.project.slug}${r.branches.length ? ":" : " (no branches)"}`,
           ...r.branches.map((b) => `  ${branchRef(b.project, b.name).padEnd(24)} ${b.kind.padEnd(7)} ${domain ? `https://${b.label}.${domain}` : b.label}`),
-          ...(r.branches.length ? [`Next: incibase bundle --out app.ib, copy it here, then sudo incibase release add ${branchRef(r.project.slug, r.branches[0]!.name)} app.ib`] : []),
+          ...(r.branches.length ? [`Next: incibase bundle --out app.ib, copy it here, then ${sudoCli(ctx, root, `release add ${branchRef(r.project.slug, r.branches[0]!.name)} app.ib`)}`] : []),
         ],
       };
     },
@@ -707,9 +791,9 @@ const SPECS: Spec[] = [
     args: "",
     summary: "The projects and their branches",
     positionals: [0, 0],
-    async run({ ctx }) {
+    async run({ ctx, root }) {
       const r = await ops.listProjects(ctx);
-      return { json: r, text: r.length ? table(["PROJECT", "NAME", "CREATED", "BRANCHES"], r.map((p) => [p.slug, p.name, formatTime(p.created_at), p.branches.join(", ") || "-"])) : ["No projects yet: sudo incibase project create <slug>"] };
+      return { json: r, text: r.length ? table(["PROJECT", "NAME", "CREATED", "BRANCHES"], r.map((p) => [p.slug, p.name, formatTime(p.created_at), p.branches.join(", ") || "-"])) : [`No projects yet: ${sudoCli(ctx, root, "project create <slug>")}`] };
     },
   },
   {

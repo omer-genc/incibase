@@ -4,7 +4,10 @@
 // machine is what an Ubuntu 24.04 VM shows, systemd built without the BPF
 // framework included.
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { sha256Hex } from "../src/engine/manifest.ts";
+import { VERSION } from "../src/engine/version.ts";
 import { runCheck, type CheckContext } from "../src/host/check.ts";
 import {
   ALERT_DELIVERY_GRACE_MS,
@@ -121,9 +124,11 @@ describe("host doctor", () => {
       sshd: "OK",
       time: "OK",
       disk: "OK",
+      "cli link": "OK",
       "check timer": "OK",
       alerts: "OK",
     });
+    expect(detail(report, "cli link")).toBe(`${host.layout.cliLink} runs the installed runtime ${VERSION}`);
     expect(detail(report, "alerts")).toBe("alerts go to ntfy.sh");
     expect(detail(report, "check timer")).toBe("incibase-check.timer runs the check every 30 s; the last one completed 10 s ago");
     expect(detail(report, "journald")).toBe("persistent storage (Storage=auto, /var/log/journal)");
@@ -285,6 +290,151 @@ describe("host doctor", () => {
     // A timer that runs but has not completed a check yet.
     rmSync(host.layout.checkState);
     expect(detail(await runDoctor(host), "check timer")).toBe("incibase-check.timer runs, but no check has completed yet");
+  });
+
+  test("cli link: the check service runs it, so one that is missing (every run skipped) or leads anywhere but an installed runtime FAILs", async () => {
+    const host = await doctorHost();
+    host.doctor = machine();
+    const link = host.layout.cliLink;
+    const { checkService } = host.layout.units;
+    // Before host use-cli, systemd skips each run (ConditionFileIsExecutable): nothing fails, nothing is checked either.
+    host.sys.remove(link);
+    const missing = await runDoctor(host);
+    expect(verdicts(missing)).toMatchObject({ "cli link": "FAIL", "check timer": "FAIL" });
+    expect(detail(missing, "cli link")).toBe(`${link} does not exist: point it at an installed runtime (host use-cli ${VERSION}); until then the check timer skips every run`);
+    expect(detail(missing, "check timer")).toBe(`every run of ${checkService} is skipped: ${link} does not exist (see cli link)`);
+    expect(missing.ok).toBe(false);
+    // An installed runtime someone else can write: use-cli refuses it, and install-runtime (never chown: they may have changed it)
+    // makes it root's alone again once its bytes are the recorded ones.
+    const binary = host.layout.runtimeBinary(VERSION);
+    host.sys.own(binary, 0, 0, 0o775);
+    expect(detail(await runDoctor(host), "cli link")).toBe(
+      `${link} does not exist: install it again (host install-runtime --version ${VERSION}), which makes its files root's alone, ` +
+        `then point it there (host use-cli ${VERSION}); until then the check timer skips every run`,
+    );
+    host.sys.own(binary, 0, 0, 0o755);
+    // No runtime at all (its file gone): install one first.
+    renameSync(binary, `${binary}.away`);
+    expect(detail(await runDoctor(host), "cli link")).toBe(`${link} does not exist: install a runtime and point it there (host install-runtime, then host use-cli <version>); until then the check timer skips every run`);
+    renameSync(`${binary}.away`, binary);
+    // With the timer off nothing runs it later: a WARN.
+    await host.registry.withLock(() => host.registry.setSetting("check_timer", "off"));
+    expect(verdicts(await runDoctor(host))["cli link"]).toBe("WARN");
+    expect(detail(await runDoctor(host), "cli link")).toBe(`${link} does not exist: point it at an installed runtime (host use-cli ${VERSION})`);
+    await host.registry.withLock(() => host.registry.setSetting("check_timer", "on"));
+    // A link to nothing is skipped as well (path conditions follow links), and so is a directory.
+    symlinkSync(join(host.dir, "gone"), link);
+    expect(detail(await runDoctor(host), "check timer")).toBe(`every run of ${checkService} is skipped: ${link} points at ${join(host.dir, "gone")}, which does not exist (see cli link)`);
+    host.sys.remove(link);
+    host.sys.mkdir(link, 0o755);
+    expect(verdicts(await runDoctor(host))).toMatchObject({ "cli link": "FAIL", "check timer": "FAIL" });
+    expect(detail(await runDoctor(host), "check timer")).toBe(`every run of ${checkService} is skipped: ${link} is a dir, not a link to an installed runtime (see cli link)`);
+    // A file in its place (a download copied there) is what root runs: the check does run, the link FAILs.
+    host.sys.remove(link);
+    writeFileSync(link, "#!/bin/sh\n", { mode: 0o755 });
+    const file = await runDoctor(host);
+    expect(verdicts(file)).toMatchObject({ "cli link": "FAIL", "check timer": "OK" });
+    expect(detail(file, "cli link")).toBe(
+      `${link} is a file, not a link to an installed runtime, and root runs it (the check timer, sudo incibase): point it at an installed runtime (host use-cli ${VERSION} --replace)`,
+    );
+    // What systemd's ConditionFileIsExecutable skips (stat(), every link followed): no executable regular file at the end.
+    const skips = async (what: string, problem: string) => {
+      const report = await runDoctor(host);
+      expect(verdicts(report), what).toMatchObject({ "cli link": "FAIL", "check timer": "FAIL" });
+      expect(detail(report, "check timer"), what).toBe(`every run of ${checkService} is skipped: ${link} ${problem} (see cli link)`);
+    };
+    chmodSync(link, 0o644);
+    await skips("a file no one can execute", "is a file no one can execute, not a link to an installed runtime");
+    host.sys.remove(link);
+    const inner = join(host.dir, "inner");
+    symlinkSync(join(host.dir, "gone"), inner);
+    symlinkSync(inner, link);
+    await skips("a link to a link to nothing", `points at ${inner}, which leads to ${join(host.dir, "gone")}, where there is nothing`);
+    host.sys.remove(link);
+    symlinkSync(host.layout.runtimeDir(VERSION), link);
+    await skips("a link to a directory", `points at ${host.layout.runtimeDir(VERSION)}, which is a dir`);
+    host.sys.remove(link);
+    const plain = join(host.dir, "plain");
+    writeFileSync(plain, "", { mode: 0o644 });
+    symlinkSync(plain, link);
+    await skips("a link to a file no one can execute", `points at ${plain}, which is a file no one can execute`);
+    // A link to a file someone else may own: the binary install-runtime copied from.
+    host.sys.remove(link);
+    symlinkSync(join(host.dir, "incibase-bin"), link);
+    expect(detail(await runDoctor(host), "cli link")).toBe(
+      `${link} points at ${join(host.dir, "incibase-bin")}, not at a runtime installed in ${host.layout.runtimeRoot} that only root can write, and root runs it (the check timer, sudo incibase): point it at an installed runtime (host use-cli ${VERSION})`,
+    );
+    // An installed runtime someone else can write is no better, and use-cli would only link it again: its files are the fix.
+    await ops.useCli(host, { version: VERSION });
+    host.sys.own(binary, 1000, 1000, 0o755);
+    const runtime = await runDoctor(host);
+    expect(verdicts(runtime)["cli link"]).toBe("FAIL");
+    expect(detail(runtime, "cli link")).toBe(
+      `${link} points at ${binary}, a runtime in ${host.layout.runtimeRoot} that someone other than root can change, and root runs it (the check timer, sudo incibase): ` +
+        `install it again (host install-runtime --version ${VERSION}), which makes its files root's alone, ` +
+        "or point it at another installed runtime (host use-cli <version>)",
+    );
+    // Root's alone again, chowned back by hand after someone else could write it: the bytes must be the recorded ones too.
+    host.sys.own(binary, 0, 0, 0o755);
+    const recorded = readFileSync(binary);
+    writeFileSync(binary, "#!/bin/sh\necho theirs\n");
+    expect(verdicts(await runDoctor(host))["cli link"]).toBe("FAIL");
+    expect(detail(await runDoctor(host), "cli link")).toBe(
+      `${link} runs ${binary}, which has sha256 ${sha256Hex("#!/bin/sh\necho theirs\n")}, not ${host.registry.getRuntime(VERSION)!.sha256} as the runtime ${VERSION} was installed with: ` +
+        `put the recorded bytes back (host install-runtime --version ${VERSION})`,
+    );
+    writeFileSync(binary, recorded);
+    expect(verdicts(await runDoctor(host))["cli link"]).toBe("OK");
+    // Nor is a link others can replace: its directory, or any directory above it, someone else can change.
+    const dir = dirname(link);
+    const dirFix = (path: string) => `make ${path} root's and writable by root alone (chown root:root ${path}; chmod go-w ${path}), or give the host a CLI link in a directory only root can write`;
+    host.sys.own(dir, 1000, 1000);
+    expect(detail(await runDoctor(host), "cli link")).toBe(
+      `${link} is in ${dir}, which someone other than root can change (${dir} belongs to uid 1000, not root), and root runs it (the check timer, sudo incibase): ${dirFix(dir)}`,
+    );
+    host.sys.own(dir, 0, 0, 0o775);
+    expect(detail(await runDoctor(host), "cli link")).toStartWith(`${link} is in ${dir}, which someone other than root can change (${dir} is writable by someone other than root), and root runs it`);
+    // A sticky one is no better (once root's link is gone anyone can put one there), and chmod go-w would break it for everyone.
+    host.sys.own(dir, 0, 0, 0o1777);
+    expect(detail(await runDoctor(host), "cli link")).toBe(
+      `${link} is in ${dir}, which someone other than root can change (${dir} is writable by someone other than root), and root runs it (the check timer, sudo incibase): ` +
+        "give the host a CLI link in a directory only root can write",
+    );
+    host.sys.own(dir, 0, 0, 0o755);
+    // Not there yet (a custom layout): root creates it first; only root can.
+    host.sys.remove(link);
+    rmSync(dir, { recursive: true });
+    const absent = await runDoctor(host);
+    expect(verdicts(absent)).toMatchObject({ "cli link": "FAIL", "check timer": "FAIL" });
+    expect(detail(absent, "cli link")).toBe(
+      `${link} is in ${dir}, which does not exist: create ${dir}, root's alone (install -d -m 0755 ${dir}), then point it at an installed runtime (host use-cli ${VERSION}); ` +
+        "until then the check timer skips every run",
+    );
+    host.sys.mkdir(dir, 0o755);
+    await ops.useCli(host, { version: VERSION });
+    // A user's grandparent: they rename the parent away and put their own incibase in its place.
+    host.sys.own(host.dir, 1000, 1000);
+    expect(detail(await runDoctor(host), "cli link")).toBe(
+      `${link} is in ${dir}, which someone other than root can change (${host.dir} belongs to uid 1000, not root), and root runs it (the check timer, sudo incibase): ${dirFix(host.dir)}`,
+    );
+    host.sys.own(host.dir, 0, 0);
+    expect(verdicts(await runDoctor(host))).toMatchObject({ "cli link": "OK", "check timer": "OK" });
+  });
+
+  test("check timer: a check unit other than this incibase renders (an older one ran the binary host init ran from) FAILs until host render", async () => {
+    const host = await doctorHost();
+    host.doctor = machine();
+    const unit = host.layout.unitFile(host.layout.units.checkService);
+    const rendered = readFileSync(unit, "utf8");
+    host.sys.writeFile(unit, rendered.replace(/^ExecStart=\S+/m, "ExecStart=/home/omer/incibase-linux-x64"), { uid: 0, gid: 0, mode: 0o644 });
+    const stale = await runDoctor(host);
+    expect(verdicts(stale)["check timer"]).toBe("FAIL");
+    expect(detail(stale, "check timer")).toBe(`${unit} is not what this incibase renders (it runs /home/omer/incibase-linux-x64 host check --root ${host.layout.root}): incibase host render writes it`);
+    host.sys.remove(unit);
+    expect(detail(await runDoctor(host), "check timer")).toBe(`${unit} is missing: incibase host render writes it`);
+    await ops.render(host);
+    expect(readFileSync(unit, "utf8")).toBe(rendered);
+    expect(verdicts(await runDoctor(host))["check timer"]).toBe("OK");
   });
 
   test("alerts: a failing delivery is a WARN; alerts waiting more than 5 minutes for the webhook FAIL", async () => {

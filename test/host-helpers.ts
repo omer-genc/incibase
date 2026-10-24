@@ -99,11 +99,12 @@ export interface OpsTestHost extends OpsContext {
 
 /**
  * A host for the owner operations: FakeSystem, FakeDriver (whose transient
- * jobs run in this process), unit files under a temp dir with the
- * production names, the current runtime installed, and gates that poll
- * every millisecond and give up after `gateFloorMs` (200 ms).
+ * jobs run in this process), unit files and nginx's under a temp dir with
+ * the production names, the current runtime installed and its own CLI link
+ * pointing at it (as `host use-cli` leaves it; `cli: false` for none), and
+ * gates that poll every millisecond and give up after `gateFloorMs` (200 ms).
  */
-export async function fakeOpsHost(options: { unitPrefix?: string } = {}): Promise<OpsTestHost> {
+export async function fakeOpsHost(options: { unitPrefix?: string; cli?: boolean } = {}): Promise<OpsTestHost> {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "incibase-ops-")));
   const layout = new HostLayout({
     root: join(dir, "root"),
@@ -126,6 +127,8 @@ export async function fakeOpsHost(options: { unitPrefix?: string } = {}): Promis
     now: () => (t += 1000),
     actor: "root:test",
     log: (line: string) => void lines.push(line),
+    // Never the machine's own nginx files: host init reads them for their owner (a real host's, on a test VM).
+    nginx: { confDir: join(dir, "nginx", "conf.d"), mainConfig: join(dir, "nginx", "nginx.conf"), logDir: join(dir, "log") },
     pollMs: 1,
     settleMs: 0,
     gateFloorMs: 200,
@@ -140,6 +143,7 @@ export async function fakeOpsHost(options: { unitPrefix?: string } = {}): Promis
   const binary = join(dir, "incibase-bin");
   writeFileSync(binary, `#!/bin/sh\necho ${VERSION}\n`, { mode: 0o755 });
   await ops.installRuntime(ctx, { binary, version: VERSION, sha256: sha256Hex(readFileSync(binary)) });
+  if (options.cli !== false) await ops.useCli(ctx, { version: VERSION });
   Object.assign(ctx, {
     dir,
     lines,

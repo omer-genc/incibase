@@ -3,14 +3,17 @@
 // root requirement, release from stdin, env import, admin-key's two
 // meanings, logs, help; and `incibase tunnel` against a fake ssh on PATH.
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { manifestLine, sha256Hex, type BundleManifest } from "../src/engine/manifest.ts";
 import { VERSION } from "../src/engine/version.ts";
 import { hostedAdminKey } from "../src/cli.ts";
 import { formatBytes, parseEnvImport, processIO, runCommand, table, type CommandIO } from "../src/host/commands.ts";
+import type { OpsContext } from "../src/host/context.ts";
 import type { DoctorContext } from "../src/host/doctor.ts";
+import { HostLayout } from "../src/host/layout.ts";
+import { Registry } from "../src/host/registry.ts";
 import { indexEntry } from "../src/host/tunnel.ts";
 import * as ops from "../src/host/ops.ts";
 import { SystemdDriver } from "../src/host/systemd.ts";
@@ -37,6 +40,8 @@ interface Session {
   execStderr: string;
   /** Whether each open was allowed to create a host. */
   creates: boolean[];
+  /** What open gives for these roots; `host` for any other. */
+  contexts: Record<string, OpsContext>;
   /** Output of the last run only. */
   last(): { out: string; err: string };
 }
@@ -56,6 +61,7 @@ async function session(): Promise<Session> {
     execOutput: [],
     execStderr: "",
     creates: [],
+    contexts: {},
     async run(...argv) {
       mark = { out: s.out.length, err: s.err.length };
       return runCommand(argv, io);
@@ -73,7 +79,7 @@ async function session(): Promise<Session> {
     open({ root, create }) {
       s.opened.push(root);
       s.creates.push(create === true);
-      return { ctx: host, close() {} };
+      return { ctx: s.contexts[root] ?? host, close() {} };
     },
     async exec(argv, line) {
       s.execs.push(argv);
@@ -243,6 +249,90 @@ describe("host", () => {
     expect(await s.run("host", "init", "--domain", "incibase.example.net", "--layout", "{nope")).toBe(2);
   });
 
+  test("init of a second root with this host's layout is refused, exit 1: one machine, one host", async () => {
+    const s = await session();
+    const { layout: first } = s.host;
+    const layout = new HostLayout({ root: join(s.host.dir, "second"), runtimeRoot: first.runtimeRoot, systemdDir: first.systemdDir, cliLink: first.cliLink });
+    const registry = Registry.open(layout);
+    s.contexts[layout.root] = { ...s.host, layout, registry };
+    try {
+      expect(await s.run("host", "init", "--domain", "incibase.example.net", "--root", layout.root)).toBe(1);
+      expect(s.last().err).toStartWith(`incibase host init: This machine already has the incibase host at ${first.root}: one machine runs one host`);
+      expect(await s.run("host", "init", "--domain", "incibase.example.net", "--root", layout.root, "--json")).toBe(1);
+      expect(JSON.parse(s.last().err)).toMatchObject({ error: { code: "CONFLICT" } });
+      expect(registry.getSetting("layout")).toBeNull();
+      // The host itself inits again.
+      expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    } finally {
+      registry.close();
+    }
+  });
+
+  test("init names the next step while the CLI link, which the check timer runs, leads to no installed runtime", async () => {
+    const s = await session();
+    const link = s.host.layout.cliLink;
+    const download = "/home/omer/incibase-linux-x64";
+    s.host.self = [download];
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    // Next goes through this host's link (not the machine's own incibase), with --root unless it is the default.
+    expect(s.last().out).toEndWith(`  check timer: every 30 s, runs ${link} (runtime ${VERSION})\nNext: sudo ${link} host add-admin <you>, then sudo ${link} project create <slug>`);
+    const other = "/var/lib/incibase-ck";
+    expect(await s.run("host", "init", "--domain", "incibase.example.net", "--root", other)).toBe(0);
+    expect(s.last().out).toEndWith(`Next: sudo ${link} host add-admin <you> --root ${other}, then sudo ${link} project create <slug> --root ${other}`);
+    // The first init, from a download: no link yet, the runtime not installed (its file gone).
+    const installed = s.host.layout.runtimeBinary(VERSION);
+    s.host.sys.remove(link);
+    renameSync(installed, `${installed}.away`);
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toContain(
+      `  check timer: waits for ${link} (host use-cli), skipping every run until then\n` +
+        `Next: sudo ${download} host install-runtime ${download} --version ${VERSION} --sums SHA256SUMS, then sudo ${download} host use-cli ${VERSION}`,
+    );
+    expect(await s.run("host", "init", "--domain", "incibase.example.net", "--root", other)).toBe(0);
+    expect(s.last().out).toEndWith(
+      `Next: sudo ${download} host install-runtime ${download} --version ${VERSION} --sums SHA256SUMS --root ${other}, then sudo ${download} host use-cli ${VERSION} --root ${other}`,
+    );
+    renameSync(`${installed}.away`, installed);
+    // Installed but someone else's: use-cli refuses it, and installing it again (never chown: they may have changed it)
+    // makes it root's alone once its bytes are the recorded ones.
+    s.host.sys.own(installed, 1000, 1000);
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toContain(
+      `Next: sudo ${download} host install-runtime ${download} --version ${VERSION} --sums SHA256SUMS, then sudo ${download} host use-cli ${VERSION}`,
+    );
+    // Installed: only use-cli is left; a file in the link's place needs --replace.
+    s.host.sys.own(installed, 0, 0);
+    writeFileSync(link, "#!/bin/sh\n", { mode: 0o755 });
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toContain(`  check timer: runs ${link}, which is a file, not a link to an installed runtime\nNext: sudo ${download} host use-cli ${VERSION} --replace`);
+    // What use-cli cannot put right (it would make the same link again): Next is the fix itself.
+    const binary = s.host.layout.runtimeBinary(VERSION);
+    s.host.sys.remove(link);
+    s.host.sys.symlink(binary, link);
+    s.host.sys.own(binary, 1000, 1000);
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toContain(
+      `  check timer: runs ${link}, which points at ${binary}, a runtime in ${s.host.layout.runtimeRoot} that someone other than root can change\n` +
+        `Next: install it again (host install-runtime --version ${VERSION}), which makes its files root's alone, or point it at another installed runtime (host use-cli <version>)`,
+    );
+    s.host.sys.own(binary, 0, 0);
+    s.host.sys.remove(link);
+    // The link's directory not there yet (a custom layout): root creates it first.
+    const dir = dirname(link);
+    rmSync(dir, { recursive: true });
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toContain(`  check timer: waits for ${link} (host use-cli), skipping every run until then\nNext: sudo install -d -m 0755 ${dir}, then sudo ${download} host use-cli ${VERSION}`);
+    s.host.sys.mkdir(dir, 0o755);
+    expect(await s.run("host", "init", "--domain", "incibase.example.net", "--no-check-timer")).toBe(0);
+    expect(s.last().out).toContain(`  check timer: off\nNext: sudo ${download} host use-cli ${VERSION}`);
+    // A host in use, run again: once the link runs the check, nothing is next.
+    s.host.sys.symlink(s.host.layout.runtimeBinary(VERSION), link);
+    await ops.createProject(s.host, { slug: "shop", branches: [] });
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toEndWith("  check timer: off");
+    expect(s.last().out).not.toContain("Next:");
+  });
+
   test("add-admin adds login accounts to the admin group, once; never system accounts", async () => {
     const s = await session();
     const sys = s.host.sys;
@@ -299,12 +389,52 @@ describe("host", () => {
     expect(s.last().out).toBe("alert_webhook removed");
   });
 
+  test("host set alert_webhook - reads the URL from stdin: one line, trimmed, checked like an argument", async () => {
+    const s = await session();
+    const stdin = (text: string) => void (s.stdin = new TextEncoder().encode(text));
+    stdin("  https://ntfy.sh/incibase-Xk3q9  \r\n\n");
+    expect(await s.run("host", "set", "alert_webhook", "-")).toBe(0);
+    expect(s.last().out).toBe("alert_webhook set (ntfy.sh)");
+    expect(s.host.registry.getSetting("alert_webhook")).toBe("https://ntfy.sh/incibase-Xk3q9");
+    // Every refusal leaves the saved URL as it was, and none repeats what stdin held.
+    for (const [text, said] of [
+      ["", "stdin is empty"],
+      [" \n\n", "stdin is empty"],
+      ["https://ntfy.sh/a\nhttps://ntfy.sh/b\n", "more than one line"],
+      ["http://ntfy.sh/incibase-plain\n", "must be an https URL"],
+      ["https://ntfy.sh/incibase a\n", "without spaces"],
+    ] as const) {
+      stdin(text);
+      expect(await s.run("host", "set", "alert_webhook", "-")).toBe(2);
+      expect(s.last().err).toContain(said);
+      expect(s.last().err).not.toContain("incibase-plain");
+      expect(s.host.registry.getSetting("alert_webhook")).toBe("https://ntfy.sh/incibase-Xk3q9");
+    }
+    s.stdin = new Uint8Array([0x68, 0xff, 0x0a]);
+    expect(await s.run("host", "set", "alert_webhook", "-")).toBe(2);
+    expect(s.last().err).toContain("not UTF-8");
+    // The size cap is the command's, before anything is decoded.
+    stdin(`https://ntfy.sh/${"x".repeat(5000)}\n`);
+    expect(await s.run("host", "set", "alert_webhook", "-")).toBe(2);
+    expect(s.last().err).toContain("stdin is too large");
+    // '' still removes it; - is never taken as the value.
+    expect(await s.run("host", "set", "alert_webhook", "")).toBe(0);
+    expect(s.host.registry.getSetting("alert_webhook")).toBeNull();
+    expect(await s.run("host", "set", "alert_webhook", "--help")).toBe(0);
+    expect(s.last().out).toContain("the URL is read from stdin");
+  });
+
   test("install-runtime and use-cli", async () => {
     const s = await session();
     const binary = join(s.host.dir, "incibase-bin");
     const sha = sha256Hex(readFileSync(binary));
     expect(await s.run("host", "install-runtime", "--version", VERSION, binary, "--sha256", sha)).toBe(0);
     expect(s.last().out).toBe(`Already installed: runtime ${VERSION} at ${s.host.layout.runtimeBinary(VERSION)} (sha256 ${sha.slice(0, 16)}...)`);
+    // Its file someone else's: the same bytes are made root's alone again.
+    s.host.sys.own(s.host.layout.runtimeBinary(VERSION), 1000, 1000);
+    expect(await s.run("host", "install-runtime", "--version", VERSION)).toBe(0);
+    expect(s.last().out).toBe(`Already installed, its files made root's alone again: runtime ${VERSION} at ${s.host.layout.runtimeBinary(VERSION)} (sha256 ${sha.slice(0, 16)}...)`);
+    expect(s.host.sys.lstat(s.host.layout.runtimeBinary(VERSION))).toMatchObject({ uid: 0, mode: 0o755 });
     expect(await s.run("host", "install-runtime", "--version", VERSION, binary, "--sha256", "0".repeat(64))).toBe(1);
     expect(await s.run("host", "install-runtime", binary, "extra")).toBe(2);
     expect(await s.run("host", "use-cli", VERSION)).toBe(0);
@@ -332,9 +462,11 @@ describe("projects and branches", () => {
     const s = await session();
     expect(await s.run("project", "list")).toBe(0);
     expect(s.last().out).toContain("No projects yet");
+    expect(s.last().out).toBe(`No projects yet: sudo ${s.host.layout.cliLink} project create <slug>`);
     expect(await s.run("project", "create", "shop", "--branches", "prod,dev", "--name", "The shop")).toBe(0);
     expect(s.last().out).toContain("Created project shop:");
     expect(s.last().out).toContain("shop/prod                prod    https://prod--shop.incibase.example.net");
+    expect(s.last().out).toEndWith(`Next: incibase bundle --out app.ib, copy it here, then sudo ${s.host.layout.cliLink} release add shop/prod app.ib`);
     expect(await s.run("project", "create", "shop")).toBe(1);
     expect(s.last().err).toBe("incibase project create: Project shop already exists");
     expect(await s.run("project", "create", "empty", "--branches", "", "--json")).toBe(0);

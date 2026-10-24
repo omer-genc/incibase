@@ -5,8 +5,8 @@
 // INCIBASE_TEST_BINARY, a standalone incibase for this machine
 // (`bun scripts/build-binary.ts`). Uses its own host root
 // (INCIBASE_TEST_HOST_ROOT, default /var/lib/incibase-systemd-test), uid base
-// (INCIBASE_TEST_UID_BASE, default 72000), unit prefix, groups and runtime
-// root named after the root, and removes everything it created.
+// (INCIBASE_TEST_UID_BASE, default 72000), unit prefix, groups, runtime root
+// and CLI link named after the root, and removes everything it created.
 //
 // Sandbox directives that do not take effect on the machine (a container
 // may override them, see `sandboxReport`) are reported, not asserted;
@@ -29,14 +29,19 @@ const UID_BASE = Number(process.env.INCIBASE_TEST_UID_BASE ?? 72000);
 const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const REQUIRE_SANDBOX = process.env.INCIBASE_TEST_REQUIRE_SANDBOX === "1";
 const MARKER = ".incibase-test-root";
-const LABEL = basename(ROOT).slice(0, 24);
+// No hyphens: systemd puts a-b.slice under a.slice, so incibase-x.slice would count against the owner's incibase.slice.
+const LABEL = basename(ROOT).replace(/[^a-z0-9]/g, "").slice(0, 24);
+const APPS = `/tmp/${LABEL}-apps`;
+const BIN = `/usr/local/lib/${LABEL}-bin`;
 const LAYOUT = {
   unitPrefix: LABEL,
   groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` },
   runtimeRoot: `/usr/local/lib/${LABEL}`,
   systemdDir: "/etc/systemd/system",
+  // What the check service runs, in a directory only root can create or change (never under /tmp, where anyone
+  // could make it again once it is gone), never the machine's own /usr/local/bin/incibase.
+  cliLink: `${BIN}/incibase`,
 };
-const APPS = `/tmp/${LABEL}-apps`;
 const DOMAIN = "incibase.example.net";
 const SLOW = 240_000;
 
@@ -58,8 +63,8 @@ function cleanup() {
     .split("\n")
     .map((l) => l.trim().split(/\s+/)[0])
     .filter((u): u is string => !!u && u.startsWith(`${prefix}-`));
-  // The slice last: systemd keeps it active after its units are gone. (Its implicit parent, incibase.slice
-  // for a prefix like incibase-s10, may hold other hosts' slices and is left alone.)
+  // The slice last: systemd keeps it active after its units are gone. (The prefix has no hyphen, so the
+  // slice has no implicit parent to leave behind.)
   for (const unit of [...units, `${prefix}.slice`]) {
     run(["systemctl", "stop", unit], { ok: [0, 1, 5] });
     run(["systemctl", "reset-failed", unit], { ok: [0, 1, 5] });
@@ -85,6 +90,7 @@ function cleanup() {
   rmSync(ROOT, { recursive: true, force: true });
   rmSync(LAYOUT.runtimeRoot, { recursive: true, force: true });
   rmSync(APPS, { recursive: true, force: true });
+  rmSync(BIN, { recursive: true, force: true });
 }
 
 // ---- the apps -----------------------------------------------------------------

@@ -14,13 +14,13 @@
 // Skipped unless INCIBASE_TEST_HOST=1 on Linux as root with nginx installed;
 // needs INCIBASE_TEST_BINARY (bun scripts/build-binary.ts). Uses its own host
 // root (INCIBASE_TEST_HOST_ROOT, default /var/lib/incibase-nginx-test), uid
-// base (INCIBASE_TEST_UID_BASE, default 73000), unit prefix, groups, nginx
-// file names and port (INCIBASE_TEST_HTTPS_PORT, default 18443), and removes
-// everything it created, nginx's files included.
+// base (INCIBASE_TEST_UID_BASE, default 73000), unit prefix, groups, runtime
+// root, CLI link, nginx file names and port (INCIBASE_TEST_HTTPS_PORT,
+// default 18443), and removes everything it created, nginx's files included.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, chownSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { connect } from "node:tls";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { VERSION } from "../src/engine/version.ts";
 import { openHost, type OpsContext } from "../src/host/context.ts";
 import { DEFAULT_ROOT, HostLayout } from "../src/host/layout.ts";
@@ -36,14 +36,19 @@ const PORT = Number(process.env.INCIBASE_TEST_HTTPS_PORT ?? 18443);
 const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const REQUIRE_SANDBOX = process.env.INCIBASE_TEST_REQUIRE_SANDBOX === "1";
 const MARKER = ".incibase-test-root";
-const LABEL = basename(ROOT).slice(0, 24);
+// No hyphens: systemd puts a-b.slice under a.slice, so incibase-x.slice would count against the owner's incibase.slice.
+const LABEL = basename(ROOT).replace(/[^a-z0-9]/g, "").slice(0, 24);
+const WORK = `/tmp/${LABEL}-work`;
+const BIN = `/usr/local/lib/${LABEL}-bin`;
 const LAYOUT = {
   unitPrefix: LABEL,
   groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` },
   runtimeRoot: `/usr/local/lib/${LABEL}`,
   systemdDir: "/etc/systemd/system",
+  // What the check service runs, in a directory only root can create or change (never under /tmp, where anyone
+  // could make it again once it is gone), never the machine's own /usr/local/bin/incibase.
+  cliLink: `${BIN}/incibase`,
 };
-const WORK = `/tmp/${LABEL}-work`;
 const DOMAIN = "incibase.omergenc.net";
 const DEV = `dev--shop.${DOMAIN}`;
 const SLOW = 240_000;
@@ -53,6 +58,8 @@ const V6_ADDRS = ["2001:db8:11f:2::a", "2001:db8:11f:2:ffff::b", "2001:db8:11f:3
 const sys = new LinuxSystem();
 let ctx: OpsContext;
 const files = nginxFiles(new HostLayout({ root: ROOT, ...LAYOUT }));
+/** Another site, this test's own, that holds a port as default_server: the clash the whole-config test needs. */
+const CLASH = { conf: join(dirname(files.conf), `${LABEL}-clash.conf`), port: PORT + 1 };
 
 function run(command: string[], options: { ok?: number[]; stdin?: Buffer } = {}) {
   const result = Bun.spawnSync(command, { stdout: "pipe", stderr: "pipe", stdin: options.stdin ?? "ignore" });
@@ -72,7 +79,7 @@ function cleanup() {
     run(["systemctl", "stop", unit], { ok: [0, 1, 5] });
     run(["systemctl", "reset-failed", unit], { ok: [0, 1, 5] });
   }
-  for (const dir of [LAYOUT.systemdDir, join(LAYOUT.systemdDir, "multi-user.target.wants")]) {
+  for (const dir of [LAYOUT.systemdDir, join(LAYOUT.systemdDir, "multi-user.target.wants"), join(LAYOUT.systemdDir, "timers.target.wants")]) {
     for (const name of existsSync(dir) ? readdirSync(dir) : []) {
       if (name.startsWith(`${prefix}-`) || name === `${prefix}.slice`) rmSync(join(dir, name), { recursive: true, force: true });
     }
@@ -80,6 +87,7 @@ function cleanup() {
   const hadNginx = existsSync(files.conf) || existsSync(files.dropIn);
   rmSync(files.conf, { force: true });
   rmSync(files.dropIn, { force: true });
+  rmSync(CLASH.conf, { force: true });
   const dropInDir = join(LAYOUT.systemdDir, `${NGINX_SERVICE}.d`);
   if (existsSync(dropInDir) && readdirSync(dropInDir).length === 0) rmSync(dropInDir, { recursive: true });
   run(["systemctl", "daemon-reload"]);
@@ -104,6 +112,7 @@ function cleanup() {
   rmSync(ROOT, { recursive: true, force: true });
   rmSync(LAYOUT.runtimeRoot, { recursive: true, force: true });
   rmSync(WORK, { recursive: true, force: true });
+  rmSync(BIN, { recursive: true, force: true });
 }
 
 /** A self-signed certificate for *.<domain>, as Cloudflare's Origin CA would issue (recipe A). */
@@ -692,10 +701,19 @@ describe.skipIf(!enabled)("the nginx front door", () => {
 
   test("a config the rest of nginx rejects is never served: the previous file and setting stay", async () => {
     const text = readFileSync(files.conf, "utf8");
-    // Port 80 already has Ubuntu's default_server.
-    const err = await ops.setFrontDoor(ctx, { httpsPort: 80 }).then(() => null, (e) => e);
+    // A site of this test's own already has a default_server on the new port (not Ubuntu's default site on 80,
+    // which a host set up as docs/host.md says has removed). nginx -t alone reads it; nothing reloads meanwhile.
+    writeFileSync(CLASH.conf, `server {\n    listen ${CLASH.port} default_server;\n    return 444;\n}\n`, { mode: 0o644 });
+    let err: { code?: string; message?: string } | null;
+    try {
+      expect(run(["nginx", "-t", "-q"]).code).toBe(0);
+      err = await ops.setFrontDoor(ctx, { httpsPort: CLASH.port }).then(() => null, (e) => e);
+    } finally {
+      rmSync(CLASH.conf, { force: true });
+    }
     expect(err?.code).toBe("FAILED");
-    note(`port 80 refused: ${String(err?.message).split("\n").find((l) => l.includes("[emerg]")) ?? err?.message}`);
+    note(`port ${CLASH.port} refused: ${String(err?.message).split("\n").find((l) => l.includes("[emerg]")) ?? err?.message}`);
+    expect(err?.message).toContain(`duplicate default server for 0.0.0.0:${CLASH.port}`);
     expect(readFileSync(files.conf, "utf8")).toBe(text);
     expect(ctx.registry.getSetting("https_port")).toBe(String(PORT));
     expect(run(["nginx", "-t", "-q"]).code).toBe(0);

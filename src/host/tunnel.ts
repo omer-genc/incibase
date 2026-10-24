@@ -12,6 +12,7 @@ import { existsSync } from "node:fs";
 import { connect } from "node:net";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { stopWithOutput } from "../engine/output.ts";
 import { printable } from "./driver.ts";
 import { DEFAULT_ROOT } from "./layout.ts";
 import { branchRef, NameError, parseBranchRef } from "./names.ts";
@@ -174,6 +175,8 @@ export async function tunnelCli(argv: string[]): Promise<number> {
       stderr: "inherit",
     });
     const child = ssh;
+    // `incibase tunnel … | head -1`: the tunnel closes when this process stops for its reader (output.ts).
+    stopWithOutput(child);
     let exited: number | null = null;
     void child.exited.then((c) => (exited = c));
     let stopping = false;

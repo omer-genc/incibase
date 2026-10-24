@@ -4,7 +4,7 @@ Temiz bir Ubuntu 24.04 VPS'ten çalışan bir `prod` ve `dev` branch'ine kadar k
 
 Örneklerde laptoptan sunucuya `ssh vps` ile bağlanılır (`~/.ssh/config`'te bir alias), sunucudaki giriş hesabı `omer`, proje `shop`.
 
-> Host katmanı (`host`, `project`, `branch`, `release`, `env`, `service-key`, `status`, `logs`, `tunnel` komutları) 0.3.1'den sonraki ilk sürümle gelir; [CHANGELOG](../CHANGELOG.md)'da şimdilik "Unreleased" altında. 0.3.1 ve öncesinin binary'lerinde bu komutlar yok. Aşağıda `V=x.y.z` gördüğün yere o sürümü ya da daha yenisini yaz.
+> Host katmanı (`host`, `project`, `branch`, `release`, `env`, `service-key`, `status`, `logs`, `tunnel` komutları) 0.4.0 ile gelir ([CHANGELOG](../CHANGELOG.md)); 0.3.1 ve öncesinin binary'lerinde bu komutlar yok. Aşağıda `V=0.4.0` gördüğün yere [yayınlanan](https://github.com/omer-genc/incibase/releases) en yeni sürümü yazabilirsin.
 
 ## Ne elde edersin
 
@@ -112,12 +112,12 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ## incibase'i kurmak
 
-Sıra: binary'yi GitHub release'inden indir ve `SHA256SUMS` ile doğrula, onunla `host init` çalıştır, sonra kendisini runtime olarak kur, `/usr/local/bin/incibase`'i ona bağla ve unit'leri kurulu runtime'la yeniden yaz. İndirilen dosyayı ancak en sonda sil. Üç blok aynı kabukta koşar (`$V` ve `$ARCH` ilk bloktan gelir).
+Sıra: binary'yi GitHub release'inden indir ve `SHA256SUMS` ile doğrula, onunla `host init` çalıştır, sonra kendisini runtime olarak kur ve `/usr/local/bin/incibase`'i ona bağla. İndirilen dosyayı ancak en sonda sil. Üç blok aynı kabukta koşar (`$V` ve `$ARCH` ilk bloktan gelir).
 
 ### 1. İndirmek ve doğrulamak
 
 ```bash
-V=x.y.z                                    # host katmanını içeren sürüm (yukarıdaki not)
+V=0.4.0                                    # ya da daha yeni bir sürüm (yukarıdaki not)
 ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')
 cd ~
 curl -fsSLO https://github.com/omer-genc/incibase/releases/download/v$V/incibase-linux-$ARCH
@@ -128,7 +128,7 @@ chmod +x incibase-linux-$ARCH
 
 ### 2. `host init`
 
-`host init` dışındaki her komut kurulmuş bir host ister (`No incibase host at /var/lib/incibase: run sudo incibase host init …`), o yüzden ilk komut budur ve indirilen dosyayla çalışır:
+`host init` dışındaki her komut kurulmuş bir host ister (`No incibase host at /var/lib/incibase: run sudo incibase host init …`), o yüzden ilk komut budur ve indirilen dosyayla çalışır. `sudo` bulunduğun dizini korur, ama binary o dizindeki `bunfig.toml`'u ve `.env`'i okumaz; ev dizinindeki bir dosya root olarak çalışan komuta bir şey yükleyemez. `host install-runtime` kurduğu binary'ye sürümünü `/`'te sorar, böylece cwd'yi hâlâ okuyan eski bir sürüm (0.3.1) kurulurken de ev dizininden bir şey yüklemez.
 
 ```bash
 sudo ./incibase-linux-$ARCH host init \
@@ -143,7 +143,8 @@ sudo ./incibase-linux-$ARCH host init \
 /var/lib/incibase is set up for incibase.omergenc.net
   units incibase-*, groups incibase-admin and incibase-proxy
   front door: certificate installed, nginx restart
-Next: sudo incibase host add-admin <you>, then sudo incibase project create <slug>
+  check timer: waits for /usr/local/bin/incibase (host use-cli), skipping every run until then
+Next: sudo /home/omer/incibase-linux-x64 host install-runtime /home/omer/incibase-linux-x64 --version 0.4.0 --sums SHA256SUMS, then sudo /home/omer/incibase-linux-x64 host use-cli 0.4.0
 ```
 
 Ne yapar: registry (`/var/lib/incibase/control/registry.db`), `incibase-proxy` (www-data üyesi) ve `incibase-admin` grupları, `incibase.slice`, branch/preflight/snapshot unit şablonları, `incibase-check.timer`, nginx config'i (`/etc/nginx/conf.d/incibase.conf`) ve nginx drop-in'i (`OOMScoreAdjust=-900`). Tekrar çalıştırmak güvenlidir.
@@ -151,15 +152,15 @@ Ne yapar: registry (`/var/lib/incibase/control/registry.db`), `incibase-proxy` (
 - `--timezone` branch'lerin cron'ları için `TZ` olur.
 - `--https-port` (varsayılan 443), `--slice-memory` (varsayılan RAM − 1G), `--uid-base` (varsayılan 70000; yalnızca ilk branch'ten önce), `--tunnel-port-base` (varsayılan 7101) genelde değişmez.
 - `--no-check-timer` yalnızca testler için; üretimde timer açık kalmalı.
+- `Next:` satırı bir sonraki adımı yazar. CLI link'i (`/usr/local/bin/incibase`) henüz kurulu bir runtime'a gitmiyorsa bu, aşağıdaki 3. adımdır (`install-runtime`, sonra `use-cli`); gidiyorsa `host add-admin` ve `project create`; host'ta zaten proje varsa `Next:` satırı yoktur. Varsayılan olmayan bir `--root` (ya da `$INCIBASE_HOST_ROOT`; sudo onu düşürür) ile `Next:`'teki her komut `--root <dizin>` taşır; layout root'un registry'sinden okunduğundan `--layout` gerekmez.
 - Sertifikayı sonra yenilemek: `sudo incibase host tls --cert <pem> --key <key>` (`nginx -t` ile denenir, geçerse nginx reload). `trust_proxy` ve `https_port` sonradan `host set` ile değişir.
-- **Bir makinede bir host.** `--root` (ya da `$INCIBASE_HOST_ROOT`) yalnızca veri dizinini değiştirir; unit adları (`incibase-*`), gruplar, `/etc/nginx/conf.d/incibase.conf`, nginx drop-in'i, `/usr/local/lib/incibase` ve `/usr/local/bin/incibase` aynı kalır. Aynı makinede başka bir `--root` ile ikinci bir `host init` ilk host'un bu dosyalarını ezer. Üretim makinesinde tek host kur; denemeleri ayrı bir VM'de yap.
+- **Bir makinede bir host.** `--root` (ya da `$INCIBASE_HOST_ROOT`) yalnızca veri dizinini değiştirir; unit adları (`incibase-*`), gruplar, `/etc/nginx/conf.d/incibase.conf`, nginx drop-in'i, `/usr/local/lib/incibase` ve `/usr/local/bin/incibase` aynı kalır. Bu dosyalar hangi host'a ait olduklarını yazar (unit'lerde ve nginx dosyalarında `# host root: /var/lib/incibase` satırı, runtime kökünde `.incibase-host`). Aynı makinede başka bir `--root` ile ikinci bir `host init` hiçbir şey yazmadan reddedilir (`This machine already has the incibase host at /var/lib/incibase: …`) ve çakışan dosyaları listeler; ilk host'un check unit'i CLI link'ini daha `use-cli`'dan önce adlandırdığından bu, link henüz yokken de geçerlidir. Aynı root'ta `host init`'i tekrar çalıştırmak ve `host render` etkilenmez. Üretim makinesinde tek host kur; denemeleri ayrı bir VM'de yap. Eski host'u kaldırdıysan, hata mesajının listelediği dosyaları sildikten sonra yeni root'la `host init` geçer.
 
-### 3. Runtime, CLI ve check unit'i
+### 3. Runtime ve CLI
 
 ```bash
 sudo ./incibase-linux-$ARCH host install-runtime ./incibase-linux-$ARCH --version $V --sums SHA256SUMS
 sudo ./incibase-linux-$ARCH host use-cli $V
-sudo incibase host render
 rm incibase-linux-$ARCH SHA256SUMS
 incibase --version
 sudo incibase host runtimes
@@ -167,8 +168,9 @@ sudo incibase host runtimes
 
 - `host install-runtime` binary'yi `SHA256SUMS`'taki girdisiyle (ya da `--sha256 <hex>` ile) karşılaştırır; eşleşmezse siler ve hiç çalıştırmaz. Eşleşirse `/usr/local/lib/incibase/<sürüm>/incibase` olarak kurar ve registry'ye yazar. Checksum'sız kurulum yok.
 - Yerel dosya vermezsen `host install-runtime --version $V` binary'yi ve `SHA256SUMS`'ı GitHub release'inden kendisi indirip doğrular (yükseltmelerde bunu kullanırsın).
-- `host use-cli` `/usr/local/bin/incibase`'i kurulu runtime'a symlink yapar. Oraya elle kopyalanmış bir dosya varsa yalnızca `--replace` ile yerine geçer.
-- **`host render` atlanmamalı.** `host init` `incibase-check.service`'i kendisini çalıştıran dosyayla yazar: `ExecStart=/home/omer/incibase-linux-<arch> host check …`. `install-runtime` ve `use-cli` bunu değiştirmez. `/usr/local/bin/incibase` ile çalışan `host render` unit'i `/usr/local/lib/incibase/<sürüm>/incibase`'e çevirir. Atlanırsa root her 30 s'de giriş hesabının ev dizinindeki bir dosyayı çalıştırır; `rm`'den sonra da her check `203/EXEC` ile düşer ve `host doctor` `FAIL check timer` verir. Kontrol: `systemctl cat incibase-check.service | grep ExecStart`.
+- Kurulu bir sürümü tekrar kurmak hiçbir şeyi değiştirmez. Dosyaları (binary, sürüm dizini, runtime root) yalnızca root'un değilse onları yeniden root'un yapar (`Already installed, its files made root's alone again`): önce dizinleri, sonra binary'nin root'a ait bir kopyasını hash'leyip kayıtlı sha256'yla aynıysa onu yerine koyarak. Aynı değilse kayıtlı baytları yeniden kurar. Bu yüzden böyle bir runtime için elle `chown` yapılmaz: dosyayı yazabilen biri baytları değiştirmiş olabilir, `chown` onları root'un yapardı.
+- `host use-cli` `/usr/local/bin/incibase`'i kurulu runtime'a symlink yapar. Oraya elle kopyalanmış bir dosya varsa yalnızca `--replace` ile yerine geçer. Root bu link'in gösterdiğini çalıştırdığından `use-cli` şunları CONFLICT ile reddeder: link'in dizini ya da `/`'e kadar üstündeki herhangi bir dizin root'un değilse ya da başkası yazabiliyorsa (Ubuntu'da `/usr/local/bin` `root:root 0755`'tir; değilse `chown root:root` ve `chmod go-w` ile düzelt), runtime'ın dosyaları ya da runtime root'tan `/`'e kadar herhangi bir dizin yalnızca root'un değilse, binary'nin baytları kurulurken kaydedilen sha256 değilse, ya da link başka bir host'unsa. Herkesin yazabildiği bir dizin sticky olsa da (`/tmp`) kabul edilmez: check unit'i link'i hep adlandırır, root'un oradaki dizini gidince (yeniden başlatma `/tmp`'yi temizler) herkes onu yeniden yaratabilir. `host init` link'in dizinini aynı şekilde denetler; henüz olmayan bir dizini (özel bir layout) yalnızca root yaratabiliyorsa kabul eder, `Next:` satırı da önce `sudo install -d -m 0755 <dizin>` yazar.
+- **Check timer CLI link'ini bekler.** `incibase-check.service` `/usr/local/bin/incibase host check …` çalıştırır: link'in kendisini, indirilen dosyayı değil (o dosyayı giriş hesabı değiştirebilir, root ise onu her 30 s'de çalıştırırdı). `host init`'ten `use-cli`'a kadar link yoktur; systemd her çalıştırmayı `ConditionFileIsExecutable` ile atlar (hata değil), `host doctor` da bu arada `FAIL cli link` ve `FAIL check timer` verir. `use-cli`'dan sonraki ilk tetiklemede check çalışır; `host render` gerekmez. İleride `use-cli` ile CLI'ı başka bir sürüme geçirmek check'i de geçirir ve `host gc` link'in gösterdiği runtime'ı silmez.
 - Her branch bir runtime sürümüne **pinlenir** (varsayılan: branch'i oluşturan CLI'ın sürümü); CLI'ı yükseltmek branch'leri değiştirmez.
 
 ## `host doctor`
@@ -183,10 +185,10 @@ Host'un dayandığı her şeyi OK/WARN/FAIL olarak listeler; bir FAIL varsa 1 il
 |---|---|
 | `WARN sandbox SocketBindDeny: unsupported by this systemd build (-BPF_FRAMEWORK) …` | Yukarıdaki firewall notu. Kalıcıdır; firewall kapalı portlarla bunu karşılar. |
 | `WARN alerts: no alert_webhook …` | Henüz alarm adresi yok; [Alarmlar](#alarmlar-ntfysh) bölümünde düzelir. |
-| `WARN check timer: …` (hiç check tamamlanmadı) | `host init`'ten hemen sonra; ilk check 30 s içinde koşunca OK olur. |
+| `WARN check timer: …` (hiç check tamamlanmadı) | `host use-cli`'dan hemen sonra; ilk check 30 s içinde koşunca OK olur. |
 | `WARN sshd: sshd is not installed …` | Yalnızca SSH sunucusu olmayan bir makinede; VPS'te çıkmaz. |
 
-Başka bir WARN ya da herhangi bir FAIL bir şeyin yanlış olduğunu söyler; satırın kendisi ne yapılacağını yazar. Bir container'da (`WARN virtualization: a container (lxc) …`) ProtectProc ve ProtectSystem WARN olur; aynı direktifler bir VM'de çalışmazsa FAIL'dir ([Sorun giderme](#sorun-giderme)).
+Başka bir WARN ya da herhangi bir FAIL bir şeyin yanlış olduğunu söyler; satırın kendisi ne yapılacağını yazar. `use-cli`'dan önce çalıştırırsan `FAIL cli link: /usr/local/bin/incibase does not exist: …` ve `FAIL check timer: every run of incibase-check.service is skipped …` görürsün; [3. adım](#3-runtime-ve-cli) düzeltir. `/usr/local/bin/incibase` kurulu bir runtime'a giden bir symlink değilse (ör. elle kopyalanmış bir dosya) `cli link` de FAIL'dir: `host use-cli <sürüm> --replace`. Link'in dizini ya da runtime root'un üstündeki bir dizin root'tan başkasınca değiştirilebiliyorsa satır `use-cli` yerine gereken `chown`/`chmod`'u yazar; sticky ya da herkesin yazabildiği bir dizin için `chmod` değil, başka bir dizinde CLI link ya da runtime root önerir. Runtime'ın kendi dosyaları yalnızca root'un değilse (link yokken de) `chown` değil `host install-runtime --version <sürüm>` önerir (yukarıya bak). Link'in runtime'ı root'un olsa da baytları kayıtlı sha256 değilse (ör. biri yazabildiği sırada değiştirip sonra elle `chown`'lanmışsa) `cli link` FAIL'dir ve aynı komutu önerir. Bir container'da (`WARN virtualization: a container (lxc) …`) ProtectProc ve ProtectSystem WARN olur; aynı direktifler bir VM'de çalışmazsa FAIL'dir ([Sorun giderme](#sorun-giderme)).
 
 `host status` aynı makinenin özetidir: domain, ön kapı, check timer, runtime'lar, branch sayıları ve açık alarmlar.
 
@@ -378,19 +380,22 @@ Loglar journal'dan gelir; branch'ler satır başına bir JSON nesnesi yazar (ist
 - Disk: dosya sistemi %80 ve %90 dolulukta alarm (3 puan aşağı inince kapanır).
 - Alarm anahtarları: `health:<id>`, `startup:<id>`, `unit:<id>`, `restarts:<id>` (10 dakikada 5 otomatik restart), `disk:80`, `disk:90`.
 
-`host doctor` check'in kendisini de denetler: timer'ın servisi `failed` ise ya da son tamamlanan check 120 s'den eskiyse FAIL.
+Servis CLI link'ini (`/usr/local/bin/incibase`) çalıştırır; link kurulu bir runtime'a gidene kadar ([3. adım](#3-runtime-ve-cli)) her çalıştırma atlanır.
+
+`host doctor` check'in kendisini de denetler: timer'ın servisi `failed` ise, son tamamlanan check 120 s'den eskiyse, CLI link'i yok olduğu için her çalıştırma atlanıyorsa ya da diskteki check unit'i bu incibase'in yazdığı değilse (`host render` yeniden yazar) FAIL.
 
 ### Alarmlar (ntfy.sh)
 
 1. Tahmin edilemeyen bir topic adı seç; ntfy.sh'ta topic adı tek erişim kontrolüdür: `openssl rand -hex 16`.
 2. Telefondaki ntfy uygulamasında o topic'e abone ol.
-3. Sunucuda:
+3. Sunucuda, URL'yi stdin'den ver (`-`): komutu çalıştır, `https://ntfy.sh/<topic>` yaz, Enter, sonra Ctrl-D:
    ```bash
-   sudo incibase host set alert_webhook https://ntfy.sh/<topic> --test
+   sudo incibase host set alert_webhook - --test
    ```
+   Laptoptan, bir dosyadan (parolasız sudo gerekir): `ssh vps sudo incibase host set alert_webhook - --test < ntfy-url.txt`.
 
-- Yalnızca https kabul edilir; kullanıcı/parola ya da `#` içeren URL'ler reddedilir. `--test` bir deneme bildirimi gönderir.
-- Topic adı bir sırdır ama bu komut onu komut satırına koyar: sudo'nun loguna (auth.log, journal) ve o an `ps` çıktısına düşer. Bu logları kimseyle paylaşma; paylaştıysan yeni bir topic seçip `host set alert_webhook` ile değiştir.
+- Stdin'den tek satır okunur (boş satırlar ve baştaki/sondaki boşluklar atlanır, en çok 4096 bayt); boş stdin reddedilir. Yalnızca https kabul edilir; kullanıcı/parola ya da `#` içeren URL'ler reddedilir. `--test` bir deneme bildirimi gönderir.
+- Topic adı bir sırdır; `-` onu komut satırının dışında tutar. URL'yi doğrudan argüman olarak vermek (`host set alert_webhook https://ntfy.sh/<topic>`) de çalışır ama topic'i sudo'nun loguna (auth.log, journal) ve o an `ps` çıktısına düşürür. Öyle verdiysen ya da topic başka bir yolla sızdıysa yeni bir topic seçip `host set alert_webhook -` ile değiştir. Audit satırında URL değil yalnızca host tutulur.
 - Bir alarm açılınca ve kapanınca birer bildirim gider. Mesajlardan anahtarlar, app env değerleri ve webhook URL'sinin kendisi çıkarılır.
 - Teslimat başarısızsa bir sonraki check'te tekrar denenir; 5 dakikadan uzun süredir ulaşılamıyorsa `host doctor` FAIL verir.
 - Kaldırmak: `sudo incibase host set alert_webhook ''`.
@@ -435,7 +440,7 @@ sudo incibase project delete shop
 ## incibase'i yükseltmek
 
 ```bash
-V=x.y.z
+V=0.4.1                                     # geçmek istediğin yeni sürüm
 sudo incibase host install-runtime --version $V     # GitHub'dan indirir, SHA256SUMS ile doğrular
 sudo incibase host use-cli $V                       # /usr/local/bin/incibase artık $V
 sudo incibase host render                           # unit'ler ve nginx config'i yeni sürümle yeniden yazılır

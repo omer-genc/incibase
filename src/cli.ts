@@ -17,6 +17,7 @@ import { loadAppFromDir, schemaOf } from "./engine/loader.ts";
 import { verifyBundle } from "./engine/manifest.ts";
 import { color, isJson, logEvent, parseLogFormat, setLogFormat, stripQuery } from "./engine/log.ts";
 import { MigrationError } from "./engine/migrate.ts";
+import { guardOutput } from "./engine/output.ts";
 import { finishMigrateOnly } from "./engine/preflight.ts";
 import { handleReloads, serviceKeysFromEnv, type ReloadTarget } from "./engine/service-keys.ts";
 import { checkHostedSecrets, corsOriginsFromEnv } from "./engine/surface.ts";
@@ -180,7 +181,22 @@ function requestedLogFormat(argv: string[]): string | undefined {
   return format;
 }
 
+/**
+ * Whether a reader that goes away ends `argv` quietly with exit 0
+ * (engine/output.ts): the commands people pipe (`incibase logs shop/prod |
+ * head`), never what systemd runs. For serve, dev, `_snapshot`, the check
+ * service's `host check` and a release's `host _job`, stdout is the journal
+ * (or a supervisor's pipe), tenant code may write to it, and a clean exit
+ * would mean Restart=on-failure does not restart the branch, or a job
+ * seems done halfway: those keep failing (exit 1) on a write error.
+ */
+export function guardsOutput(argv: string[]): boolean {
+  if (argv[0] === "host") return argv[1] !== "_job" && argv[1] !== "check";
+  return argv[0] !== undefined && (HOSTED_COMMANDS.has(argv[0]) || (argv[0] === "admin-key" && hostedAdminKey(argv.slice(1))));
+}
+
 export async function runCli(argv: string[], options: CliOptions = {}) {
+  if (!options.embedded && guardsOutput(argv)) guardOutput();
   // Host commands have their own flags; loaded only when asked for.
   if (argv[0] === "host") {
     if (options.embedded) {

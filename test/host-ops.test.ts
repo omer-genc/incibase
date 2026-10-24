@@ -1,14 +1,27 @@
 // The owner operations (design section 5.2) on a fake host: input
 // validation, control/LOCK, busy branches, audit rows, start/stop/restart,
-// delete, env, keys, status and logs.
+// delete, env, keys, status and logs; and one machine, one host: host init
+// refuses another host's machine-wide files.
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { sha256Hex } from "../src/engine/manifest.ts";
+import { VERSION } from "../src/engine/version.ts";
+import { processIO } from "../src/host/commands.ts";
+import { FakeDriver } from "../src/host/fake-driver.ts";
+import { HostLayout, type LayoutOptions } from "../src/host/layout.ts";
+import { nginxConfig, nginxDropIn, nginxFiles } from "../src/host/nginx.ts";
 import * as ops from "../src/host/ops.ts";
 import { Registry, RegistryLockedError, type BranchRow } from "../src/host/registry.ts";
+import { recordedRoot } from "../src/host/render.ts";
+import { RUNTIME_OWNER_FILE } from "../src/host/runtime.ts";
 import { closeOpsHosts, fakeBundle, fakeOpsHost, parseEnvFile, seedDatabase, type OpsTestHost } from "./host-helpers.ts";
 
-afterEach(closeOpsHosts);
+const registries: Registry[] = [];
+afterEach(() => {
+  for (const registry of registries.splice(0)) registry.close();
+  closeOpsHosts();
+});
 
 const HOSTNAME = "prod--shop.incibase.example.net";
 
@@ -416,5 +429,316 @@ describe("status and logs", () => {
     ]);
     await expect(ops.createProject(host, { slug: "shop" })).rejects.toMatchObject({ code: "CONFLICT" });
     writeFileSync(join(host.dir, "unused"), "");
+  });
+});
+
+// ---- one machine, one host ---------------------------------------------------------------
+
+const DOMAIN = "incibase.example.net";
+
+/**
+ * Another host root on `host`'s machine (its FakeSystem, driver and nginx
+ * paths), with `host`'s layout but for `options`; not initialized.
+ */
+function secondHost(host: OpsTestHost, options: LayoutOptions = {}, nginx = host.nginx): OpsTestHost {
+  const layout = new HostLayout({
+    root: join(host.dir, "other"),
+    runtimeRoot: host.layout.runtimeRoot,
+    systemdDir: host.layout.systemdDir,
+    unitPrefix: host.layout.units.prefix,
+    groups: host.layout.groups,
+    cliLink: host.layout.cliLink,
+    ...options,
+  });
+  const registry = Registry.open(layout);
+  registries.push(registry);
+  return { ...host, layout, registry, nginx, driver: new FakeDriver(layout, host.sys) } as OpsTestHost;
+}
+
+/** The front door's config and drop-in, as renderNginx leaves them for `host`. */
+function frontDoorFiles(host: OpsTestHost) {
+  const files = nginxFiles(host.layout, host.nginx);
+  mkdirSync(join(files.conf, ".."), { recursive: true });
+  mkdirSync(join(files.dropIn, ".."), { recursive: true });
+  const owner = { uid: 0, gid: 0, mode: 0o644 };
+  host.sys.writeFile(files.conf, nginxConfig({ layout: host.layout, files, domain: DOMAIN, port: 443, trustProxy: "none", cert: "/x/tls/a.crt", key: "/x/tls/a.key" }), owner);
+  host.sys.writeFile(files.dropIn, nginxDropIn(host.layout), owner);
+  return files;
+}
+
+/** Every file, directory and link under `dir` (registries aside): what each holds or points at. */
+function tree(dir: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (path: string) => {
+    const st = lstatSync(path);
+    if (st.isSymbolicLink()) out[path] = `-> ${readlinkSync(path)}`;
+    else if (st.isDirectory()) {
+      out[path] = `dir ${(st.mode & 0o7777).toString(8)}`;
+      for (const name of readdirSync(path)) walk(join(path, name));
+    } else if (!/\/registry\.db(?:-wal|-shm)?$/.test(path)) out[path] = readFileSync(path, "utf8");
+  };
+  walk(dir);
+  return out;
+}
+
+/** What a refused init must leave as it was: the files, the FakeSystem's records, systemd. */
+function machineState(host: OpsTestHost) {
+  return { tree: tree(host.dir), changes: host.sys.changeCount, meta: [...host.sys.meta], groups: [...host.sys.groups.keys()], calls: host.driver.calls.length };
+}
+
+/** host init on `ctx`, refused: the error. */
+async function refusedInit(ctx: OpsTestHost): Promise<ops.OpError> {
+  const err = await ops.initHost(ctx, { domain: DOMAIN }).then(() => null, (e: unknown) => e);
+  expect(err).toBeInstanceOf(ops.OpError);
+  expect((err as ops.OpError).code).toBe("CONFLICT");
+  return err as ops.OpError;
+}
+
+/** The host's own units: the ones of its prefix that carry an owner record. */
+const hostUnits = (host: OpsTestHost) => {
+  const u = host.layout.units;
+  return [u.branchTemplate, u.preflightTemplate, u.snapshotTemplate, u.slice, u.checkService, u.checkTimer].map((name) => host.layout.unitFile(name));
+};
+
+describe("one machine, one host", () => {
+  test("host init of a second root with the same layout is refused before anything is written", async () => {
+    const host = await fakeOpsHost();
+    const front = frontDoorFiles(host);
+    const other = secondHost(host);
+    const before = machineState(host);
+    const err = await refusedInit(other);
+    expect(err.message).toStartWith(`This machine already has the incibase host at ${host.layout.root}: one machine runs one host, `);
+    expect(err.message).toContain(`so ${other.layout.root} would take over that host's files. A second host needs a layout of its own (host init --layout '{"unitPrefix":`);
+    const listed = [...hostUnits(host), front.conf, front.dropIn, join(host.layout.runtimeRoot, RUNTIME_OWNER_FILE)];
+    expect(err.message).toEndWith(`If that host is gone, remove these first: ${listed.join(", ")}`);
+    // Nothing on the machine, no setting, not even a refusal's audit row in the new registry.
+    expect(machineState(host)).toEqual(before);
+    expect(other.driver.calls).toEqual([]);
+    expect(other.registry.getSetting("layout")).toBeNull();
+    expect(other.registry.getSetting("domain")).toBeNull();
+    expect(other.registry.listAudit()).toEqual([]);
+    // The first host is untouched and still re-inits.
+    await ops.initHost(host, { domain: DOMAIN });
+  });
+
+  test("host init on the command line: a refused new root gets no registry, and the error names the host", async () => {
+    const host = await fakeOpsHost({ unitPrefix: "incibaseo1" });
+    const root = join(host.dir, "fresh");
+    const layout = { runtimeRoot: host.layout.runtimeRoot, systemdDir: host.layout.systemdDir, unitPrefix: "incibaseo1", cliLink: host.layout.cliLink };
+    // The real open: checked before Registry.open would create <root>/control.
+    expect(() => processIO.open({ root, layout, create: true })).toThrow(`This machine already has the incibase host at ${host.layout.root}`);
+    expect(existsSync(root)).toBe(false);
+  });
+
+  test("each machine-wide path is enough on its own; a layout of its own inits side by side", async () => {
+    const host = await fakeOpsHost();
+    const front = frontDoorFiles(host);
+    const own = (name: string) => ({
+      systemdDir: join(host.dir, `systemd-${name}`),
+      runtimeRoot: join(host.dir, `runtime-${name}`),
+      cliLink: join(host.dir, "bin", `incibase-${name}`),
+    });
+    const ownNginx = (name: string) => ({ ...host.nginx, confDir: join(host.dir, `conf-${name}`) });
+    const marker = join(host.layout.runtimeRoot, RUNTIME_OWNER_FILE);
+    const cases: [what: string, ctx: OpsTestHost, paths: string[]][] = [
+      // The same unit prefix in the same systemd directory: the units, and nginx's drop-in there.
+      ["units", secondHost(host, { root: join(host.dir, "u"), runtimeRoot: own("u").runtimeRoot, cliLink: own("u").cliLink }, ownNginx("u")), [...hostUnits(host), front.dropIn]],
+      ["nginx config", secondHost(host, { root: join(host.dir, "n"), systemdDir: own("n").systemdDir, runtimeRoot: own("n").runtimeRoot, cliLink: own("n").cliLink }), [front.conf]],
+      ["runtime root", secondHost(host, { root: join(host.dir, "r"), systemdDir: own("r").systemdDir, cliLink: own("r").cliLink }, ownNginx("r")), [marker]],
+      ["CLI link", secondHost(host, { root: join(host.dir, "c"), systemdDir: own("c").systemdDir, runtimeRoot: own("c").runtimeRoot }, ownNginx("c")), [host.layout.cliLink]],
+    ];
+    for (const [what, ctx, paths] of cases) {
+      const before = machineState(host);
+      const err = await refusedInit(ctx);
+      expect(err.message, what).toContain(`the incibase host at ${host.layout.root}`);
+      for (const path of paths) expect(err.message, what).toContain(path);
+      expect(machineState(host), what).toEqual(before);
+    }
+    expect((await refusedInit(cases[3]![1])).message).toContain(`${host.layout.cliLink} (a link into the runtime root ${host.layout.runtimeRoot})`);
+
+    // Everything its own, as the Linux tests' hosts are: both hosts init, again and again.
+    const second = secondHost(host, { ...own("s"), unitPrefix: "incibases2", groups: { proxy: "incibase-s2-proxy", admin: "incibase-s2-admin" } }, ownNginx("s"));
+    await ops.initHost(second, { domain: DOMAIN });
+    await ops.initHost(host, { domain: DOMAIN });
+    await ops.initHost(second, { domain: DOMAIN });
+    expect(recordedRoot(readFileSync(second.layout.unitFile("incibases2-check.service"), "utf8"))).toBe(second.layout.root);
+    expect(recordedRoot(readFileSync(host.layout.unitFile("incibase-check.service"), "utf8"))).toBe(host.layout.root);
+  });
+
+  test("a CLI link another host's check runs: init refuses it before that host's use-cli, use-cli refuses it after", async () => {
+    // Host A between host init and use-cli: its check unit names the link, which does not exist yet.
+    const host = await fakeOpsHost({ cli: false });
+    const own = (name: string) => ({
+      root: join(host.dir, name),
+      unitPrefix: `incibase${name}`,
+      groups: { proxy: `incibase-${name}-proxy`, admin: `incibase-${name}-admin` },
+      runtimeRoot: join(host.dir, `runtime-${name}`),
+    });
+    const ownNginx = (name: string) => ({ ...host.nginx, confDir: join(host.dir, `conf-${name}`) });
+    const link = host.layout.cliLink;
+    const b = secondHost(host, own("b"), ownNginx("b"));
+    const before = machineState(host);
+    const err = await refusedInit(b);
+    expect(err.message).toStartWith(`This machine already has the incibase host at ${host.layout.root}: `);
+    expect(err.message).toEndWith(`remove these first: ${host.layout.unitFile("incibase-check.service")} (its check runs ${link})`);
+    expect(machineState(host)).toEqual(before);
+    // Its own link: side by side.
+    const c = secondHost(host, { ...own("c"), cliLink: join(host.dir, "bin", "incibase-c") }, ownNginx("c"));
+    await ops.initHost(c, { domain: DOMAIN });
+
+    // Once A's use-cli made the link, a host that shares it (here one whose units are elsewhere, so its init did not see A's) cannot move it.
+    await ops.useCli(host, { version: VERSION });
+    const d = secondHost(host, { ...own("d"), systemdDir: join(host.dir, "systemd-d") }, ownNginx("d"));
+    // The link into A's runtime root refuses its init too; past that (a link made after it), use-cli refuses.
+    expect((await refusedInit(d)).message).toEndWith(`remove these first: ${link} (a link into the runtime root ${host.layout.runtimeRoot})`);
+    host.sys.remove(link);
+    await ops.initHost(d, { domain: DOMAIN });
+    await ops.useCli(host, { version: VERSION });
+    const binary = join(host.dir, "incibase-bin");
+    await ops.installRuntime(d, { binary, version: VERSION, sha256: sha256Hex(readFileSync(binary)) });
+    await expect(ops.useCli(d, { version: VERSION })).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: `${link} is the CLI link of the incibase host at ${host.layout.root} (${link}: a link into the runtime root ${host.layout.runtimeRoot}): moving it would move that host's check. Give this host a CLI link of its own`,
+    });
+    expect(readlinkSync(link)).toBe(host.layout.runtimeBinary(VERSION));
+  });
+
+  test("host init refuses a CLI link where someone other than root can change it: the check timer runs it as root", async () => {
+    const host = await fakeOpsHost();
+    const own = (name: string, cliLink: string) =>
+      secondHost(
+        host,
+        { root: join(host.dir, name), unitPrefix: `incibase${name}`, groups: { proxy: `incibase-${name}-p`, admin: `incibase-${name}-a` }, runtimeRoot: join(host.dir, `runtime-${name}`), cliLink },
+        { ...host.nginx, confDir: join(host.dir, `conf-${name}`) },
+      );
+    const users = join(host.dir, "users");
+    mkdirSync(users);
+    host.sys.own(users, 1000, 1000, 0o755);
+    const userLink = join(users, "incibase");
+    const err = await refusedInit(own("u", userLink));
+    expect(err.message).toBe(
+      `The CLI link ${userLink}, which the check timer runs as root, would be in ${users}, which someone other than root can change: ${users} belongs to uid 1000, not root. ` +
+        `Make ${users} root's and writable by root alone (chown root:root ${users}; chmod go-w ${users}), or give the host a CLI link in a directory only root can write`,
+    );
+    // Not in or under a directory anyone can write, sticky or not: once root's directory in /tmp is gone (a reboot),
+    // anyone could make it again, and the check unit still names the link.
+    const shared = join(host.dir, "tmp");
+    mkdirSync(shared);
+    host.sys.own(shared, 0, 0, 0o1777);
+    expect((await refusedInit(own("t", join(shared, "bin", "incibase")))).message).toContain(`${shared} is writable by someone other than root`);
+    mkdirSync(join(shared, "bin"));
+    // Never chmod go-w for a sticky directory: that would break it for everyone.
+    expect((await refusedInit(own("s", join(shared, "bin", "incibase")))).message).toEndWith(
+      `${shared} is writable by someone other than root. Give the host a CLI link in a directory only root can write`,
+    );
+    // Not there yet: fine where only root can create it.
+    await ops.initHost(own("m", join(host.dir, "opt", "bin", "incibase")), { domain: DOMAIN });
+    expect(existsSync(join(host.dir, "opt"))).toBe(false);
+  });
+
+  test("re-running host init on the same root writes nothing; host render keeps working; files without a record are its own", async () => {
+    const host = await fakeOpsHost();
+    const front = frontDoorFiles(host);
+    for (const path of hostUnits(host)) expect(recordedRoot(readFileSync(path, "utf8")), path).toBe(host.layout.root);
+    expect(recordedRoot(readFileSync(front.conf, "utf8"))).toBe(host.layout.root);
+    expect((await ops.render(host)).failed).toEqual([]);
+    const mark = host.sys.log.length;
+    await ops.initHost(host, { domain: DOMAIN });
+    await ops.initHost(host, { domain: DOMAIN });
+    expect((await ops.render(host)).failed).toEqual([]);
+    expect(host.sys.log.slice(mark)).toEqual([]);
+
+    // Files rendered before owner records (or by hand): on a host set up with this layout, init renders them again.
+    const unit = host.layout.unitFile(host.layout.units.checkService);
+    const rendered = readFileSync(unit, "utf8");
+    writeFileSync(unit, rendered.replace(`# host root: ${host.layout.root}\n`, ""));
+    writeFileSync(front.conf, readFileSync(front.conf, "utf8").replace(`# host root: ${host.layout.root}\n`, ""));
+    expect(recordedRoot(readFileSync(unit, "utf8"))).toBeNull();
+    await ops.initHost(host, { domain: DOMAIN });
+    expect(readFileSync(unit, "utf8")).toBe(rendered);
+    writeFileSync(unit, rendered.replace(`# host root: ${host.layout.root}\n`, ""));
+    expect((await ops.render(host)).failed).toEqual([]);
+    expect(readFileSync(unit, "utf8")).toBe(rendered);
+  });
+
+  test("an owner record that is missing, corrupted, behind a link or in an oversized file: refused on a new root, rendered again on its own", async () => {
+    const host = await fakeOpsHost();
+    const other = secondHost(host, { systemdDir: join(host.dir, "systemd-x"), runtimeRoot: join(host.dir, "runtime-x"), cliLink: join(host.dir, "bin", "incibase-x") }, {
+      ...host.nginx,
+      confDir: join(host.dir, "conf-x"),
+    });
+    mkdirSync(other.layout.systemdDir);
+    const planted = other.layout.unitFile(other.layout.units.checkService);
+    const header = "# Rendered by incibase from control/registry.db; changes here are overwritten.\n";
+    // A file naming the new root, which a link or an oversized file must not pass off as its own.
+    const decoy = join(host.dir, "decoy.service");
+    writeFileSync(decoy, `${header}# host root: ${other.layout.root}\n[Unit]\n`);
+    const oversized = `${header}# host root: ${other.layout.root}\n${"#".repeat(2 * 1024 * 1024)}\n`;
+    const cases: [what: string, plant: (path: string) => void, note: string][] = [
+      ["missing", (p) => writeFileSync(p, `${header}[Unit]\nDescription=by hand\n`), "names no host root"],
+      ["corrupted", (p) => writeFileSync(p, `${header}# host root: var/lib/incibase\n[Unit]\n`), "names no host root"],
+      ["corrupted bytes", (p) => writeFileSync(p, Buffer.from([0x23, 0x20, 0xff, 0xfe, 0x00, 0x0a, 0x5b])), "names no host root"],
+      ["behind a link", (p) => symlinkSync(decoy, p), "a symlink"],
+      ["a directory", (p) => mkdirSync(p), "a dir"],
+      ["oversized", (p) => writeFileSync(p, oversized), `${oversized.length} bytes, more than a rendered file`],
+    ];
+    for (const [what, plant, note] of cases) {
+      plant(planted);
+      const before = machineState(host);
+      const err = await refusedInit(other);
+      expect(err.message, what).toStartWith("This machine already has another incibase host: ");
+      expect(err.message, what).toEndWith(`remove these first: ${planted} (${note})`);
+      expect(machineState(host), what).toEqual(before);
+      expect(other.registry.getSetting("layout"), what).toBeNull();
+      rmSync(planted, { recursive: true });
+    }
+    expect(readFileSync(decoy, "utf8")).toContain(other.layout.root);
+    // With nothing planted, the new root inits.
+    await ops.initHost(other, { domain: DOMAIN });
+
+    // On a host set up with this layout, the same files are its own: rendered again as a regular file (a link replaced, never followed).
+    const unit = host.layout.unitFile(host.layout.units.checkService);
+    const rendered = readFileSync(unit, "utf8");
+    for (const [what, plant] of cases) {
+      if (what === "a directory") continue;
+      rmSync(unit);
+      plant(unit);
+      await ops.initHost(host, { domain: DOMAIN });
+      expect(lstatSync(unit).isFile(), what).toBe(true);
+      expect(readFileSync(unit, "utf8"), what).toBe(rendered);
+    }
+    expect(readFileSync(decoy, "utf8")).toBe(`${header}# host root: ${other.layout.root}\n[Unit]\n`);
+  });
+
+  test("a runtime root marker that names no host, or is a link, or is oversized, refuses init even on its own host", async () => {
+    const host = await fakeOpsHost();
+    const marker = join(host.layout.runtimeRoot, RUNTIME_OWNER_FILE);
+    const decoy = join(host.dir, "decoy-marker");
+    writeFileSync(decoy, `${host.layout.root}\n`);
+    const cases: [what: string, plant: () => void, note: string][] = [
+      ["empty", () => writeFileSync(marker, "\n"), "a file that names no host root"],
+      ["behind a link", () => symlinkSync(decoy, marker), "a symlink that names no host root"],
+      ["oversized", () => writeFileSync(marker, `${host.layout.root}\n${" ".repeat(5000)}`), "a file that names no host root"],
+    ];
+    for (const [what, plant, note] of cases) {
+      rmSync(marker);
+      plant();
+      const before = machineState(host);
+      const err = await refusedInit(host);
+      expect(err.message, what).toBe(
+        `This machine already has another incibase host: one machine runs one host, and --root moves only a host's data, so ${host.layout.root} would take over that host's files. ` +
+          `A second host needs a layout of its own (host init --layout '{"unitPrefix":"…","groups":{"proxy":"…","admin":"…"},"runtimeRoot":"…","cliLink":"…"}'). ` +
+          `If that host is gone, remove these first: ${marker} (${note})`,
+      );
+      expect(machineState(host), what).toEqual(before);
+    }
+    // Another host's name in it; then none at all: no marker is no claim.
+    rmSync(marker);
+    writeFileSync(marker, "/var/lib/incibase-elsewhere\n");
+    const elsewhere = (await refusedInit(host)).message;
+    expect(elsewhere).toStartWith("This machine already has the incibase host at /var/lib/incibase-elsewhere: ");
+    expect(elsewhere).toEndWith(`remove these first: ${marker}`);
+    rmSync(marker);
+    await ops.initHost(host, { domain: DOMAIN });
   });
 });

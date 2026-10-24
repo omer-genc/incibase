@@ -147,6 +147,7 @@ describe("the rendered config", () => {
 
   test("routes every <branch>--<project> label through hosts/, with no line per branch", () => {
     expect(nginxConfig(input)).toBe(`# Rendered by incibase from control/registry.db; changes here are overwritten.
+# host root: /var/lib/incibase
 # The front door of the incibase host at /var/lib/incibase: https://<branch>--<project>.incibase.omergenc.net
 # goes to /var/lib/incibase/hosts/<branch>--<project>/http.sock. Nothing here is per branch: the hosts/ links route.
 
@@ -333,19 +334,19 @@ server {
   });
 
   test("another host prefix, root and port get their own names, so two hosts can share one nginx on different ports", () => {
-    const other = new HostLayout({ root: "/var/lib/incibase-n11", unitPrefix: "incibase-n11" });
+    const other = new HostLayout({ root: "/var/lib/incibase-n11", unitPrefix: "incibasen11" });
     const text = nginxConfig({ ...input, layout: other, files: nginxFiles(other), port: 18443, cert: "/var/lib/incibase-n11/tls/a.crt", key: "/var/lib/incibase-n11/tls/a.key" });
-    expect(nginxFiles(other).conf).toBe("/etc/nginx/conf.d/incibase-n11.conf");
-    expect(nginxFiles(other).dropIn).toBe("/etc/systemd/system/nginx.service.d/50-incibase-n11.conf");
-    for (const name of ["zone=incibase_n11_ip:", "zone=incibase_n11_auth:", "zone=incibase_n11_ip_conn:", "zone=incibase_n11_branch_conn:", "$incibase_n11_connection {", "log_format incibase_n11_json"]) {
+    expect(nginxFiles(other).conf).toBe("/etc/nginx/conf.d/incibasen11.conf");
+    expect(nginxFiles(other).dropIn).toBe("/etc/systemd/system/nginx.service.d/50-incibasen11.conf");
+    for (const name of ["zone=incibasen11_ip:", "zone=incibasen11_auth:", "zone=incibasen11_ip_conn:", "zone=incibasen11_branch_conn:", "$incibasen11_connection {", "log_format incibasen11_json"]) {
       expect(text).toContain(name);
     }
     expect(text).toContain("set $ib /var/lib/incibase-n11/hosts/$ib_label;");
     expect(text).toContain("    listen 18443 ssl http2;\n    listen [::]:18443 ssl http2;");
     expect(text).toContain("    listen 18443 ssl http2 default_server;");
-    expect(text).toContain("access_log /var/log/nginx/incibase-n11.access.log incibase_n11_json;");
-    expect(text).toContain("error_log /var/log/nginx/incibase-n11.error.log alert;");
-    for (const name of ["$incibase_n11_client {", "$incibase_n11_auth_client {", "limit_req_zone $incibase_n11_client ", "limit_req_zone $incibase_n11_auth_client ", "Retry-After $incibase_n11_retry_after"]) {
+    expect(text).toContain("access_log /var/log/nginx/incibasen11.access.log incibasen11_json;");
+    expect(text).toContain("error_log /var/log/nginx/incibasen11.error.log alert;");
+    for (const name of ["$incibasen11_client {", "$incibasen11_auth_client {", "limit_req_zone $incibasen11_client ", "limit_req_zone $incibasen11_auth_client ", "Retry-After $incibasen11_retry_after"]) {
       expect(text).toContain(name);
     }
     expect(text).not.toContain("listen 443");
@@ -396,7 +397,9 @@ server {
   });
 
   test("the nginx drop-in keeps the front door alive under memory pressure", () => {
-    expect(nginxDropIn()).toBe("# Rendered by incibase from control/registry.db; changes here are overwritten.\n[Service]\nOOMScoreAdjust=-900\nMemoryMin=64M\n");
+    expect(nginxDropIn(new HostLayout())).toBe(
+      "# Rendered by incibase from control/registry.db; changes here are overwritten.\n# host root: /var/lib/incibase\n[Service]\nOOMScoreAdjust=-900\nMemoryMin=64M\n",
+    );
   });
 
   test("nothing that nginx would read as syntax reaches the file", () => {
@@ -451,7 +454,7 @@ describe("the front door on a host", () => {
     expect(text).toContain(`set $ib ${host.layout.hosts}/$ib_label;`);
     expect(host.sys.lstat(host.conf)).toMatchObject({ uid: 0, gid: 0, mode: 0o644 });
     expect(host.sys.getgrnam(host.layout.groups.proxy)!.members).toEqual(["www-data"]);
-    expect(readFileSync(join(host.layout.systemdDir, "nginx.service.d", "50-incibase.conf"), "utf8")).toBe(nginxDropIn());
+    expect(readFileSync(join(host.layout.systemdDir, "nginx.service.d", "50-incibase.conf"), "utf8")).toBe(nginxDropIn(host.layout));
     // Tested alone (the harness), then with the rest of nginx's config, before nginx was told.
     expect(host.fake.tests.map((t) => (t.config.endsWith("harness.conf") ? "candidate" : "whole"))).toEqual(["candidate", "candidate", "whole"]);
     expect(host.fake.tests.every((t) => t.text.includes(`ssl_certificate ${cert};`))).toBe(true);
@@ -536,6 +539,26 @@ describe("the front door on a host", () => {
     host.driver.calls.length = 0;
     expect((await ops.setTls(host, { cert: second.cert, key: second.key })).nginx).toMatchObject({ changed: false, action: null });
     expect(nginxCalls(host)).toEqual([]);
+  });
+
+  test("a drop-in that differs only in comments (one rendered before owner records) is rewritten without restarting nginx", async () => {
+    const host = await nginxHost();
+    const pair = makeCert("first");
+    await ops.initHost(host, { domain: DOMAIN, tlsCert: pair.cert, tlsKey: pair.key });
+    const dropIn = join(host.layout.systemdDir, "nginx.service.d", "50-incibase.conf");
+    const rendered = readFileSync(dropIn, "utf8");
+    const older = rendered.replace(`# host root: ${host.layout.root}\n`, "");
+    expect(older).not.toBe(rendered);
+    writeFileSync(dropIn, older);
+    host.driver.calls.length = 0;
+    expect(await ops.renderNginx(host)).toMatchObject({ changed: false, dropInChanged: true, action: null });
+    expect(readFileSync(dropIn, "utf8")).toBe(rendered);
+    expect(nginxCalls(host)).toEqual(["daemon-reload"]);
+    // A changed setting does: OOMScoreAdjust applies when the master starts.
+    writeFileSync(dropIn, rendered.replace("MemoryMin=64M", "MemoryMin=32M"));
+    host.driver.calls.length = 0;
+    expect(await ops.renderNginx(host)).toMatchObject({ dropInChanged: true, action: "restart" });
+    expect(nginxCalls(host)).toEqual(["daemon-reload", `restart ${NGINX_SERVICE}`]);
   });
 
   test("a certificate nginx rejects changes nothing: old config, old pair, no reload; the refusal is audited", async () => {

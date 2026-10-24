@@ -34,9 +34,9 @@
 // INCIBASE_TEST_BINARY, a standalone incibase for this machine
 // (`bun scripts/build-binary.ts`). Uses its own host root
 // (INCIBASE_TEST_HOST_ROOT, default /var/lib/incibase-iso15), uid base
-// (INCIBASE_TEST_UID_BASE, default 82000), unit prefix, groups, runtime root
-// and dummy interface named after the root and uid base, and removes
-// everything it created.
+// (INCIBASE_TEST_UID_BASE, default 82000), unit prefix, groups, runtime root,
+// CLI link and dummy interface named after the root and uid base, and
+// removes everything it created.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -55,14 +55,19 @@ const UID_BASE = Number(process.env.INCIBASE_TEST_UID_BASE ?? 82000);
 const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const REQUIRE_SANDBOX = process.env.INCIBASE_TEST_REQUIRE_SANDBOX === "1";
 const MARKER = ".incibase-test-root";
-const LABEL = basename(ROOT).slice(0, 24);
+// No hyphens: systemd puts a-b.slice under a.slice, so incibase-x.slice would count against the owner's incibase.slice.
+const LABEL = basename(ROOT).replace(/[^a-z0-9]/g, "").slice(0, 24);
+const APPS = `/tmp/${LABEL}-apps`;
+const BIN = `/usr/local/lib/${LABEL}-bin`;
 const LAYOUT = {
   unitPrefix: LABEL,
   groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` },
   runtimeRoot: `/usr/local/lib/${LABEL}`,
   systemdDir: "/etc/systemd/system",
+  // What the check service runs, in a directory only root can create or change (never under /tmp, where anyone
+  // could make it again once it is gone), never the machine's own /usr/local/bin/incibase.
+  cliLink: `${BIN}/incibase`,
 };
-const APPS = `/tmp/${LABEL}-apps`;
 const DOMAIN = "incibase.example.net";
 const SLOW = 300_000;
 /** zzz-lxc-service.conf turns ProtectSystem/ProtectProc/NoNewPrivileges off; on a VM it is absent. */
@@ -260,6 +265,7 @@ function cleanup() {
   rmSync(ROOT, { recursive: true, force: true });
   rmSync(LAYOUT.runtimeRoot, { recursive: true, force: true });
   rmSync(APPS, { recursive: true, force: true });
+  rmSync(BIN, { recursive: true, force: true });
 }
 
 // ---- the network probes' targets and controls ----------------------------------

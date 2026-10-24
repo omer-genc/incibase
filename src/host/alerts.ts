@@ -191,8 +191,9 @@ const setSettingSchema = z.discriminatedUnion("key", [
 ]);
 
 /**
- * `incibase host set alert_webhook <url>`: where alerts go. Only https URLs;
- * the audit row keeps the host, never the URL (an ntfy topic is its secret).
+ * `incibase host set alert_webhook <url|->`: where alerts go. Only https URLs;
+ * the audit row keeps the host, never the URL (an ntfy topic is its secret;
+ * `-` reads it from stdin so it stays off the command line too).
  */
 export async function setSetting(ctx: OpsContext, input: z.input<typeof setSettingSchema>) {
   const parsed = setSettingSchema.safeParse(input);

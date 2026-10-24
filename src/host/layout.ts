@@ -25,7 +25,8 @@
 // `incibase-branch@.service`, `incibase-preflight@.service`,
 // `incibase-snapshot@.service`, `incibase.slice`, per-branch drop-ins and the transient
 // `incibase-release-<id>-<seq>` jobs. A test host picks its own prefix, so
-// hosts sharing a machine never touch each other's units.
+// hosts sharing a machine never touch each other's units (one word: a hyphen
+// would nest its slice under another host's).
 import { isAbsolute, join, normalize, relative } from "node:path";
 import { branchUser, checkBranchId, checkLabel, NameError } from "./names.ts";
 
@@ -38,8 +39,13 @@ export const DEFAULT_UNIT_PREFIX = "incibase";
 export const DEFAULT_GROUPS = { proxy: "incibase-proxy", admin: "incibase-admin" } as const;
 /** Runtime versions as `incibase --version` prints them; they name directories. */
 export const RUNTIME_VERSION_REGEX = /^\d{1,4}\.\d{1,5}\.\d{1,6}(?:-[0-9A-Za-z.]{1,40})?$/;
-/** A unit prefix: what `incibase` is in the unit names; lowercase words joined by single hyphens. */
-const UNIT_PREFIX = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+/**
+ * A unit prefix: what `incibase` is in the unit names; one lowercase word.
+ * Never a hyphen: systemd nests `a-b.slice` under `a.slice`, so a second
+ * host prefixed `incibase-b` would run its branches inside the first one's
+ * slice, under its MemoryMax.
+ */
+const UNIT_PREFIX = /^[a-z][a-z0-9]*$/;
 
 /** Who owns a path: root, or a branch's own user (and group). */
 export type Principal = "root" | "branch";
@@ -84,7 +90,7 @@ export function checkRuntimeVersion(value: unknown): string {
 
 export function checkUnitPrefix(value: unknown): string {
   if (typeof value !== "string" || value.length > 32 || !UNIT_PREFIX.test(value)) {
-    throw new NameError(`Invalid unit prefix ${JSON.stringify(value)}: lowercase letters, digits and single hyphens, at most 32`);
+    throw new NameError(`Invalid unit prefix ${JSON.stringify(value)}: lowercase letters and digits, starting with a letter, at most 32 (no hyphen: systemd would nest its slice under another's)`);
   }
   return value;
 }

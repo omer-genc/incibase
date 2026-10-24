@@ -4,7 +4,11 @@
 // `incibase-snapshot@.service`, `incibase.slice` and each branch's drop-ins. The text builders here are pure; the writers
 // write a file atomically (temp file, fsync, rename, via HostSystem) and only
 // when its content, owner or mode differ, and say whether a unit file changed,
-// so the caller runs `systemctl daemon-reload` once, and only then.
+// so the caller runs `systemctl daemon-reload` once, and only then. The
+// host's own units (the templates, the slice and the check timer's two) name
+// the host root they belong to (ownerRecord), so `host init` of another root
+// refuses them: one machine runs one host.
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { VERSION } from "../engine/version.ts";
 import type { BranchConfig, ResolvedLimits } from "./config.ts";
 import { authConcurrency, drainMs, durationText, parseConfig, parseLimits, resolveLimits, stopTimeoutSec, systemdSize, timeoutsFlag } from "./config.ts";
@@ -12,6 +16,7 @@ import { RUNTIME_VERSION_REGEX, type HostLayout } from "./layout.ts";
 import { branchUser, checkDomain, checkEnvName, checkLabel } from "./names.ts";
 import type { HostContext } from "./provision.ts";
 import type { BranchRow, EnvRow, ReleaseRow, ServiceKeyRow } from "./registry.ts";
+import type { FileInfo, HostSystem } from "./system.ts";
 
 /** Values systemd reads the same unquoted: no spaces, quotes, backslashes or comment marks. */
 const PLAIN_VALUE = /^[A-Za-z0-9_@%+=:,./-]*$/;
@@ -72,6 +77,31 @@ export function adminIndexContent(branches: BranchRow[], domain: string | null):
 // ---- systemd units ---------------------------------------------------------
 
 const HEADER = "# Rendered by incibase from control/registry.db; changes here are overwritten.\n";
+/** What an owner record says: `# host root: <root>`. */
+const OWNER_RECORD = /^# host root: (\/[A-Za-z0-9_./:=,@+-]*)$/;
+
+/**
+ * The owner record of a file every host of a layout would write in the same
+ * place (its units, the nginx front door): the host root it belongs to. One
+ * machine runs one host, and `host init` of another root refuses a file
+ * that names someone else (ops.checkMachineOwner).
+ */
+export function ownerRecord(layout: HostLayout): string {
+  return `# host root: ${word(layout.root)}\n`;
+}
+
+/** The host root a rendered file's leading comments name; null when they name none (or not readably). */
+export function recordedRoot(text: string): string | null {
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("#")) break;
+    const match = OWNER_RECORD.exec(line);
+    if (match) return match[1]!;
+  }
+  return null;
+}
+
+/** The header of a host unit: rendered, and whose. */
+const hostHeader = (layout: HostLayout) => `${HEADER}${ownerRecord(layout)}`;
 /**
  * Network the sandbox denies: loopback, private ranges (IPv4 and IPv6
  * unique-local), the shared/CGNAT range an overlay such as Tailscale uses,
@@ -126,7 +156,7 @@ function sandbox(layout: HostLayout, writable: string[]): string {
 /** `incibase-branch@.service`: what every branch shares. The per-branch drop-in adds the user, command and limits. */
 export function branchTemplateUnit(layout: HostLayout): string {
   const writable = ["/data", "/run/http", "/run/admin"].map((rest) => instancePath(layout.branches, rest));
-  return `${HEADER}[Unit]
+  return `${hostHeader(layout)}[Unit]
 Description=incibase branch %i
 Wants=network-online.target
 After=network-online.target
@@ -157,7 +187,7 @@ WantedBy=multi-user.target
 
 /** `incibase-preflight@.service`: the same sandbox, where only the branch's preflight dir is writable. */
 export function preflightTemplateUnit(layout: HostLayout): string {
-  return `${HEADER}[Unit]
+  return `${hostHeader(layout)}[Unit]
 Description=incibase preflight %i
 RequiresMountsFor=${word(layout.root)}
 
@@ -186,7 +216,7 @@ export const SNAPSHOT_RUNTIME_MAX_SEC = 900;
  * maps data.db-shm; nothing else is. No EnvironmentFile: the copy needs no secret.
  */
 export function snapshotTemplateUnit(layout: HostLayout): string {
-  return `${HEADER}[Unit]
+  return `${hostHeader(layout)}[Unit]
 Description=incibase snapshot %i
 RequiresMountsFor=${word(layout.root)}
 
@@ -202,8 +232,8 @@ ${sandbox(layout, [instancePath(layout.branches, "/data"), instancePath(layout.b
 }
 
 /** `incibase.slice`: all branches together stay under this much memory. */
-export function sliceUnit(memoryMax: number | null): string {
-  return `${HEADER}[Unit]
+export function sliceUnit(layout: HostLayout, memoryMax: number | null): string {
+  return `${hostHeader(layout)}[Unit]
 Description=incibase branches
 
 [Slice]
@@ -331,19 +361,36 @@ ${limitLines(limits, config)}
  * Installed runtime versions root can trust to run as a tenant, oldest first
  * (semver): the binary a root-owned regular file (lstat, so never a symlink),
  * world-executable and writable by no one else, in a root-owned version
- * directory and runtime root that no one else can write either.
+ * directory and runtime root that no one else can write either, on a way
+ * from / that only root controls (rootOnlyDir).
  */
 export function trustedRuntimes(ctx: HostContext): string[] {
   const { sys, layout } = ctx;
-  const rootOnly = (path: string, type: "dir" | "file", mustAllow = 0) => {
-    const info = sys.lstat(path);
-    return info?.type === type && info.uid === 0 && (info.mode & 0o022) === 0 && (info.mode & mustAllow) === mustAllow;
-  };
-  if (!rootOnly(layout.runtimeRoot, "dir")) return [];
+  if (!rootOnlyPath(sys, layout.runtimeRoot, "dir") || rootOnlyDir(sys, dirname(layout.runtimeRoot))) return [];
   return sys
     .readdir(layout.runtimeRoot)
-    .filter((v) => RUNTIME_VERSION_REGEX.test(v) && rootOnly(layout.runtimeDir(v), "dir") && rootOnly(layout.runtimeBinary(v), "file", 0o005))
+    .filter((v) => RUNTIME_VERSION_REGEX.test(v) && runtimeFilesRootOnly(sys, layout, v))
     .sort(Bun.semver.order);
+}
+
+/** `path` (lstat, so never a symlink) is a `type` of root's that no one else can write, with the `mustAllow` mode bits. */
+function rootOnlyPath(sys: HostSystem, path: string, type: "dir" | "file", mustAllow = 0): boolean {
+  const info = sys.lstat(path);
+  return info?.type === type && info.uid === 0 && (info.mode & 0o022) === 0 && (info.mode & mustAllow) === mustAllow;
+}
+
+/**
+ * The files of the runtime `version` as trustedRuntimes needs them, what is
+ * above the runtime root aside: its binary, version directory and the
+ * runtime root itself root's and writable by root alone, the binary
+ * world-executable. What install-runtime puts back (installRuntime).
+ */
+export function runtimeFilesRootOnly(sys: HostSystem, layout: HostLayout, version: string): boolean {
+  return (
+    rootOnlyPath(sys, layout.runtimeRoot, "dir") &&
+    rootOnlyPath(sys, layout.runtimeDir(version), "dir") &&
+    rootOnlyPath(sys, layout.runtimeBinary(version), "file", 0o005)
+  );
 }
 
 export interface HostRuntime {
@@ -365,6 +412,191 @@ export function hostRuntime(ctx: HostContext, pinned: string | null): HostRuntim
   const trusted = trustedRuntimes(ctx);
   const version = trusted.filter((v) => v === VERSION || v === pinned).at(-1) ?? (pinned === null ? trusted.at(-1) : undefined);
   return version ? { version, binary: ctx.layout.runtimeBinary(version) } : null;
+}
+
+/** Links followed on the way to a path before giving up, as the kernel does (MAXSYMLINKS). */
+const MAX_LINKS = 40;
+
+/** A part of the way to a directory that root does not control alone: `why` completes "<path> …". */
+export interface NotRootOnly {
+  path: string;
+  why: string;
+}
+
+/**
+ * Whether root alone controls what the directory `dir` holds: every
+ * directory on the way from /, through the links on the way, root's and
+ * writable by no one else, since whoever can write one can rename what is
+ * below it and put their own in its place. Not even a sticky one (/tmp):
+ * no one else can rename root's entries in it, but a unit names the path
+ * long after this check, and once root's entry is gone (a reboot clears
+ * /tmp) anyone can make it again. With `missing`, a part of the way that
+ * does not exist yet is fine when only root can create it. The first part
+ * that fails; null when none does.
+ */
+export function rootOnlyDir(sys: HostSystem, dir: string, missing = false): NotRootOnly | null {
+  if (!isAbsolute(dir)) return { path: dir, why: "is not an absolute path" };
+  const rest = dir.split("/").filter(Boolean);
+  let at = "/";
+  let links = 0;
+  const notOnly = (info: FileInfo | null): string | null => {
+    if (!info) return "does not exist";
+    if (info.type !== "dir") return `is a ${info.type}, not a directory`;
+    if (info.uid !== 0) return `belongs to uid ${info.uid}, not root`;
+    if ((info.mode & 0o022) !== 0) return "is writable by someone other than root";
+    return null;
+  };
+  const first = notOnly(sys.lstat(at));
+  if (first) return { path: at, why: first };
+  while (rest.length) {
+    const name = rest.shift()!;
+    if (name === ".") continue;
+    if (name === "..") {
+      at = dirname(at);
+      continue;
+    }
+    const path = join(at, name);
+    const info = sys.lstat(path);
+    // Not there yet: its parent is root's alone (checked on the way), so only root can create it.
+    if (!info && missing) return null;
+    if (info?.type === "symlink") {
+      if (info.uid !== 0) return { path, why: `is a link that belongs to uid ${info.uid}, not root` };
+      if (++links > MAX_LINKS) return { path, why: `leads through more than ${MAX_LINKS} links` };
+      const target = sys.readlink(path) ?? "";
+      rest.unshift(...target.split("/").filter(Boolean));
+      if (isAbsolute(target)) at = "/";
+      continue;
+    }
+    const why = notOnly(info);
+    if (why) return { path, why };
+    at = path;
+  }
+  return null;
+}
+
+/** Where `path` leads with its links followed, as stat() does: the last path, and what is there (null: nothing, or a loop). */
+function follow(sys: HostSystem, path: string): { path: string; info: FileInfo | null } {
+  for (let i = 0; i <= MAX_LINKS; i++) {
+    const info = sys.lstat(path);
+    if (info?.type !== "symlink") return { path, info };
+    path = resolve(dirname(path), sys.readlink(path) ?? "");
+  }
+  return { path, info: null };
+}
+
+/**
+ * What the CLI link runs: a trusted installed runtime, or why not.
+ * `skipped`: there is no executable regular file at the end of the link,
+ * which is what the check service's ConditionFileIsExecutable= tests
+ * (stat(), so through every link), so systemd skips its runs. `fix` is what
+ * puts it right when `host use-cli` cannot; null when use-cli does.
+ */
+export type CliLinkRuntime =
+  | { ok: true; version: string }
+  | {
+      ok: false;
+      skipped: boolean;
+      problem: string;
+      fix: string | null;
+      /** The link's directory, which does not exist yet: root creates it (only root can) before use-cli. */
+      createDir?: string;
+    };
+
+/** "chown root:root <path>; chmod go-w <path>": root's, and writable by root alone. */
+const rootOnlyFix = (path: string) => `chown root:root ${path}; chmod go-w ${path}`;
+
+/**
+ * What puts right a part of the way to the CLI link's directory that root
+ * does not control alone (rootOnlyDir). chown and chmod only for a plain
+ * directory: never a sticky one (go-w would break /tmp for everyone), nor a
+ * link, a file or a path that is not there.
+ */
+export function cliLinkPlaceFix(sys: HostSystem, bad: NotRootOnly): string {
+  const elsewhere = "give the host a CLI link in a directory only root can write";
+  const info = sys.lstat(bad.path);
+  return info?.type === "dir" && (info.mode & 0o1000) === 0 ? `make ${bad.path} root's and writable by root alone (${rootOnlyFix(bad.path)}), or ${elsewhere}` : elsewhere;
+}
+
+/**
+ * What puts right a part of the way to the runtime root that root does not
+ * control alone, as cliLinkPlaceFix does for the CLI link; null when there
+ * is none. No runtime is trusted until then, whatever its own files are.
+ */
+export function runtimeRootPlaceFix(sys: HostSystem, layout: HostLayout): string | null {
+  // Not there yet is fine when only root can create it: install-runtime does.
+  const bad = rootOnlyDir(sys, dirname(layout.runtimeRoot), true);
+  if (!bad) return null;
+  const elsewhere = "give the host a runtime root in a directory only root can write";
+  const info = sys.lstat(bad.path);
+  return info?.type === "dir" && (info.mode & 0o1000) === 0
+    ? `make ${bad.path}, on the way to ${layout.runtimeRoot}, root's and writable by root alone (${rootOnlyFix(bad.path)}), or ${elsewhere}`
+    : `${elsewhere} (${bad.path}, on the way to ${layout.runtimeRoot}, ${bad.why})`;
+}
+
+/**
+ * What makes the installed runtime `version` trusted (trustedRuntimes), as
+ * use-cli needs: the way to the runtime root (runtimeRootPlaceFix), then
+ * install-runtime of it again, which makes its files root's alone once a
+ * root-only copy of their bytes is the recorded ones, and puts those back
+ * otherwise. Never chown by hand: whoever could write the binary may have
+ * changed it, and chown would make their bytes root's.
+ */
+export function runtimeFix(sys: HostSystem, layout: HostLayout, version: string): string {
+  const steps = [runtimeRootPlaceFix(sys, layout)];
+  if (!runtimeFilesRootOnly(sys, layout, version)) steps.push(`install it again (host install-runtime --version ${version}), which makes its files root's alone`);
+  return steps.filter((s) => s !== null).join(", then ");
+}
+
+/**
+ * Whether the runtime `version` is installed (recorded, its binary there)
+ * but not trusted: use-cli refuses it, so runtimeFix is what to do.
+ */
+export function untrustedRuntime(ctx: HostContext, version: string): boolean {
+  const { sys, layout, registry } = ctx;
+  return registry.getRuntime(version) !== null && sys.lstat(layout.runtimeBinary(version))?.type === "file" && !trustedRuntimes(ctx).includes(version);
+}
+
+/**
+ * What root runs when it runs the CLI link (the check service every 30 s,
+ * `sudo incibase`): fine only when the link is a symlink, in a directory
+ * only root controls (rootOnlyDir), straight to the binary of a trusted
+ * runtime (trustedRuntimes). `problem` completes "<link> …".
+ */
+export function cliLinkRuntime(ctx: HostContext): CliLinkRuntime {
+  const { sys, layout } = ctx;
+  const link = layout.cliLink;
+  const info = sys.lstat(link);
+  const end = follow(sys, link);
+  const skipped = end.info?.type !== "file" || (end.info.mode & 0o111) === 0;
+  // Whoever can change its directory can put their own incibase there, linked or not.
+  const dir = rootOnlyDir(sys, dirname(link), true);
+  if (dir) {
+    return { ok: false, skipped, problem: `is in ${dirname(link)}, which someone other than root can change (${dir.path} ${dir.why})`, fix: cliLinkPlaceFix(sys, dir) };
+  }
+  // Root's alone, but not there yet (a custom layout): root creates it, then use-cli.
+  if (rootOnlyDir(sys, dirname(link))) return { ok: false, skipped: true, problem: `is in ${dirname(link)}, which does not exist`, fix: null, createDir: dirname(link) };
+  if (!info) return { ok: false, skipped: true, problem: "does not exist", fix: null };
+  if (info.type !== "symlink") {
+    const what = info.type === "file" && skipped ? "a file no one can execute" : `a ${info.type}`;
+    return { ok: false, skipped, problem: `is ${what}, not a link to an installed runtime`, fix: null };
+  }
+  const target = resolve(dirname(link), sys.readlink(link) ?? "");
+  if (skipped) {
+    const there = end.info ? (end.info.type === "file" ? "a file no one can execute" : `a ${end.info.type}`) : null;
+    const leads = end.path === target ? (there ? `which is ${there}` : "which does not exist") : `which leads to ${end.path}, ${there ? `which is ${there}` : "where there is nothing"}`;
+    return { ok: false, skipped, problem: `points at ${target}, ${leads}`, fix: null };
+  }
+  const version = trustedRuntimes(ctx).find((v) => layout.runtimeBinary(v) === target);
+  if (version !== undefined) return { ok: true, version };
+  const installed = basename(target) === "incibase" && dirname(dirname(target)) === layout.runtimeRoot && RUNTIME_VERSION_REGEX.test(basename(dirname(target)));
+  if (!installed) return { ok: false, skipped, problem: `points at ${target}, not at a runtime installed in ${layout.runtimeRoot} that only root can write`, fix: null };
+  // The runtime use-cli would link again: its files are what to put right.
+  return {
+    ok: false,
+    skipped,
+    problem: `points at ${target}, a runtime in ${layout.runtimeRoot} that someone other than root can change`,
+    fix: `${runtimeFix(sys, layout, basename(dirname(target)))}, or point it at another installed runtime (host use-cli <version>)`,
+  };
 }
 
 /** `incibase-snapshot@<id>.service.d/10-incibase.conf`: the branch's user and limits, `_snapshot` of the runtime hostRuntime picked. */
@@ -421,7 +653,7 @@ export function removeIfPresent(ctx: HostContext, path: string): boolean {
   return true;
 }
 
-/** The host's units: the two templates and the slice. True when one changed. */
+/** The host's units: the three templates, the slice and the check timer's two. True when one changed. */
 export function renderHostUnits(ctx: HostContext): boolean {
   const { layout, registry } = ctx;
   ensureDir(ctx, layout.systemdDir);
@@ -429,32 +661,50 @@ export function renderHostUnits(ctx: HostContext): boolean {
   let changed = writeIfChanged(ctx, layout.unitFile(layout.units.branchTemplate), branchTemplateUnit(layout), UNIT_FILE);
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.preflightTemplate), preflightTemplateUnit(layout), UNIT_FILE) || changed;
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.snapshotTemplate), snapshotTemplateUnit(layout), UNIT_FILE) || changed;
-  changed = writeIfChanged(ctx, layout.unitFile(layout.units.slice), sliceUnit(Number.isSafeInteger(sliceMax) && sliceMax > 0 ? sliceMax : null), UNIT_FILE) || changed;
-  if (ctx.self) changed = renderCheckUnits(ctx, ctx.self) || changed;
+  changed = writeIfChanged(ctx, layout.unitFile(layout.units.slice), sliceUnit(layout, Number.isSafeInteger(sliceMax) && sliceMax > 0 ? sliceMax : null), UNIT_FILE) || changed;
+  changed = renderCheckUnits(ctx) || changed;
   return changed;
 }
 
 // ---- the check timer (design section 9) ------------------------------------
 
-/** `<prefix>-check.service`: one `incibase host check` of this host, as root. */
-export function checkServiceUnit(layout: HostLayout, self: string[]): string {
-  if (!self.length) throw new Error("The check service needs the command that runs incibase");
-  return `${HEADER}[Unit]
+/**
+ * `<prefix>-check.service`: one `incibase host check` of this host, as root,
+ * every 30 s. It runs the CLI link (`host use-cli`), the link's own path,
+ * never the binary that rendered it: `host init` runs from a download in a
+ * login account's home, which that account (anything running as it) can
+ * replace. Through the link root runs an installed runtime, the check
+ * follows `use-cli` without a render, and gc keeps what it runs (it keeps
+ * the link's runtime). Until the link points at an executable file, systemd
+ * skips each run instead of failing it: path conditions follow symlinks, so
+ * a missing link and one to nothing are both unmet; the service stays
+ * inactive and the timer goes on firing (systemd 255). `host doctor` says
+ * so (cliLinkRuntime).
+ */
+export function checkServiceUnit(layout: HostLayout): string {
+  return `${hostHeader(layout)}[Unit]
 Description=incibase health check of ${word(layout.root)}
 After=network-online.target
+# Skipped, not failed, until host use-cli points the link at an installed runtime.
+${cliCondition(layout)}
 
 [Service]
 Type=oneshot
-ExecStart=${[...self, "host", "check", "--root", layout.root].map(word).join(" ")}
+ExecStart=${word(layout.cliLink)} host check --root ${word(layout.root)}
 Environment=NO_COLOR=1
 # Probes run in parallel with a 5 s timeout and an alert POST has 10 s; anything longer is stuck.
 TimeoutStartSec=120
 `;
 }
 
+/** The check service's line that names the CLI link it runs; another host's init looks for it (ops.foreignPaths). */
+export function cliCondition(layout: HostLayout): string {
+  return `ConditionFileIsExecutable=${word(layout.cliLink)}`;
+}
+
 /** `<prefix>-check.timer`: the check every 30 s; a oneshot never runs twice at once. */
 export function checkTimerUnit(layout: HostLayout): string {
-  return `${HEADER}[Unit]
+  return `${hostHeader(layout)}[Unit]
 Description=incibase health check every 30 s
 
 [Timer]
@@ -473,9 +723,9 @@ WantedBy=timers.target
  * The check service and timer, and the timer's boot link unless the host
  * turned the timer off (setting check_timer = off). True when one changed.
  */
-export function renderCheckUnits(ctx: HostContext, self: string[]): boolean {
+export function renderCheckUnits(ctx: HostContext): boolean {
   const { layout, sys } = ctx;
-  let changed = writeIfChanged(ctx, layout.unitFile(layout.units.checkService), checkServiceUnit(layout, self), UNIT_FILE);
+  let changed = writeIfChanged(ctx, layout.unitFile(layout.units.checkService), checkServiceUnit(layout), UNIT_FILE);
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.checkTimer), checkTimerUnit(layout), UNIT_FILE) || changed;
   const wants = layout.timerWantsLink();
   if (ctx.registry.getSetting("check_timer") !== "off") {
