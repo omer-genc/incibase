@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { parseDrainTimeout } from "../engine/drain.ts";
+import { stopWithOutput } from "../engine/output.ts";
 import { parseTimeouts } from "../engine/timeouts.ts";
 import { VERSION } from "../engine/version.ts";
 import { MiB, parseSize, resolveLimits, type BranchConfig, type BranchLimits } from "./config.ts";
@@ -97,9 +98,12 @@ export const processIO: CommandIO = {
     // Ctrl-C on `logs -f` reaches journalctl too (one process group); this process waits for it to end.
     const ignore = () => {};
     process.on("SIGINT", ignore);
+    let forget = () => {};
     try {
       // Its output is the tenant's, so it never reaches the terminal unread (escape sequences): see logs.
       const child = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "pipe", env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LC_ALL: "C.UTF-8", SYSTEMD_COLORS: "0" } });
+      // `logs -f | head`: once head exits, this process does (output.ts), and journalctl with it.
+      forget = stopWithOutput(child);
       const stderr = (async () => {
         let text = "";
         for await (const chunk of child.stderr.pipeThrough(new TextDecoderStream())) if (text.length < MAX_STDERR) text += chunk;
@@ -118,6 +122,7 @@ export const processIO: CommandIO = {
       if (rest) line(rest);
       return { code: await child.exited, stderr: await stderr };
     } finally {
+      forget();
       process.off("SIGINT", ignore);
     }
   },

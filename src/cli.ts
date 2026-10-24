@@ -17,6 +17,7 @@ import { loadAppFromDir, schemaOf } from "./engine/loader.ts";
 import { verifyBundle } from "./engine/manifest.ts";
 import { color, isJson, logEvent, parseLogFormat, setLogFormat, stripQuery } from "./engine/log.ts";
 import { MigrationError } from "./engine/migrate.ts";
+import { guardOutput } from "./engine/output.ts";
 import { finishMigrateOnly } from "./engine/preflight.ts";
 import { handleReloads, serviceKeysFromEnv, type ReloadTarget } from "./engine/service-keys.ts";
 import { checkHostedSecrets, corsOriginsFromEnv } from "./engine/surface.ts";
@@ -181,6 +182,8 @@ function requestedLogFormat(argv: string[]): string | undefined {
 }
 
 export async function runCli(argv: string[], options: CliOptions = {}) {
+  // `incibase logs shop/prod | head`: a reader that went away ends the command quietly (exit 0).
+  guardOutput();
   // Host commands have their own flags; loaded only when asked for.
   if (argv[0] === "host") {
     if (options.embedded) {
