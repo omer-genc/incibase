@@ -14,6 +14,13 @@ M1 Faz B: tek sunucuda birden fazla proje ve branch barındıran host katmanı. 
 - **Check timer ve alarmlar.** 30 s'de bir health, takılan branch'i öldürme, `failed` unit'i bir kez yeniden deneme, disk eşikleri; alarmlar `host set alert_webhook` ile (ör. ntfy.sh). `host doctor` host'un dayandığı her şeyi OK/WARN/FAIL olarak denetler.
 - **Admin yalnızca SSH ile.** Laptopta `incibase tunnel <project>/<branch> --ssh <host>` dashboard'u ve MCP'yi branch'in admin soketine tüneller; `host add-admin` hesabı admin grubuna ekler.
 - **Sırlar ve servis anahtarları.** `env import … -` sırları stdin'den alır; servis anahtarları yalnızca sha256'larıyla tutulur ve restart'sız iptal edilir.
+- **Check timer CLI link'ini çalıştırır.** `incibase-check.service` `/usr/local/bin/incibase`'i (link'in kendisini) çalıştırır, `host init`'i çalıştıran binary'yi değil; `host use-cli` check'i de yeni sürüme geçirir, kurulumda `use-cli`'dan sonra `host render` gerekmez. Link yokken çalıştırmalar atlanır; `host doctor`'ın yeni `cli link` satırı ve `check timer` satırı bunu FAIL olarak söyler, `host init` sonraki adım olarak `install-runtime` ve `use-cli`'ı yazar.
+- **Bir makinede bir host.** `host init`, layout'unun makine çapındaki dosyaları (unit'ler, nginx config'i ve drop-in'i, runtime root, CLI link) başka bir host root'una aitse hiçbir şey yazmadan CONFLICT ile reddeder. Unit'ler ve nginx dosyaları `# host root: <root>` satırı taşır.
+- **`host set alert_webhook -`** URL'yi (ntfy topic'i bir sırdır) komut satırı yerine stdin'den okur; sudo logunda, journal'da ve `ps`'te görünmez.
+
+### Düzeltilen
+
+- Çıktıyı okuyan süreç kapanınca (`incibase logs shop/prod | head`) CLI EPIPE yığın izi basmadan 0 ile çıkar ve okuduğu alt süreci (journalctl, tunnel'ın ssh'i) durdurur. Diğer yazma hataları stderr'e yazılır ve 1 ile çıkar. Her komut için geçerli.
 
 ### Bilinen sınırlar
 
