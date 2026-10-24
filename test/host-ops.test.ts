@@ -522,9 +522,9 @@ describe("one machine, one host", () => {
   });
 
   test("host init on the command line: a refused new root gets no registry, and the error names the host", async () => {
-    const host = await fakeOpsHost({ unitPrefix: "incibase-o1" });
+    const host = await fakeOpsHost({ unitPrefix: "incibaseo1" });
     const root = join(host.dir, "fresh");
-    const layout = { runtimeRoot: host.layout.runtimeRoot, systemdDir: host.layout.systemdDir, unitPrefix: "incibase-o1", cliLink: host.layout.cliLink };
+    const layout = { runtimeRoot: host.layout.runtimeRoot, systemdDir: host.layout.systemdDir, unitPrefix: "incibaseo1", cliLink: host.layout.cliLink };
     // The real open: checked before Registry.open would create <root>/control.
     expect(() => processIO.open({ root, layout, create: true })).toThrow(`This machine already has the incibase host at ${host.layout.root}`);
     expect(existsSync(root)).toBe(false);
@@ -557,11 +557,11 @@ describe("one machine, one host", () => {
     expect((await refusedInit(cases[3]![1])).message).toContain(`${host.layout.cliLink} (a link into the runtime root ${host.layout.runtimeRoot})`);
 
     // Everything its own, as the Linux tests' hosts are: both hosts init, again and again.
-    const second = secondHost(host, { ...own("s"), unitPrefix: "incibase-s2", groups: { proxy: "incibase-s2-proxy", admin: "incibase-s2-admin" } }, ownNginx("s"));
+    const second = secondHost(host, { ...own("s"), unitPrefix: "incibases2", groups: { proxy: "incibase-s2-proxy", admin: "incibase-s2-admin" } }, ownNginx("s"));
     await ops.initHost(second, { domain: DOMAIN });
     await ops.initHost(host, { domain: DOMAIN });
     await ops.initHost(second, { domain: DOMAIN });
-    expect(recordedRoot(readFileSync(second.layout.unitFile("incibase-s2-check.service"), "utf8"))).toBe(second.layout.root);
+    expect(recordedRoot(readFileSync(second.layout.unitFile("incibases2-check.service"), "utf8"))).toBe(second.layout.root);
     expect(recordedRoot(readFileSync(host.layout.unitFile("incibase-check.service"), "utf8"))).toBe(host.layout.root);
   });
 
@@ -570,7 +570,7 @@ describe("one machine, one host", () => {
     const host = await fakeOpsHost({ cli: false });
     const own = (name: string) => ({
       root: join(host.dir, name),
-      unitPrefix: `incibase-${name}`,
+      unitPrefix: `incibase${name}`,
       groups: { proxy: `incibase-${name}-proxy`, admin: `incibase-${name}-admin` },
       runtimeRoot: join(host.dir, `runtime-${name}`),
     });
@@ -608,7 +608,7 @@ describe("one machine, one host", () => {
     const own = (name: string, cliLink: string) =>
       secondHost(
         host,
-        { root: join(host.dir, name), unitPrefix: `incibase-${name}`, groups: { proxy: `incibase-${name}-p`, admin: `incibase-${name}-a` }, runtimeRoot: join(host.dir, `runtime-${name}`), cliLink },
+        { root: join(host.dir, name), unitPrefix: `incibase${name}`, groups: { proxy: `incibase-${name}-p`, admin: `incibase-${name}-a` }, runtimeRoot: join(host.dir, `runtime-${name}`), cliLink },
         { ...host.nginx, confDir: join(host.dir, `conf-${name}`) },
       );
     const users = join(host.dir, "users");

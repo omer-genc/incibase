@@ -668,19 +668,19 @@ describe("alert delivery", () => {
 
 describe("the check timer", () => {
   test("its service and timer are rendered with the host's units, enabled and started; the service runs the CLI link", async () => {
-    const host = await fakeOpsHost({ unitPrefix: "incibase-c13" });
-    const service = readFileSync(host.layout.unitFile("incibase-c13-check.service"), "utf8");
+    const host = await fakeOpsHost({ unitPrefix: "incibasec13" });
+    const service = readFileSync(host.layout.unitFile("incibasec13-check.service"), "utf8");
     // The link's own path, skipped until it points at something executable: never the binary that ran host init.
     expect(service).toContain(`ExecStart=${host.layout.cliLink} host check --root ${host.layout.root}\n`);
     expect(service).toContain(`ConditionFileIsExecutable=${host.layout.cliLink}\n`);
     expect(service).not.toContain(host.self[0]!);
     expect(service).toContain("Type=oneshot\n");
-    const timer = readFileSync(host.layout.unitFile("incibase-c13-check.timer"), "utf8");
+    const timer = readFileSync(host.layout.unitFile("incibasec13-check.timer"), "utf8");
     expect(timer).toContain("OnUnitActiveSec=30s\n");
-    expect(timer).toContain("Unit=incibase-c13-check.service\n");
-    expect(host.sys.readlink(host.layout.timerWantsLink().path)).toBe(host.layout.unitFile("incibase-c13-check.timer"));
-    expect(host.driver.calls).toContain("start incibase-c13-check.timer");
-    expect(host.driver.isActive("incibase-c13-check.timer")).toBe(true);
+    expect(timer).toContain("Unit=incibasec13-check.service\n");
+    expect(host.sys.readlink(host.layout.timerWantsLink().path)).toBe(host.layout.unitFile("incibasec13-check.timer"));
+    expect(host.driver.calls).toContain("start incibasec13-check.timer");
+    expect(host.driver.isActive("incibasec13-check.timer")).toBe(true);
     // A value that would expand in a unit file is refused.
     expect(() => checkServiceUnit(new HostLayout({ root: host.layout.root, cliLink: "/opt/$HOME/incibase" }))).toThrow(/Refusing/);
     expect(checkTimerUnit(host.layout)).toContain("WantedBy=timers.target");

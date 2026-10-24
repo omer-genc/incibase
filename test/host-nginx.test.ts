@@ -334,19 +334,19 @@ server {
   });
 
   test("another host prefix, root and port get their own names, so two hosts can share one nginx on different ports", () => {
-    const other = new HostLayout({ root: "/var/lib/incibase-n11", unitPrefix: "incibase-n11" });
+    const other = new HostLayout({ root: "/var/lib/incibase-n11", unitPrefix: "incibasen11" });
     const text = nginxConfig({ ...input, layout: other, files: nginxFiles(other), port: 18443, cert: "/var/lib/incibase-n11/tls/a.crt", key: "/var/lib/incibase-n11/tls/a.key" });
-    expect(nginxFiles(other).conf).toBe("/etc/nginx/conf.d/incibase-n11.conf");
-    expect(nginxFiles(other).dropIn).toBe("/etc/systemd/system/nginx.service.d/50-incibase-n11.conf");
-    for (const name of ["zone=incibase_n11_ip:", "zone=incibase_n11_auth:", "zone=incibase_n11_ip_conn:", "zone=incibase_n11_branch_conn:", "$incibase_n11_connection {", "log_format incibase_n11_json"]) {
+    expect(nginxFiles(other).conf).toBe("/etc/nginx/conf.d/incibasen11.conf");
+    expect(nginxFiles(other).dropIn).toBe("/etc/systemd/system/nginx.service.d/50-incibasen11.conf");
+    for (const name of ["zone=incibasen11_ip:", "zone=incibasen11_auth:", "zone=incibasen11_ip_conn:", "zone=incibasen11_branch_conn:", "$incibasen11_connection {", "log_format incibasen11_json"]) {
       expect(text).toContain(name);
     }
     expect(text).toContain("set $ib /var/lib/incibase-n11/hosts/$ib_label;");
     expect(text).toContain("    listen 18443 ssl http2;\n    listen [::]:18443 ssl http2;");
     expect(text).toContain("    listen 18443 ssl http2 default_server;");
-    expect(text).toContain("access_log /var/log/nginx/incibase-n11.access.log incibase_n11_json;");
-    expect(text).toContain("error_log /var/log/nginx/incibase-n11.error.log alert;");
-    for (const name of ["$incibase_n11_client {", "$incibase_n11_auth_client {", "limit_req_zone $incibase_n11_client ", "limit_req_zone $incibase_n11_auth_client ", "Retry-After $incibase_n11_retry_after"]) {
+    expect(text).toContain("access_log /var/log/nginx/incibasen11.access.log incibasen11_json;");
+    expect(text).toContain("error_log /var/log/nginx/incibasen11.error.log alert;");
+    for (const name of ["$incibasen11_client {", "$incibasen11_auth_client {", "limit_req_zone $incibasen11_client ", "limit_req_zone $incibasen11_auth_client ", "Retry-After $incibasen11_retry_after"]) {
       expect(text).toContain(name);
     }
     expect(text).not.toContain("listen 443");

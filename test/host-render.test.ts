@@ -212,16 +212,16 @@ TimeoutStopSec=25
   });
 
   test("unit names carry the host's prefix", () => {
-    const test = new HostLayout({ root: "/var/lib/incibase-s10", unitPrefix: "incibase-s10" });
-    expect(test.units.branch("b7k2m9q4")).toBe("incibase-s10-branch@b7k2m9q4.service");
-    expect(test.units.preflight("b7k2m9q4")).toBe("incibase-s10-preflight@b7k2m9q4.service");
-    expect(test.units.snapshot("b7k2m9q4")).toBe("incibase-s10-snapshot@b7k2m9q4.service");
-    expect(test.units.job("release", "b7k2m9q4", 3)).toBe("incibase-s10-release-b7k2m9q4-3.service");
-    expect(test.units.slice).toBe("incibase-s10.slice");
-    expect(branchTemplateUnit(test)).toContain("Slice=incibase-s10.slice\n");
-    expect(test.dropIn(test.units.branch("b7k2m9q4"))).toBe("/etc/systemd/system/incibase-s10-branch@b7k2m9q4.service.d/10-incibase.conf");
+    const test = new HostLayout({ root: "/var/lib/incibase-s10", unitPrefix: "incibases10" });
+    expect(test.units.branch("b7k2m9q4")).toBe("incibases10-branch@b7k2m9q4.service");
+    expect(test.units.preflight("b7k2m9q4")).toBe("incibases10-preflight@b7k2m9q4.service");
+    expect(test.units.snapshot("b7k2m9q4")).toBe("incibases10-snapshot@b7k2m9q4.service");
+    expect(test.units.job("release", "b7k2m9q4", 3)).toBe("incibases10-release-b7k2m9q4-3.service");
+    expect(test.units.slice).toBe("incibases10.slice");
+    expect(branchTemplateUnit(test)).toContain("Slice=incibases10.slice\n");
+    expect(test.dropIn(test.units.branch("b7k2m9q4"))).toBe("/etc/systemd/system/incibases10-branch@b7k2m9q4.service.d/10-incibase.conf");
     expect(layout.units.branch("b7k2m9q4")).toBe("incibase-branch@b7k2m9q4.service");
-    for (const bad of ["Incibase", "a--b", "a-", "-a", "a b", "x".repeat(33)]) expect(() => new HostLayout({ unitPrefix: bad })).toThrow(/unit prefix/);
+    for (const bad of ["Incibase", "a--b", "a-", "-a", "a b", "incibase-b", "1a", "x".repeat(33)]) expect(() => new HostLayout({ unitPrefix: bad })).toThrow(/unit prefix/);
   });
 });
 
