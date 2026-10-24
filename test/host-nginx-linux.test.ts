@@ -20,7 +20,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, chownSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { connect } from "node:tls";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { VERSION } from "../src/engine/version.ts";
 import { openHost, type OpsContext } from "../src/host/context.ts";
 import { DEFAULT_ROOT, HostLayout } from "../src/host/layout.ts";
@@ -36,7 +36,8 @@ const PORT = Number(process.env.INCIBASE_TEST_HTTPS_PORT ?? 18443);
 const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const REQUIRE_SANDBOX = process.env.INCIBASE_TEST_REQUIRE_SANDBOX === "1";
 const MARKER = ".incibase-test-root";
-const LABEL = basename(ROOT).slice(0, 24);
+// No hyphens: systemd puts a-b.slice under a.slice, so incibase-x.slice would count against the owner's incibase.slice.
+const LABEL = basename(ROOT).replace(/[^a-z0-9]/g, "").slice(0, 24);
 const WORK = `/tmp/${LABEL}-work`;
 const BIN = `/usr/local/lib/${LABEL}-bin`;
 const LAYOUT = {
@@ -57,6 +58,8 @@ const V6_ADDRS = ["2001:db8:11f:2::a", "2001:db8:11f:2:ffff::b", "2001:db8:11f:3
 const sys = new LinuxSystem();
 let ctx: OpsContext;
 const files = nginxFiles(new HostLayout({ root: ROOT, ...LAYOUT }));
+/** Another site, this test's own, that holds a port as default_server: the clash the whole-config test needs. */
+const CLASH = { conf: join(dirname(files.conf), `${LABEL}-clash.conf`), port: PORT + 1 };
 
 function run(command: string[], options: { ok?: number[]; stdin?: Buffer } = {}) {
   const result = Bun.spawnSync(command, { stdout: "pipe", stderr: "pipe", stdin: options.stdin ?? "ignore" });
@@ -84,6 +87,7 @@ function cleanup() {
   const hadNginx = existsSync(files.conf) || existsSync(files.dropIn);
   rmSync(files.conf, { force: true });
   rmSync(files.dropIn, { force: true });
+  rmSync(CLASH.conf, { force: true });
   const dropInDir = join(LAYOUT.systemdDir, `${NGINX_SERVICE}.d`);
   if (existsSync(dropInDir) && readdirSync(dropInDir).length === 0) rmSync(dropInDir, { recursive: true });
   run(["systemctl", "daemon-reload"]);
@@ -697,10 +701,19 @@ describe.skipIf(!enabled)("the nginx front door", () => {
 
   test("a config the rest of nginx rejects is never served: the previous file and setting stay", async () => {
     const text = readFileSync(files.conf, "utf8");
-    // Port 80 already has Ubuntu's default_server.
-    const err = await ops.setFrontDoor(ctx, { httpsPort: 80 }).then(() => null, (e) => e);
+    // A site of this test's own already has a default_server on the new port (not Ubuntu's default site on 80,
+    // which a host set up as docs/host.md says has removed). nginx -t alone reads it; nothing reloads meanwhile.
+    writeFileSync(CLASH.conf, `server {\n    listen ${CLASH.port} default_server;\n    return 444;\n}\n`, { mode: 0o644 });
+    let err: { code?: string; message?: string } | null;
+    try {
+      expect(run(["nginx", "-t", "-q"]).code).toBe(0);
+      err = await ops.setFrontDoor(ctx, { httpsPort: CLASH.port }).then(() => null, (e) => e);
+    } finally {
+      rmSync(CLASH.conf, { force: true });
+    }
     expect(err?.code).toBe("FAILED");
-    note(`port 80 refused: ${String(err?.message).split("\n").find((l) => l.includes("[emerg]")) ?? err?.message}`);
+    note(`port ${CLASH.port} refused: ${String(err?.message).split("\n").find((l) => l.includes("[emerg]")) ?? err?.message}`);
+    expect(err?.message).toContain(`duplicate default server for 0.0.0.0:${CLASH.port}`);
     expect(readFileSync(files.conf, "utf8")).toBe(text);
     expect(ctx.registry.getSetting("https_port")).toBe(String(PORT));
     expect(run(["nginx", "-t", "-q"]).code).toBe(0);
