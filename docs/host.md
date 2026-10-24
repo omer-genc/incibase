@@ -128,7 +128,7 @@ chmod +x incibase-linux-$ARCH
 
 ### 2. `host init`
 
-`host init` dışındaki her komut kurulmuş bir host ister (`No incibase host at /var/lib/incibase: run sudo incibase host init …`), o yüzden ilk komut budur ve indirilen dosyayla çalışır. `sudo` bulunduğun dizini korur, ama binary o dizindeki `bunfig.toml`'u ve `.env`'i okumaz; ev dizinindeki bir dosya root olarak çalışan komuta bir şey yükleyemez.
+`host init` dışındaki her komut kurulmuş bir host ister (`No incibase host at /var/lib/incibase: run sudo incibase host init …`), o yüzden ilk komut budur ve indirilen dosyayla çalışır. `sudo` bulunduğun dizini korur, ama binary o dizindeki `bunfig.toml`'u ve `.env`'i okumaz; ev dizinindeki bir dosya root olarak çalışan komuta bir şey yükleyemez. `host install-runtime` kurduğu binary'ye sürümünü `/`'te sorar, böylece cwd'yi hâlâ okuyan eski bir sürüm (0.3.1) kurulurken de ev dizininden bir şey yüklemez.
 
 ```bash
 sudo ./incibase-linux-$ARCH host init \

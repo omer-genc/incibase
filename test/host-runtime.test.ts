@@ -433,6 +433,15 @@ describe("install from a local file", () => {
     await expect(ops.installRuntime(host, { version: "0.9.1", binary: broken, sha256: sha256Hex("#!/bin/sh\nexit 3\n"), skipVersionCheck: true })).rejects.toThrow(/says it is/);
     noLeftovers(host);
   });
+
+  test("asks for the version in /, never in the cwd sudo kept: an older runtime reads bunfig.toml and .env from there", async () => {
+    const host = await hostWith();
+    expect(process.cwd()).not.toBe("/");
+    const content = "#!/bin/sh\npwd\n";
+    const bin = file(host, "pwd", content);
+    expect(await ops.installRuntime(host, { version: "0.9.2", binary: bin, sha256: sha256Hex(content), skipVersionCheck: true })).toMatchObject({ installed: true });
+    expect(host.registry.getRuntime("0.9.2")).toMatchObject({ reported: "/" });
+  });
 });
 
 /** Installs a fake runtime `version` from a local file. */

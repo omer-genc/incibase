@@ -21,7 +21,7 @@ M1 Faz B: tek sunucuda birden fazla proje ve branch barındıran host katmanı. 
 
 ### Düzeltilen
 
-- **Standalone binary bulunduğu dizindeki `bunfig.toml`'u ve `.env`'i okumaz.** `sudo incibase …` cwd'yi korur; ev dizinindeki bir `bunfig.toml`'un `preload`'u root olarak çalışıyordu, `.env` de komutu yönlendirebiliyordu. Yan etki: standalone binary'yle `incibase serve`/`dev` proje dizinindeki `.env`'i artık kendiliğinden yüklemez.
+- **Standalone binary bulunduğu dizindeki `bunfig.toml`'u ve `.env`'i okumaz.** `sudo incibase …` cwd'yi korur; ev dizinindeki bir `bunfig.toml`'un `preload`'u root olarak çalışıyordu, `.env` de komutu yönlendirebiliyordu. `host install-runtime` kurduğu binary'ye sürümünü `/`'te sorar, böylece cwd'yi hâlâ okuyan eski bir sürüm (0.3.1) kurulurken de oradaki bir `preload` root olarak çalışmaz. Yan etki: standalone binary'yle `incibase serve`/`dev` proje dizinindeki `.env`'i artık kendiliğinden yüklemez.
 - `host init`'in ve `project create`'in `Next:` satırı varsayılan olmayan bir host root'u için `--root <dizin>` yazar ve özel bir CLI link'i olan host'ta komutu o link'le adlandırır. Projesi olan bir host'ta tekrar çalıştırılan `host init` artık `host add-admin` ve `project create` önermez.
 - Çıktıyı okuyan süreç kapanınca (`incibase logs shop/prod | head`) CLI EPIPE yığın izi basmadan 0 ile çıkar ve okuduğu alt süreci (journalctl, tunnel'ın ssh'i) durdurur. Diğer yazma hataları stderr'e yazılır ve 1 ile çıkar. Boruya bağlanan komutlar için geçerli (`host …`, `logs`, `status`, `project`/`branch`/`release`/`env`/`service-key`, `tunnel`); `serve`, `dev`, check servisi (`host check`) ve release job'ları (`host _job`) yazma hatasında eskisi gibi 1 ile çıkar, böylece systemd branch'i yeniden başlatır ve job'u başarısız sayar.
 

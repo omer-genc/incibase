@@ -330,7 +330,9 @@ function sweepStaged(ctx: OpsContext, dir: string): string[] {
 
 /** What `<binary> --version` prints; the runtime is the platform's own code, checked before it runs. */
 function askVersion(path: string): { ok: boolean; said: string } {
-  const result = Bun.spawnSync([path, "--version"], { stdin: "ignore", stdout: "pipe", stderr: "pipe", env: { PATH: "/usr/bin:/bin" }, timeout: 30_000 });
+  // In /, not the cwd sudo kept: a runtime built before the binary stopped reading bunfig.toml and .env
+  // from its cwd (0.3.1) would run the preload a user put there, as root.
+  const result = Bun.spawnSync([path, "--version"], { cwd: "/", stdin: "ignore", stdout: "pipe", stderr: "pipe", env: { PATH: "/usr/bin:/bin" }, timeout: 30_000 });
   const said = result.stdout.toString().trim();
   return { ok: result.exitCode === 0, said: (said || result.stderr.toString().trim()).slice(0, 200) };
 }
