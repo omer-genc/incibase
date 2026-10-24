@@ -1,6 +1,6 @@
 # Değişiklikler
 
-## Unreleased
+## 0.4.0
 
 M1 Faz B: tek sunucuda birden fazla proje ve branch barındıran host katmanı. Tasarım: [docs/m1-mimari.md](docs/m1-mimari.md), kurulum ve işletim rehberi: [docs/host.md](docs/host.md). Tek uygulama `serve`/`dev` değişmedi.
 
