@@ -541,6 +541,26 @@ describe("the front door on a host", () => {
     expect(nginxCalls(host)).toEqual([]);
   });
 
+  test("a drop-in that differs only in comments (one rendered before owner records) is rewritten without restarting nginx", async () => {
+    const host = await nginxHost();
+    const pair = makeCert("first");
+    await ops.initHost(host, { domain: DOMAIN, tlsCert: pair.cert, tlsKey: pair.key });
+    const dropIn = join(host.layout.systemdDir, "nginx.service.d", "50-incibase.conf");
+    const rendered = readFileSync(dropIn, "utf8");
+    const older = rendered.replace(`# host root: ${host.layout.root}\n`, "");
+    expect(older).not.toBe(rendered);
+    writeFileSync(dropIn, older);
+    host.driver.calls.length = 0;
+    expect(await ops.renderNginx(host)).toMatchObject({ changed: false, dropInChanged: true, action: null });
+    expect(readFileSync(dropIn, "utf8")).toBe(rendered);
+    expect(nginxCalls(host)).toEqual(["daemon-reload"]);
+    // A changed setting does: OOMScoreAdjust applies when the master starts.
+    writeFileSync(dropIn, rendered.replace("MemoryMin=64M", "MemoryMin=32M"));
+    host.driver.calls.length = 0;
+    expect(await ops.renderNginx(host)).toMatchObject({ dropInChanged: true, action: "restart" });
+    expect(nginxCalls(host)).toEqual(["daemon-reload", `restart ${NGINX_SERVICE}`]);
+  });
+
   test("a certificate nginx rejects changes nothing: old config, old pair, no reload; the refusal is audited", async () => {
     const host = await nginxHost();
     const first = makeCert("keep");
