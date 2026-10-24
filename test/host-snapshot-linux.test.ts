@@ -53,7 +53,8 @@
 // Skipped unless INCIBASE_TEST_HOST=1 on Linux as root; needs
 // INCIBASE_TEST_BINARY (a standalone incibase for this machine, for the
 // branch's _snapshot). Host root INCIBASE_TEST_HOST_ROOT (/var/lib/incibase-snp)
-// and uid base INCIBASE_TEST_UID_BASE (84000); it removes everything it made.
+// and uid base INCIBASE_TEST_UID_BASE (84000), with a unit prefix, groups,
+// runtime root and CLI link named after the root; it removes everything it made.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { closeSync, constants as fsConstants, chownSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -74,7 +75,14 @@ const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const MARKER = `incibase-secret-${process.pid}-${Date.now().toString(36)}`;
 const MARKER2 = `${MARKER}-other-branch`;
 const LABEL = basename(ROOT).slice(0, 24);
-const LAYOUT = { unitPrefix: LABEL, groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` }, runtimeRoot: `/usr/local/lib/${LABEL}` };
+const LAYOUT = {
+  unitPrefix: LABEL,
+  groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` },
+  runtimeRoot: `/usr/local/lib/${LABEL}`,
+  systemdDir: "/etc/systemd/system",
+  // What the check service runs, never the machine's own /usr/local/bin/incibase (nothing links it here).
+  cliLink: `/usr/local/lib/${LABEL}-bin/incibase`,
+};
 const SROOT = "/etc/shadow";
 const SLOW = 120_000;
 
@@ -98,7 +106,7 @@ function cleanup() {
     }
   }
   Bun.spawnSync(["systemctl", "stop", `${prefix}.slice`]);
-  for (const dir of [LAYOUT.runtimeRoot === DEFAULT_ROOT ? "" : "/etc/systemd/system"].filter(Boolean)) {
+  for (const dir of [LAYOUT.systemdDir, join(LAYOUT.systemdDir, "multi-user.target.wants"), join(LAYOUT.systemdDir, "timers.target.wants")]) {
     for (const name of existsSync(dir) ? readdirSync(dir) : []) if (name.startsWith(`${prefix}-`) || name === `${prefix}.slice`) rmSync(join(dir, name), { recursive: true, force: true });
   }
   Bun.spawnSync(["systemctl", "daemon-reload"]);

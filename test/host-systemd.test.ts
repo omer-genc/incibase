@@ -5,8 +5,8 @@
 // INCIBASE_TEST_BINARY, a standalone incibase for this machine
 // (`bun scripts/build-binary.ts`). Uses its own host root
 // (INCIBASE_TEST_HOST_ROOT, default /var/lib/incibase-systemd-test), uid base
-// (INCIBASE_TEST_UID_BASE, default 72000), unit prefix, groups and runtime
-// root named after the root, and removes everything it created.
+// (INCIBASE_TEST_UID_BASE, default 72000), unit prefix, groups, runtime root
+// and CLI link named after the root, and removes everything it created.
 //
 // Sandbox directives that do not take effect on the machine (a container
 // may override them, see `sandboxReport`) are reported, not asserted;
@@ -30,13 +30,15 @@ const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const REQUIRE_SANDBOX = process.env.INCIBASE_TEST_REQUIRE_SANDBOX === "1";
 const MARKER = ".incibase-test-root";
 const LABEL = basename(ROOT).slice(0, 24);
+const APPS = `/tmp/${LABEL}-apps`;
 const LAYOUT = {
   unitPrefix: LABEL,
   groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` },
   runtimeRoot: `/usr/local/lib/${LABEL}`,
   systemdDir: "/etc/systemd/system",
+  // What the check service runs, never the machine's own /usr/local/bin/incibase (nothing links it here).
+  cliLink: `${APPS}/bin/incibase`,
 };
-const APPS = `/tmp/${LABEL}-apps`;
 const DOMAIN = "incibase.example.net";
 const SLOW = 240_000;
 

@@ -2,8 +2,9 @@
 // links and the env file as systemd reads it. Skipped unless
 // INCIBASE_TEST_HOST=1 on Linux as root. Uses its own host root
 // (INCIBASE_TEST_HOST_ROOT, default /var/lib/incibase-test), uid base
-// (INCIBASE_TEST_UID_BASE, default 71000) and groups named after the root, so
-// several runs can share a machine; it removes everything it created.
+// (INCIBASE_TEST_UID_BASE, default 71000) and a layout (groups, unit prefix,
+// runtime root, CLI link) named after the root, so several runs can share a
+// machine; it removes everything it created.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chownSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -30,6 +31,8 @@ const UID_BASE = Number(process.env.INCIBASE_TEST_UID_BASE ?? 71000);
 const MARKER = ".incibase-test-root";
 const label = basename(ROOT).slice(0, 24);
 const GROUPS = { proxy: `${label}-proxy`, admin: `${label}-admin` };
+/** No units or runtimes here (no driver), but a layout of its own all the same: never the machine's defaults. */
+const LAYOUT = { groups: GROUPS, unitPrefix: label, runtimeRoot: `/usr/local/lib/${label}`, cliLink: `/usr/local/lib/${label}-bin/incibase` };
 
 const sys = new LinuxSystem();
 let ctx: HostContext;
@@ -56,7 +59,7 @@ function gid(name: string): number {
 /** Removes the users, groups and tree of this test host. */
 function cleanup() {
   if (existsSync(join(ROOT, "control", "registry.db"))) {
-    const registry = Registry.open(new HostLayout({ root: ROOT, groups: GROUPS }));
+    const registry = Registry.open(new HostLayout({ root: ROOT, ...LAYOUT }));
     for (const branch of registry.listBranches()) {
       for (const pid of sys.processesOf(branch.os_uid)) process.kill(pid, "SIGKILL");
       const user = sys.getpwnam(`ib-${branch.id}`);
@@ -80,7 +83,7 @@ describe.skipIf(!enabled)("host provisioning on Linux", () => {
     }
     mkdirSync(ROOT, { mode: 0o755 });
     writeFileSync(join(ROOT, MARKER), "");
-    const layout = new HostLayout({ root: ROOT, groups: GROUPS });
+    const layout = new HostLayout({ root: ROOT, ...LAYOUT });
     ctx = { layout, sys, registry: Registry.open(layout), actor: "root:test" };
     await initHost(ctx, { uidBase: UID_BASE, domain: "incibase.example.net", timezone: "Europe/Istanbul" });
     await createProject(ctx, { slug: "shop" });

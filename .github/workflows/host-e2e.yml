@@ -76,17 +76,20 @@ jobs:
         if: always()
         env:
           TEST_PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-        # A throwaway host with the built runtime installed, so doctor's sandbox probe runs on the real VM.
+        # A throwaway host with the built runtime installed and its own CLI link (what its check service runs)
+        # pointing there, so doctor's sandbox probe runs on the real VM.
         # Never fails the job: doctor exits 1 on any FAIL (a bare host has no TLS or alert webhook).
         run: |
           mkdir -p artifacts
           BIN="$GITHUB_WORKSPACE/dist/incibase"
           ROOT=/var/lib/incibase-doctor
-          LAYOUT='{"unitPrefix":"ibdoc","groups":{"proxy":"ibdoc-proxy","admin":"ibdoc-admin"},"runtimeRoot":"/usr/local/lib/ibdoc"}'
+          LAYOUT='{"unitPrefix":"ibdoc","groups":{"proxy":"ibdoc-proxy","admin":"ibdoc-admin"},"runtimeRoot":"/usr/local/lib/ibdoc","cliLink":"/usr/local/lib/ibdoc-bin/incibase"}'
           VER="$("$BIN" --version | tr -d '[:space:]')"
           SHA="$(sha256sum "$BIN" | cut -d' ' -f1)"
+          sudo install -d -m 0755 /usr/local/lib/ibdoc-bin
           sudo env "PATH=$TEST_PATH" "$BIN" host op initHost "{\"domain\":\"incibase.example.net\",\"timezone\":\"UTC\",\"uidBase\":90000}" --root "$ROOT" --layout "$LAYOUT" || true
           sudo env "PATH=$TEST_PATH" "$BIN" host op installRuntime "{\"binary\":\"$BIN\",\"version\":\"$VER\",\"sha256\":\"$SHA\"}" --root "$ROOT" || true
+          sudo env "PATH=$TEST_PATH" "$BIN" host op useCli "{\"version\":\"$VER\"}" --root "$ROOT" || true
           sudo env "PATH=$TEST_PATH" "$BIN" host doctor --root "$ROOT" 2>&1 | tee artifacts/doctor.log || true
 
       - name: Network diagnostics

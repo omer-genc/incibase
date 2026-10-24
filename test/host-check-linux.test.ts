@@ -6,7 +6,8 @@
 // root; needs INCIBASE_TEST_BINARY (`bun scripts/build-binary.ts`). Uses its
 // own host root (INCIBASE_TEST_HOST_ROOT, default /var/lib/incibase-check-test)
 // and uid base (INCIBASE_TEST_UID_BASE, default 73000), with a unit prefix,
-// groups and runtime root named after the root, and removes all it created.
+// groups, runtime root and CLI link named after the root (never the
+// machine's own /usr/local/bin/incibase), and removes all it created.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -27,13 +28,14 @@ const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const REQUIRE_SANDBOX = process.env.INCIBASE_TEST_REQUIRE_SANDBOX === "1";
 const MARKER = ".incibase-test-root";
 const LABEL = basename(ROOT).slice(0, 24);
+const APPS = `/tmp/${LABEL}-apps`;
 const LAYOUT = {
   unitPrefix: LABEL,
   groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` },
   runtimeRoot: `/usr/local/lib/${LABEL}`,
   systemdDir: "/etc/systemd/system",
+  cliLink: `${APPS}/bin/incibase`,
 };
-const APPS = `/tmp/${LABEL}-apps`;
 const SLOW = 240_000;
 
 const sys = new LinuxSystem();
@@ -123,6 +125,7 @@ describe.skipIf(!enabled)("host check and doctor on systemd", () => {
     mkdirSync(ROOT, { mode: 0o755 });
     writeFileSync(join(ROOT, MARKER), "");
     mkdirSync(APPS, { mode: 0o755 });
+    mkdirSync(join(APPS, "bin"), { mode: 0o755 });
     cpSync(BINARY, join(APPS, "incibase"));
     chmodSync(join(APPS, "incibase"), 0o755);
     ctx = openHost({ root: ROOT, layout: LAYOUT });

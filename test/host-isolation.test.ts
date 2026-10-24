@@ -34,9 +34,9 @@
 // INCIBASE_TEST_BINARY, a standalone incibase for this machine
 // (`bun scripts/build-binary.ts`). Uses its own host root
 // (INCIBASE_TEST_HOST_ROOT, default /var/lib/incibase-iso15), uid base
-// (INCIBASE_TEST_UID_BASE, default 82000), unit prefix, groups, runtime root
-// and dummy interface named after the root and uid base, and removes
-// everything it created.
+// (INCIBASE_TEST_UID_BASE, default 82000), unit prefix, groups, runtime root,
+// CLI link and dummy interface named after the root and uid base, and
+// removes everything it created.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -56,13 +56,15 @@ const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const REQUIRE_SANDBOX = process.env.INCIBASE_TEST_REQUIRE_SANDBOX === "1";
 const MARKER = ".incibase-test-root";
 const LABEL = basename(ROOT).slice(0, 24);
+const APPS = `/tmp/${LABEL}-apps`;
 const LAYOUT = {
   unitPrefix: LABEL,
   groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` },
   runtimeRoot: `/usr/local/lib/${LABEL}`,
   systemdDir: "/etc/systemd/system",
+  // What the check service runs, never the machine's own /usr/local/bin/incibase (nothing links it here).
+  cliLink: `${APPS}/bin/incibase`,
 };
-const APPS = `/tmp/${LABEL}-apps`;
 const DOMAIN = "incibase.example.net";
 const SLOW = 300_000;
 /** zzz-lxc-service.conf turns ProtectSystem/ProtectProc/NoNewPrivileges off; on a VM it is absent. */

@@ -14,9 +14,9 @@
 // Skipped unless INCIBASE_TEST_HOST=1 on Linux as root with nginx installed;
 // needs INCIBASE_TEST_BINARY (bun scripts/build-binary.ts). Uses its own host
 // root (INCIBASE_TEST_HOST_ROOT, default /var/lib/incibase-nginx-test), uid
-// base (INCIBASE_TEST_UID_BASE, default 73000), unit prefix, groups, nginx
-// file names and port (INCIBASE_TEST_HTTPS_PORT, default 18443), and removes
-// everything it created, nginx's files included.
+// base (INCIBASE_TEST_UID_BASE, default 73000), unit prefix, groups, runtime
+// root, CLI link, nginx file names and port (INCIBASE_TEST_HTTPS_PORT,
+// default 18443), and removes everything it created, nginx's files included.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, chownSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { connect } from "node:tls";
@@ -37,13 +37,15 @@ const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const REQUIRE_SANDBOX = process.env.INCIBASE_TEST_REQUIRE_SANDBOX === "1";
 const MARKER = ".incibase-test-root";
 const LABEL = basename(ROOT).slice(0, 24);
+const WORK = `/tmp/${LABEL}-work`;
 const LAYOUT = {
   unitPrefix: LABEL,
   groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` },
   runtimeRoot: `/usr/local/lib/${LABEL}`,
   systemdDir: "/etc/systemd/system",
+  // What the check service runs, never the machine's own /usr/local/bin/incibase (nothing links it here).
+  cliLink: `${WORK}/bin/incibase`,
 };
-const WORK = `/tmp/${LABEL}-work`;
 const DOMAIN = "incibase.omergenc.net";
 const DEV = `dev--shop.${DOMAIN}`;
 const SLOW = 240_000;
@@ -72,7 +74,7 @@ function cleanup() {
     run(["systemctl", "stop", unit], { ok: [0, 1, 5] });
     run(["systemctl", "reset-failed", unit], { ok: [0, 1, 5] });
   }
-  for (const dir of [LAYOUT.systemdDir, join(LAYOUT.systemdDir, "multi-user.target.wants")]) {
+  for (const dir of [LAYOUT.systemdDir, join(LAYOUT.systemdDir, "multi-user.target.wants"), join(LAYOUT.systemdDir, "timers.target.wants")]) {
     for (const name of existsSync(dir) ? readdirSync(dir) : []) {
       if (name.startsWith(`${prefix}-`) || name === `${prefix}.slice`) rmSync(join(dir, name), { recursive: true, force: true });
     }
