@@ -26,6 +26,7 @@ import {
 } from "../src/host/check.ts";
 import { CLD_EXITED, CLD_KILLED, type UnitStatus } from "../src/host/driver.ts";
 import { FakeSystem } from "../src/host/fake-system.ts";
+import { HostLayout } from "../src/host/layout.ts";
 import * as ops from "../src/host/ops.ts";
 import { checkServiceUnit, checkTimerUnit } from "../src/host/render.ts";
 import type { BranchRow } from "../src/host/registry.ts";
@@ -666,10 +667,13 @@ describe("alert delivery", () => {
 // ---- the timer ------------------------------------------------------------------------------
 
 describe("the check timer", () => {
-  test("its service and timer are rendered with the host's units, enabled and started", async () => {
+  test("its service and timer are rendered with the host's units, enabled and started; the service runs the CLI link", async () => {
     const host = await fakeOpsHost({ unitPrefix: "incibase-c13" });
     const service = readFileSync(host.layout.unitFile("incibase-c13-check.service"), "utf8");
-    expect(service).toContain(`ExecStart=/usr/local/bin/incibase host check --root ${host.layout.root}\n`);
+    // The link's own path, skipped until it points at something executable: never the binary that ran host init.
+    expect(service).toContain(`ExecStart=${host.layout.cliLink} host check --root ${host.layout.root}\n`);
+    expect(service).toContain(`ConditionFileIsExecutable=${host.layout.cliLink}\n`);
+    expect(service).not.toContain(host.self[0]!);
     expect(service).toContain("Type=oneshot\n");
     const timer = readFileSync(host.layout.unitFile("incibase-c13-check.timer"), "utf8");
     expect(timer).toContain("OnUnitActiveSec=30s\n");
@@ -677,10 +681,33 @@ describe("the check timer", () => {
     expect(host.sys.readlink(host.layout.timerWantsLink().path)).toBe(host.layout.unitFile("incibase-c13-check.timer"));
     expect(host.driver.calls).toContain("start incibase-c13-check.timer");
     expect(host.driver.isActive("incibase-c13-check.timer")).toBe(true);
-    // A value that would split or expand in a unit file is refused.
-    expect(() => checkServiceUnit(host.layout, ["/opt/my incibase"])).toThrow(/Refusing/);
-    expect(() => checkServiceUnit(host.layout, ["/opt/$HOME/incibase"])).toThrow(/Refusing/);
+    // A value that would expand in a unit file is refused.
+    expect(() => checkServiceUnit(new HostLayout({ root: host.layout.root, cliLink: "/opt/$HOME/incibase" }))).toThrow(/Refusing/);
     expect(checkTimerUnit(host.layout)).toContain("WantedBy=timers.target");
+  });
+
+  test("whatever command renders it (a download, bun with the source), the service is the same; use-cli switches what it runs without a render", async () => {
+    const host = await fakeOpsHost();
+    const unit = host.layout.unitFile(host.layout.units.checkService);
+    const before = readFileSync(unit, "utf8");
+    for (const self of [["/home/omer/incibase-linux-x64"], [process.execPath, join(import.meta.dir, "..", "src", "cli.ts")]]) {
+      host.self = self;
+      await ops.render(host);
+      expect(readFileSync(unit, "utf8")).toBe(before);
+      await ops.initHost(host, { domain: "incibase.example.net" });
+      expect(readFileSync(unit, "utf8")).toBe(before);
+    }
+    const binary = join(host.dir, "incibase-0.4.0");
+    writeFileSync(binary, "#!/bin/sh\necho 0.4.0\n", { mode: 0o755 });
+    await ops.installRuntime(host, { binary, version: "0.4.0", sha256: new Bun.CryptoHasher("sha256").update(readFileSync(binary)).digest("hex") });
+    const reloads = host.driver.calls.filter((c) => c === "daemon-reload").length;
+    await ops.useCli(host, { version: "0.4.0" });
+    expect(readFileSync(unit, "utf8")).toBe(before);
+    expect(host.driver.calls.filter((c) => c === "daemon-reload").length).toBe(reloads);
+    // What the service runs, through the link, is the installed runtime.
+    expect(realpathSync(host.layout.cliLink)).toBe(host.layout.runtimeBinary("0.4.0"));
+    // gc keeps it: the link's runtime.
+    expect((await ops.gcRuntimes(host)).kept).toContainEqual({ version: "0.4.0", by: [host.layout.cliLink] });
   });
 
   test("checkTimer: false keeps it stopped and unlinked; render follows the setting", async () => {

@@ -421,7 +421,7 @@ export function removeIfPresent(ctx: HostContext, path: string): boolean {
   return true;
 }
 
-/** The host's units: the two templates and the slice. True when one changed. */
+/** The host's units: the three templates, the slice and the check timer's two. True when one changed. */
 export function renderHostUnits(ctx: HostContext): boolean {
   const { layout, registry } = ctx;
   ensureDir(ctx, layout.systemdDir);
@@ -430,22 +430,35 @@ export function renderHostUnits(ctx: HostContext): boolean {
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.preflightTemplate), preflightTemplateUnit(layout), UNIT_FILE) || changed;
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.snapshotTemplate), snapshotTemplateUnit(layout), UNIT_FILE) || changed;
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.slice), sliceUnit(Number.isSafeInteger(sliceMax) && sliceMax > 0 ? sliceMax : null), UNIT_FILE) || changed;
-  if (ctx.self) changed = renderCheckUnits(ctx, ctx.self) || changed;
+  changed = renderCheckUnits(ctx) || changed;
   return changed;
 }
 
 // ---- the check timer (design section 9) ------------------------------------
 
-/** `<prefix>-check.service`: one `incibase host check` of this host, as root. */
-export function checkServiceUnit(layout: HostLayout, self: string[]): string {
-  if (!self.length) throw new Error("The check service needs the command that runs incibase");
+/**
+ * `<prefix>-check.service`: one `incibase host check` of this host, as root,
+ * every 30 s. It runs the CLI link (`host use-cli`), the link's own path,
+ * never the binary that rendered it: `host init` runs from a download in a
+ * login account's home, which that account (anything running as it) can
+ * replace. Through the link root runs an installed runtime, the check
+ * follows `use-cli` without a render, and gc keeps what it runs (it keeps
+ * the link's runtime). Until the link points at an executable file, systemd
+ * skips each run instead of failing it: path conditions follow symlinks, so
+ * a missing link and one to nothing are both unmet; the service stays
+ * inactive and the timer goes on firing (systemd 255).
+ */
+export function checkServiceUnit(layout: HostLayout): string {
+  const cli = word(layout.cliLink);
   return `${HEADER}[Unit]
 Description=incibase health check of ${word(layout.root)}
 After=network-online.target
+# Skipped, not failed, until host use-cli points the link at an installed runtime.
+ConditionFileIsExecutable=${cli}
 
 [Service]
 Type=oneshot
-ExecStart=${[...self, "host", "check", "--root", layout.root].map(word).join(" ")}
+ExecStart=${cli} host check --root ${word(layout.root)}
 Environment=NO_COLOR=1
 # Probes run in parallel with a 5 s timeout and an alert POST has 10 s; anything longer is stuck.
 TimeoutStartSec=120
@@ -473,9 +486,9 @@ WantedBy=timers.target
  * The check service and timer, and the timer's boot link unless the host
  * turned the timer off (setting check_timer = off). True when one changed.
  */
-export function renderCheckUnits(ctx: HostContext, self: string[]): boolean {
+export function renderCheckUnits(ctx: HostContext): boolean {
   const { layout, sys } = ctx;
-  let changed = writeIfChanged(ctx, layout.unitFile(layout.units.checkService), checkServiceUnit(layout, self), UNIT_FILE);
+  let changed = writeIfChanged(ctx, layout.unitFile(layout.units.checkService), checkServiceUnit(layout), UNIT_FILE);
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.checkTimer), checkTimerUnit(layout), UNIT_FILE) || changed;
   const wants = layout.timerWantsLink();
   if (ctx.registry.getSetting("check_timer") !== "off") {

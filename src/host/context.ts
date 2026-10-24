@@ -20,7 +20,12 @@ export interface HealthReply {
 
 export interface OpsContext extends HostContext {
   driver: Driver;
-  /** The command that runs this incibase as root, e.g. `["/usr/local/bin/incibase"]`; transient jobs start with it. */
+  /**
+   * The command that runs this incibase, e.g. `["/usr/local/bin/incibase"]`:
+   * only for what runs at once, as part of this command (transient jobs, see
+   * release.jobArgv). A unit root runs later never names it: it may be a
+   * download its owner can replace (see render.checkServiceUnit).
+   */
   self: string[];
   /** GET /api/health on a unix socket; null when nothing (healthy) answers. */
   health?: (socket: string) => Promise<HealthReply | null>;

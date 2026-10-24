@@ -268,7 +268,12 @@ export async function stageRelease(ctx: OpsContext, id: string, file: string, op
 
 export type JobKind = "release" | "rollback" | "upgrade";
 
-/** The command of a transient job: `<self> host _job --root <root> <kind> <id> <n> [args]`. */
+/**
+ * The command of a transient job: `<self> host _job --root <root> <kind> <id> <n> [args]`.
+ * ctx.self, unlike the check service (render.checkServiceUnit): the job starts
+ * now, from this command, runs the same code version as this process, and
+ * its unit is gone (--collect) once it ends, so it adds no root execution later.
+ */
 export function jobArgv(ctx: OpsContext, kind: JobKind, id: string, n: number, ...args: string[]): string[] {
   return [...ctx.self, "host", "_job", "--root", ctx.layout.root, kind, id, String(n), ...args];
 }

@@ -45,8 +45,9 @@ function releases(files: Record<string, string>) {
   return { url: `http://127.0.0.1:${server.port}`, requests };
 }
 
+/** A host with the current runtime installed and no CLI link yet: these tests make and move it. */
 async function hostWith(url?: string): Promise<OpsTestHost & RuntimeContext> {
-  const host = (await fakeOpsHost()) as OpsTestHost & RuntimeContext;
+  const host = (await fakeOpsHost({ cli: false })) as OpsTestHost & RuntimeContext;
   if (url) host.releasesUrl = url;
   return host;
 }

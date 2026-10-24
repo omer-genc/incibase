@@ -608,7 +608,7 @@ const SPECS: Spec[] = [
   {
     path: ["host", "use-cli"],
     args: "<version>",
-    summary: "Point /usr/local/bin/incibase at an installed runtime",
+    summary: "Point /usr/local/bin/incibase, which the check timer runs, at an installed runtime",
     positionals: [1, 1],
     flags: { replace: { type: "boolean", help: "Replace a file that is not a link (an incibase copied there by hand)" } },
     async run({ ctx, values, args }) {

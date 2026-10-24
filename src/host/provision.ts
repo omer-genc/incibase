@@ -61,8 +61,6 @@ export interface HostContext {
   registry: Registry;
   /** The service manager; without one (provisioning tests) no unit is rendered, started or stopped. */
   driver?: Driver;
-  /** The command that runs this incibase as root; with it (and a driver) the check timer's units are rendered too. */
-  self?: string[];
   now?: () => number;
   random?: (n: number) => Uint8Array;
   actor?: string;

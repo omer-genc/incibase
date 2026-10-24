@@ -133,6 +133,8 @@ describe.skipIf(!enabled)("host check and doctor on systemd", () => {
     ctx.log = (line) => console.log(`  | ${line}`);
     await ops.initHost(ctx, { domain: "incibase.example.net", timezone: "Europe/Istanbul", uidBase: UID_BASE, sliceMemoryMax: 2 * 1024 ** 3, checkTimer: false });
     await ops.installRuntime(ctx, { binary: BINARY, version: VERSION, sha256: new Bun.CryptoHasher("sha256").update(readFileSync(BINARY)).digest("hex") });
+    // The check service runs the CLI link.
+    await ops.useCli(ctx, { version: VERSION });
     await ops.createProject(ctx, { slug: "shop", branches: ["dev"] });
     const { release } = await ops.addRelease(ctx, { project: "shop", branch: "dev", file: bundleExample() });
     expect(release.status).toBe("live");
@@ -154,8 +156,10 @@ describe.skipIf(!enabled)("host check and doctor on systemd", () => {
     if (enabled) cleanup();
   });
 
-  test("the check's service and timer load, the service runs a check as root, and the timer fires it", async () => {
+  test("the check's service and timer load, the service runs a check as root through the CLI link, and the timer fires it", async () => {
     const { checkService, checkTimer } = ctx.layout.units;
+    // The link's own path, never the command that ran host init (here bun with src/cli.ts).
+    expect(readFileSync(ctx.layout.unitFile(checkService), "utf8")).toContain(`\nExecStart=${ctx.layout.cliLink} host check --root ${ROOT}\n`);
     expect(verifyUnit(checkService)).toEqual({ code: 0, ours: [] });
     expect(verifyUnit(checkTimer)).toEqual({ code: 0, ours: [] });
     // Earlier runs of this test used the same unit name: only lines from here on count.
