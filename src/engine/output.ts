@@ -3,8 +3,9 @@
 // nothing listening that is a stack trace and exit 1, e.g. for
 // `incibase logs shop/prod | head` once head has its lines and exits.
 //
-// A reader that went away (EPIPE) is how a pipeline says it has enough: the
-// command stops quietly with exit 0, as a Unix filter does on SIGPIPE, and
+// A reader that went away (EPIPE) is how a pipeline says it has enough: a
+// command people pipe (cli.ts guardsOutput: not serve, nor what systemd runs)
+// stops quietly with exit 0, as a Unix filter does on SIGPIPE, and
 // takes the children it streams from (logs' journalctl, tunnel's ssh) with
 // it. Any other write error (a full disk under `> file`) is a failure: said
 // on stderr, exit 1. console.* does not go through these streams (Bun drops

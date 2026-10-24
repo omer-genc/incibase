@@ -1,11 +1,13 @@
 // What a command does when it cannot write its output (src/engine/output.ts):
 // a reader that went away (`incibase logs shop/prod | head`) ends it quietly
 // with exit 0 and stops the child it streams from; any other write error is
-// a failure. Each case runs in a child process behind a real pipe.
+// a failure. Each case runs in a child process behind a real pipe. Only the
+// commands people pipe get this; what systemd runs keeps failing.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { guardsOutput } from "../src/cli.ts";
 
 const SRC = join(import.meta.dir, "..", "src");
 let dir: string;
@@ -79,3 +81,11 @@ test("any other write error on stdout is a failure, said on stderr", async () =>
   expect(code).toBe(1);
   expect(err).toBe("incibase: cannot write to stdout: ENOSPC: no space left on device, write\n");
 }, 15_000);
+
+test("only the commands people pipe stop quietly: never serve, dev, _snapshot, the check service or a release job", () => {
+  const piped = [["logs", "shop/prod"], ["status"], ["branch", "list", "shop"], ["tunnel", "shop/dev"], ["admin-key", "shop/prod"], ["host", "doctor"], ["host", "status"], ["host", "op", "status"]];
+  for (const argv of piped) expect(guardsOutput(argv), argv.join(" ")).toBe(true);
+  // Tenant code writes to their stdout, which is the journal: exit 0 there would keep Restart=on-failure from restarting a branch, or end a job halfway as if done.
+  const supervised = [["serve", "--dir", "app"], ["start"], ["dev"], ["_snapshot", "1"], ["host", "check", "--root", "/var/lib/incibase"], ["host", "_job", "--root", "/var/lib/incibase", "release", "x", "1"], ["admin-key", "--data", "d"], []];
+  for (const argv of supervised) expect(guardsOutput(argv), argv.join(" ")).toBe(false);
+});
