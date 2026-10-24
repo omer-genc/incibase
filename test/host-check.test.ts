@@ -697,17 +697,17 @@ describe("the check timer", () => {
       await ops.initHost(host, { domain: "incibase.example.net" });
       expect(readFileSync(unit, "utf8")).toBe(before);
     }
-    const binary = join(host.dir, "incibase-0.4.0");
-    writeFileSync(binary, "#!/bin/sh\necho 0.4.0\n", { mode: 0o755 });
-    await ops.installRuntime(host, { binary, version: "0.4.0", sha256: new Bun.CryptoHasher("sha256").update(readFileSync(binary)).digest("hex") });
+    const binary = join(host.dir, "incibase-90.4.0");
+    writeFileSync(binary, "#!/bin/sh\necho 90.4.0\n", { mode: 0o755 });
+    await ops.installRuntime(host, { binary, version: "90.4.0", sha256: new Bun.CryptoHasher("sha256").update(readFileSync(binary)).digest("hex") });
     const reloads = host.driver.calls.filter((c) => c === "daemon-reload").length;
-    await ops.useCli(host, { version: "0.4.0" });
+    await ops.useCli(host, { version: "90.4.0" });
     expect(readFileSync(unit, "utf8")).toBe(before);
     expect(host.driver.calls.filter((c) => c === "daemon-reload").length).toBe(reloads);
     // What the service runs, through the link, is the installed runtime.
-    expect(realpathSync(host.layout.cliLink)).toBe(host.layout.runtimeBinary("0.4.0"));
+    expect(realpathSync(host.layout.cliLink)).toBe(host.layout.runtimeBinary("90.4.0"));
     // gc keeps it: the link's runtime.
-    expect((await ops.gcRuntimes(host)).kept).toContainEqual({ version: "0.4.0", by: [host.layout.cliLink] });
+    expect((await ops.gcRuntimes(host)).kept).toContainEqual({ version: "90.4.0", by: [host.layout.cliLink] });
   });
 
   test("checkTimer: false keeps it stopped and unlinked; render follows the setting", async () => {

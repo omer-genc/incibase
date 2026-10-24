@@ -530,16 +530,16 @@ describe("runtime upgrades", () => {
     const dev = branchOf(host, "dev");
     await release(host, "dev", fakeBundle(host.dir, "v1"));
     const before = branchOf(host, "dev").runtime_version;
-    await expect(ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "0.4.0" })).rejects.toThrow(/not installed/);
-    await withRuntime(host, "0.4.0");
-    await withRuntime(host, "0.5.0");
-    expect(await ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "0.4.0" })).toMatchObject({ ok: true });
-    expect(readFileSync(host.layout.dropIn(host.layout.units.branch(dev.id)), "utf8")).toContain(`${host.layout.runtimeRoot}/0.4.0/incibase serve`);
-    host.driver.behavior = (run) => (run.runtime === "0.5.0" && run.kind === "branch" ? { exit: 64 } : {});
-    expect(await ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "0.5.0" })).toMatchObject({ ok: false });
-    expect(branchOf(host, "dev").runtime_version).toBe("0.4.0");
-    expect(readFileSync(host.layout.dropIn(host.layout.units.branch(dev.id)), "utf8")).toContain(`${host.layout.runtimeRoot}/0.4.0/incibase serve`);
-    expect(before).not.toBe("0.4.0");
+    await expect(ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "90.4.0" })).rejects.toThrow(/not installed/);
+    await withRuntime(host, "90.4.0");
+    await withRuntime(host, "90.5.0");
+    expect(await ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "90.4.0" })).toMatchObject({ ok: true });
+    expect(readFileSync(host.layout.dropIn(host.layout.units.branch(dev.id)), "utf8")).toContain(`${host.layout.runtimeRoot}/90.4.0/incibase serve`);
+    host.driver.behavior = (run) => (run.runtime === "90.5.0" && run.kind === "branch" ? { exit: 64 } : {});
+    expect(await ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "90.5.0" })).toMatchObject({ ok: false });
+    expect(branchOf(host, "dev").runtime_version).toBe("90.4.0");
+    expect(readFileSync(host.layout.dropIn(host.layout.units.branch(dev.id)), "utf8")).toContain(`${host.layout.runtimeRoot}/90.4.0/incibase serve`);
+    expect(before).not.toBe("90.4.0");
   });
 
   test("installRuntime checks what the binary says it is", async () => {

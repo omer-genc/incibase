@@ -119,19 +119,19 @@ describe("names", () => {
 
 describe("install from a release", () => {
   test("downloads the asset and SHA256SUMS, checks it, installs it root 0755", async () => {
-    const bin = script("0.4.0");
-    const gh = releases({ "/v0.4.0/SHA256SUMS": sumsLine(bin, ASSET) + sumsLine("other", "incibase-darwin-arm64"), [`/v0.4.0/${ASSET}`]: bin });
+    const bin = script("90.4.0");
+    const gh = releases({ "/v90.4.0/SHA256SUMS": sumsLine(bin, ASSET) + sumsLine("other", "incibase-darwin-arm64"), [`/v90.4.0/${ASSET}`]: bin });
     const host = await hostWith(gh.url);
-    const result = await ops.installRuntime(host, { version: "0.4.0" });
-    const path = host.layout.runtimeBinary("0.4.0");
-    expect(result).toEqual({ version: "0.4.0", path, sha256: sha256Hex(bin), installed: true, source: `${gh.url}/v0.4.0/${ASSET}` });
+    const result = await ops.installRuntime(host, { version: "90.4.0" });
+    const path = host.layout.runtimeBinary("90.4.0");
+    expect(result).toEqual({ version: "90.4.0", path, sha256: sha256Hex(bin), installed: true, source: `${gh.url}/v90.4.0/${ASSET}` });
     // SHA256SUMS first: nothing is downloaded that could not be checked.
-    expect(gh.requests).toEqual(["/v0.4.0/SHA256SUMS", `/v0.4.0/${ASSET}`]);
+    expect(gh.requests).toEqual(["/v90.4.0/SHA256SUMS", `/v90.4.0/${ASSET}`]);
     expect(readFileSync(path, "utf8")).toBe(bin);
     expect(host.sys.lstat(path)).toMatchObject({ type: "file", uid: 0, gid: 0, mode: 0o755 });
-    expect(host.sys.lstat(host.layout.runtimeDir("0.4.0"))).toMatchObject({ type: "dir", uid: 0, gid: 0, mode: 0o755 });
+    expect(host.sys.lstat(host.layout.runtimeDir("90.4.0"))).toMatchObject({ type: "dir", uid: 0, gid: 0, mode: 0o755 });
     expect(host.sys.lstat(host.layout.runtimeRoot)).toMatchObject({ uid: 0, gid: 0, mode: 0o755 });
-    expect(host.registry.getRuntime("0.4.0")).toMatchObject({ sha256: sha256Hex(bin), bytes: bin.length, reported: "0.4.0", source: result.source });
+    expect(host.registry.getRuntime("90.4.0")).toMatchObject({ sha256: sha256Hex(bin), bytes: bin.length, reported: "90.4.0", source: result.source });
     expect(host.registry.listAudit().at(-1)).toMatchObject({ action: "runtime.install", ok: 1 });
     noLeftovers(host);
   });
@@ -139,12 +139,12 @@ describe("install from a release", () => {
   test("a wrong checksum is refused and nothing is kept", async () => {
     const host = await hostWith();
     const ran = join(host.dir, "ran");
-    const bin = `#!/bin/sh\ntouch ${ran}\necho 0.4.0\n`;
-    const gh = releases({ "/v0.4.0/SHA256SUMS": sumsLine("the real one", ASSET), [`/v0.4.0/${ASSET}`]: bin });
+    const bin = `#!/bin/sh\ntouch ${ran}\necho 90.4.0\n`;
+    const gh = releases({ "/v90.4.0/SHA256SUMS": sumsLine("the real one", ASSET), [`/v90.4.0/${ASSET}`]: bin });
     host.releasesUrl = gh.url;
-    await expect(ops.installRuntime(host, { version: "0.4.0" })).rejects.toMatchObject({ code: "FAILED", message: expect.stringContaining(`has sha256 ${sha256Hex(bin)}`) });
+    await expect(ops.installRuntime(host, { version: "90.4.0" })).rejects.toMatchObject({ code: "FAILED", message: expect.stringContaining(`has sha256 ${sha256Hex(bin)}`) });
     expect(installed(host)).toEqual([VERSION]);
-    expect(host.sys.lstat(host.layout.runtimeDir("0.4.0"))).toBeNull();
+    expect(host.sys.lstat(host.layout.runtimeDir("90.4.0"))).toBeNull();
     noLeftovers(host);
     expect(failures(host, "runtime.install")).toHaveLength(1);
     // Never run: an unverified binary is not even asked its version.
@@ -152,29 +152,29 @@ describe("install from a release", () => {
   });
 
   test("a SHA256SUMS without the asset is refused before the binary is downloaded", async () => {
-    const bin = script("0.4.0");
-    const gh = releases({ "/v0.4.0/SHA256SUMS": sumsLine(bin, "incibase-windows-x64.exe"), [`/v0.4.0/${ASSET}`]: bin });
+    const bin = script("90.4.0");
+    const gh = releases({ "/v90.4.0/SHA256SUMS": sumsLine(bin, "incibase-windows-x64.exe"), [`/v90.4.0/${ASSET}`]: bin });
     const host = await hostWith(gh.url);
-    await expect(ops.installRuntime(host, { version: "0.4.0" })).rejects.toMatchObject({ code: "NOT_FOUND", message: expect.stringContaining(`no entry for ${ASSET}`) });
-    expect(gh.requests).toEqual(["/v0.4.0/SHA256SUMS"]);
+    await expect(ops.installRuntime(host, { version: "90.4.0" })).rejects.toMatchObject({ code: "NOT_FOUND", message: expect.stringContaining(`no entry for ${ASSET}`) });
+    expect(gh.requests).toEqual(["/v90.4.0/SHA256SUMS"]);
     expect(installed(host)).toEqual([VERSION]);
     noLeftovers(host);
   });
 
   test("a release without SHA256SUMS, or without the binary (404)", async () => {
-    const bin = script("0.4.0");
-    const gh = releases({ [`/v0.4.0/${ASSET}`]: bin, "/v0.5.0/SHA256SUMS": sumsLine(bin, ASSET) });
+    const bin = script("90.4.0");
+    const gh = releases({ [`/v90.4.0/${ASSET}`]: bin, "/v90.5.0/SHA256SUMS": sumsLine(bin, ASSET) });
     const host = await hostWith(gh.url);
-    await expect(ops.installRuntime(host, { version: "0.4.0" })).rejects.toMatchObject({ code: "NOT_FOUND", message: expect.stringContaining("/v0.4.0/SHA256SUMS does not exist (404)") });
-    expect(gh.requests).toEqual(["/v0.4.0/SHA256SUMS"]);
-    await expect(ops.installRuntime(host, { version: "0.5.0" })).rejects.toMatchObject({ code: "NOT_FOUND", message: expect.stringContaining(`/v0.5.0/${ASSET} does not exist (404)`) });
+    await expect(ops.installRuntime(host, { version: "90.4.0" })).rejects.toMatchObject({ code: "NOT_FOUND", message: expect.stringContaining("/v90.4.0/SHA256SUMS does not exist (404)") });
+    expect(gh.requests).toEqual(["/v90.4.0/SHA256SUMS"]);
+    await expect(ops.installRuntime(host, { version: "90.5.0" })).rejects.toMatchObject({ code: "NOT_FOUND", message: expect.stringContaining(`/v90.5.0/${ASSET} does not exist (404)`) });
     await expect(ops.installRuntime(host, { version: "9.9.9" })).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(installed(host)).toEqual([VERSION]);
     noLeftovers(host);
   });
 
   test("a download that breaks off is refused and its partial file removed", async () => {
-    const bin = script("0.4.0", "x".repeat(4000));
+    const bin = script("90.4.0", "x".repeat(4000));
     const sums = sumsLine(bin, ASSET);
     // A raw server: SHA256SUMS whole, the binary cut off after 1000 of its bytes.
     const server = Bun.listen({
@@ -192,9 +192,9 @@ describe("install from a release", () => {
     });
     servers.push(server);
     const host = await hostWith(`http://127.0.0.1:${server.port}`);
-    await expect(ops.installRuntime(host, { version: "0.4.0" })).rejects.toMatchObject({ code: "FAILED", message: expect.stringMatching(/broke off|ended after 1000 of/) });
+    await expect(ops.installRuntime(host, { version: "90.4.0" })).rejects.toMatchObject({ code: "FAILED", message: expect.stringMatching(/broke off|ended after 1000 of/) });
     expect(installed(host)).toEqual([VERSION]);
-    expect(host.sys.lstat(host.layout.runtimeDir("0.4.0"))).toBeNull();
+    expect(host.sys.lstat(host.layout.runtimeDir("90.4.0"))).toBeNull();
     noLeftovers(host);
   });
 
@@ -214,21 +214,21 @@ describe("install from a release", () => {
     });
     servers.push(server);
     const host = await hostWith(`http://127.0.0.1:${server.port}`);
-    await expect(ops.installRuntime(host, { version: "0.4.0" })).rejects.toThrow(/more than the \d+ a runtime may be/);
+    await expect(ops.installRuntime(host, { version: "90.4.0" })).rejects.toThrow(/more than the \d+ a runtime may be/);
     noLeftovers(host);
   });
 
   test("a binary that is not the version it was published as is refused", async () => {
-    const bin = script("0.3.9");
-    const gh = releases({ "/v0.4.0/SHA256SUMS": sumsLine(bin, ASSET), [`/v0.4.0/${ASSET}`]: bin });
+    const bin = script("90.3.9");
+    const gh = releases({ "/v90.4.0/SHA256SUMS": sumsLine(bin, ASSET), [`/v90.4.0/${ASSET}`]: bin });
     const host = await hostWith(gh.url);
-    await expect(ops.installRuntime(host, { version: "0.4.0" })).rejects.toThrow(/says it is "0.3.9", not 0.4.0/);
+    await expect(ops.installRuntime(host, { version: "90.4.0" })).rejects.toThrow(/says it is "90.3.9", not 90.4.0/);
     expect(installed(host)).toEqual([VERSION]);
     noLeftovers(host);
   });
 
   test("every redirect hop is checked, not only the last one", async () => {
-    const bin = script("0.4.0");
+    const bin = script("90.4.0");
     const sums = sumsLine(bin, ASSET);
     const requests: string[] = [];
     // On every interface, so that 0.0.0.0 (not loopback) reaches it too.
@@ -241,53 +241,53 @@ describe("install from a release", () => {
         const [, kind, name] = url.pathname.split("/") as [string, string, string];
         const to = (where: string) => new Response(null, { status: 302, headers: { location: where } });
         // https -> http://<anywhere> -> https://<attacker>, with loopback standing in for https.
-        if (kind === "v0.4.0") return to(`http://0.0.0.0:${server.port}/hop/${name}`);
+        if (kind === "v90.4.0") return to(`http://0.0.0.0:${server.port}/hop/${name}`);
         if (kind === "hop") return to(`http://127.0.0.1:${server.port}/real/${name}`);
         if (kind === "real") return new Response(name === "SHA256SUMS" ? sums : bin);
-        if (kind === "v0.6.0") return to(`/v0.6.0/${name}`); // forever
-        if (kind === "v0.7.0") return new Response(null, { status: 302 }); // no Location
+        if (kind === "v90.6.0") return to(`/v90.6.0/${name}`); // forever
+        if (kind === "v90.7.0") return new Response(null, { status: 302 }); // no Location
         return new Response("Not Found", { status: 404 });
       },
     });
     servers.push(server);
     const host = await hostWith(`http://127.0.0.1:${server.port}`);
-    await expect(ops.installRuntime(host, { version: "0.4.0" })).rejects.toMatchObject({ code: "FAILED", message: expect.stringContaining(`redirected to http://0.0.0.0:${server.port}, which is not https`) });
+    await expect(ops.installRuntime(host, { version: "90.4.0" })).rejects.toMatchObject({ code: "FAILED", message: expect.stringContaining(`redirected to http://0.0.0.0:${server.port}, which is not https`) });
     // Refused at the hop itself: nothing was asked of 0.0.0.0.
-    expect(requests).toEqual(["127.0.0.1 /v0.4.0/SHA256SUMS"]);
-    await expect(ops.installRuntime(host, { version: "0.6.0" })).rejects.toThrow(/redirected more than 5 times/);
-    await expect(ops.installRuntime(host, { version: "0.7.0" })).rejects.toMatchObject({ code: "FAILED", message: expect.stringContaining("answered 302 without a Location") });
+    expect(requests).toEqual(["127.0.0.1 /v90.4.0/SHA256SUMS"]);
+    await expect(ops.installRuntime(host, { version: "90.6.0" })).rejects.toThrow(/redirected more than 5 times/);
+    await expect(ops.installRuntime(host, { version: "90.7.0" })).rejects.toMatchObject({ code: "FAILED", message: expect.stringContaining("answered 302 without a Location") });
     expect(installed(host)).toEqual([VERSION]);
 
     // Loopback all the way (http only because the download started on loopback): followed.
-    const bin5 = script("0.5.0");
+    const bin5 = script("90.5.0");
     const sums5 = sumsLine(bin5, ASSET);
     const gh = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
       fetch(req): Response {
         const path = new URL(req.url).pathname;
-        if (path.startsWith("/v0.5.0/")) return new Response(null, { status: 302, headers: { location: `/store${path}` } });
+        if (path.startsWith("/v90.5.0/")) return new Response(null, { status: 302, headers: { location: `/store${path}` } });
         if (path.startsWith("/store/")) return new Response(null, { status: 307, headers: { location: `http://localhost:${gh.port}/final${path}` } });
         return new Response(path.endsWith("SHA256SUMS") ? sums5 : bin5);
       },
     });
     servers.push(gh);
     host.releasesUrl = `http://127.0.0.1:${gh.port}`;
-    expect(await ops.installRuntime(host, { version: "0.5.0" })).toMatchObject({ installed: true, sha256: sha256Hex(bin5) });
+    expect(await ops.installRuntime(host, { version: "90.5.0" })).toMatchObject({ installed: true, sha256: sha256Hex(bin5) });
     noLeftovers(host);
   });
 
   test("again: no download, nothing changes", async () => {
-    const bin = script("0.4.0");
-    const gh = releases({ "/v0.4.0/SHA256SUMS": sumsLine(bin, ASSET), [`/v0.4.0/${ASSET}`]: bin });
+    const bin = script("90.4.0");
+    const gh = releases({ "/v90.4.0/SHA256SUMS": sumsLine(bin, ASSET), [`/v90.4.0/${ASSET}`]: bin });
     const host = await hostWith(gh.url);
-    await ops.installRuntime(host, { version: "0.4.0" });
-    const before = statSync(host.layout.runtimeBinary("0.4.0"));
+    await ops.installRuntime(host, { version: "90.4.0" });
+    const before = statSync(host.layout.runtimeBinary("90.4.0"));
     const changes = host.sys.changeCount;
-    expect(await ops.installRuntime(host, { version: "0.4.0" })).toMatchObject({ installed: false, sha256: sha256Hex(bin) });
+    expect(await ops.installRuntime(host, { version: "90.4.0" })).toMatchObject({ installed: false, sha256: sha256Hex(bin) });
     expect(gh.requests).toHaveLength(2);
     expect(host.sys.changeCount).toBe(changes);
-    expect(statSync(host.layout.runtimeBinary("0.4.0")).ino).toBe(before.ino);
+    expect(statSync(host.layout.runtimeBinary("90.4.0")).ino).toBe(before.ino);
     expect(host.registry.listAudit().at(-1)).toMatchObject({ action: "runtime.install", ok: 1, detail_json: expect.stringContaining('"unchanged":true') });
   });
 });
@@ -295,75 +295,75 @@ describe("install from a release", () => {
 describe("install from a local file", () => {
   test("with SHA256SUMS: the entry for its file name must match", async () => {
     const host = await hostWith();
-    const bin = file(host, "incibase-linux-x64", script("0.4.0"));
-    const sums = file(host, "SHA256SUMS", sumsLine(script("0.4.0"), "incibase-linux-x64") + sumsLine("other", "incibase-linux-arm64"));
-    expect(await ops.installRuntime(host, { version: "0.4.0", binary: bin, sums })).toMatchObject({ installed: true, source: `file:${bin}` });
-    expect(readFileSync(host.layout.runtimeBinary("0.4.0"), "utf8")).toBe(script("0.4.0"));
+    const bin = file(host, "incibase-linux-x64", script("90.4.0"));
+    const sums = file(host, "SHA256SUMS", sumsLine(script("90.4.0"), "incibase-linux-x64") + sumsLine("other", "incibase-linux-arm64"));
+    expect(await ops.installRuntime(host, { version: "90.4.0", binary: bin, sums })).toMatchObject({ installed: true, source: `file:${bin}` });
+    expect(readFileSync(host.layout.runtimeBinary("90.4.0"), "utf8")).toBe(script("90.4.0"));
 
-    const other = file(host, "incibase-0.5.0", script("0.5.0"));
-    await expect(ops.installRuntime(host, { version: "0.5.0", binary: other, sums })).rejects.toMatchObject({ code: "NOT_FOUND", message: expect.stringContaining("no entry for incibase-0.5.0") });
-    const wrong = file(host, "SHA256SUMS.wrong", sumsLine("not it", "incibase-0.5.0"));
-    await expect(ops.installRuntime(host, { version: "0.5.0", binary: other, sums: wrong })).rejects.toMatchObject({ code: "FAILED" });
-    expect(installed(host)).toEqual([VERSION, "0.4.0"]);
+    const other = file(host, "incibase-90.5.0", script("90.5.0"));
+    await expect(ops.installRuntime(host, { version: "90.5.0", binary: other, sums })).rejects.toMatchObject({ code: "NOT_FOUND", message: expect.stringContaining("no entry for incibase-90.5.0") });
+    const wrong = file(host, "SHA256SUMS.wrong", sumsLine("not it", "incibase-90.5.0"));
+    await expect(ops.installRuntime(host, { version: "90.5.0", binary: other, sums: wrong })).rejects.toMatchObject({ code: "FAILED" });
+    expect(installed(host)).toEqual([VERSION, "90.4.0"]);
     noLeftovers(host);
   });
 
   test("with an explicit sha256", async () => {
     const host = await hostWith();
-    const bin = file(host, "incibase", script("0.4.0"));
-    await expect(ops.installRuntime(host, { version: "0.4.0", binary: bin, sha256: sha256Hex("something else") })).rejects.toMatchObject({ code: "FAILED" });
-    expect(host.sys.lstat(host.layout.runtimeDir("0.4.0"))).toBeNull();
-    expect(await ops.installRuntime(host, { version: "0.4.0", binary: bin, sha256: sha256Hex(script("0.4.0")).toUpperCase() })).toMatchObject({ installed: true });
+    const bin = file(host, "incibase", script("90.4.0"));
+    await expect(ops.installRuntime(host, { version: "90.4.0", binary: bin, sha256: sha256Hex("something else") })).rejects.toMatchObject({ code: "FAILED" });
+    expect(host.sys.lstat(host.layout.runtimeDir("90.4.0"))).toBeNull();
+    expect(await ops.installRuntime(host, { version: "90.4.0", binary: bin, sha256: sha256Hex(script("90.4.0")).toUpperCase() })).toMatchObject({ installed: true });
     noLeftovers(host);
   });
 
   test("needs exactly one checksum, absolute paths and a valid version", async () => {
     const host = await hostWith();
-    const bin = file(host, "incibase", script("0.4.0"));
-    const sums = file(host, "SHA256SUMS", sumsLine(script("0.4.0"), "incibase"));
-    const sha256 = sha256Hex(script("0.4.0"));
+    const bin = file(host, "incibase", script("90.4.0"));
+    const sums = file(host, "SHA256SUMS", sumsLine(script("90.4.0"), "incibase"));
+    const sha256 = sha256Hex(script("90.4.0"));
     for (const input of [
-      { version: "0.4.0", binary: bin },
-      { version: "0.4.0", binary: bin, sha256, sums },
-      { version: "0.4.0", sums },
-      { version: "0.4.0", sha256 },
-      { version: "0.4.0", binary: "incibase", sha256 },
-      { version: "0.4.0", binary: bin, sha256: "abc" },
-      { version: "../0.4.0", binary: bin, sha256 },
-      { version: "0.4.0", binary: bin, sha256, extra: 1 },
+      { version: "90.4.0", binary: bin },
+      { version: "90.4.0", binary: bin, sha256, sums },
+      { version: "90.4.0", sums },
+      { version: "90.4.0", sha256 },
+      { version: "90.4.0", binary: "incibase", sha256 },
+      { version: "90.4.0", binary: bin, sha256: "abc" },
+      { version: "../90.4.0", binary: bin, sha256 },
+      { version: "90.4.0", binary: bin, sha256, extra: 1 },
     ]) {
       await expect(ops.installRuntime(host, input as never)).rejects.toMatchObject({ code: "INVALID" });
     }
-    await expect(ops.installRuntime(host, { version: "0.4.0", binary: join(host.dir, "missing"), sha256 })).rejects.toMatchObject({ code: "INVALID" });
+    await expect(ops.installRuntime(host, { version: "90.4.0", binary: join(host.dir, "missing"), sha256 })).rejects.toMatchObject({ code: "INVALID" });
     expect(installed(host)).toEqual([VERSION]);
   });
 
   test("never other bytes under an installed version; a damaged file is put back", async () => {
     const host = await hostWith();
-    const bin = file(host, "a", script("0.4.0"));
-    await ops.installRuntime(host, { version: "0.4.0", binary: bin, sha256: sha256Hex(script("0.4.0")) });
-    const rebuilt = file(host, "b", script("0.4.0", "rebuilt"));
-    await expect(ops.installRuntime(host, { version: "0.4.0", binary: rebuilt, sha256: sha256Hex(script("0.4.0", "rebuilt")) })).rejects.toMatchObject({
+    const bin = file(host, "a", script("90.4.0"));
+    await ops.installRuntime(host, { version: "90.4.0", binary: bin, sha256: sha256Hex(script("90.4.0")) });
+    const rebuilt = file(host, "b", script("90.4.0", "rebuilt"));
+    await expect(ops.installRuntime(host, { version: "90.4.0", binary: rebuilt, sha256: sha256Hex(script("90.4.0", "rebuilt")) })).rejects.toMatchObject({
       code: "CONFLICT",
     });
-    expect(readFileSync(host.layout.runtimeBinary("0.4.0"), "utf8")).toBe(script("0.4.0"));
+    expect(readFileSync(host.layout.runtimeBinary("90.4.0"), "utf8")).toBe(script("90.4.0"));
     // Damaged on disk: the recorded bytes go back, other ones still do not.
-    writeFileSync(host.layout.runtimeBinary("0.4.0"), "garbage");
-    await expect(ops.installRuntime(host, { version: "0.4.0", binary: rebuilt, sha256: sha256Hex(script("0.4.0", "rebuilt")) })).rejects.toMatchObject({
+    writeFileSync(host.layout.runtimeBinary("90.4.0"), "garbage");
+    await expect(ops.installRuntime(host, { version: "90.4.0", binary: rebuilt, sha256: sha256Hex(script("90.4.0", "rebuilt")) })).rejects.toMatchObject({
       code: "CONFLICT",
     });
-    expect(await ops.installRuntime(host, { version: "0.4.0", binary: bin, sha256: sha256Hex(script("0.4.0")) })).toMatchObject({ installed: true });
-    expect(readFileSync(host.layout.runtimeBinary("0.4.0"), "utf8")).toBe(script("0.4.0"));
+    expect(await ops.installRuntime(host, { version: "90.4.0", binary: bin, sha256: sha256Hex(script("90.4.0")) })).toMatchObject({ installed: true });
+    expect(readFileSync(host.layout.runtimeBinary("90.4.0"), "utf8")).toBe(script("90.4.0"));
   });
 
   test("again, with its files someone else's: a root-only copy of the recorded bytes takes their place; other bytes are put back", async () => {
     const host = await hostWith();
-    const bin = file(host, "a", script("0.4.0"));
-    const sha256 = sha256Hex(script("0.4.0"));
-    await ops.installRuntime(host, { version: "0.4.0", binary: bin, sha256 });
-    const path = host.layout.runtimeBinary("0.4.0");
-    const dir = host.layout.runtimeDir("0.4.0");
-    const trusted = () => runtimeFilesRootOnly(host.sys, host.layout, "0.4.0");
+    const bin = file(host, "a", script("90.4.0"));
+    const sha256 = sha256Hex(script("90.4.0"));
+    await ops.installRuntime(host, { version: "90.4.0", binary: bin, sha256 });
+    const path = host.layout.runtimeBinary("90.4.0");
+    const dir = host.layout.runtimeDir("90.4.0");
+    const trusted = () => runtimeFilesRootOnly(host.sys, host.layout, "90.4.0");
     // The same bytes, someone else's: the directories become root's first, then a checked copy replaces the file (a new inode: an fd they hold open writes elsewhere).
     for (const [what, mess] of [
       ["the binary", () => host.sys.own(path, 1000, 1000)],
@@ -376,7 +376,7 @@ describe("install from a local file", () => {
       expect(trusted(), what).toBe(false);
       const before = statSync(path).ino;
       const marks = host.sys.log.length;
-      expect(await ops.installRuntime(host, { version: "0.4.0" }), what).toMatchObject({ installed: false, repaired: true, sha256 });
+      expect(await ops.installRuntime(host, { version: "90.4.0" }), what).toMatchObject({ installed: false, repaired: true, sha256 });
       expect(trusted(), what).toBe(true);
       expect(statSync(path).ino, what).not.toBe(before);
       expect(host.sys.log.slice(marks).filter((l) => l.startsWith("chown ") || l.startsWith("chmod ")).slice(0, 4), what).toEqual([
@@ -385,25 +385,25 @@ describe("install from a local file", () => {
         `chown ${dir} 0:0`,
         `chmod ${dir} 755`,
       ]);
-      expect(readFileSync(path, "utf8"), what).toBe(script("0.4.0"));
+      expect(readFileSync(path, "utf8"), what).toBe(script("90.4.0"));
       expect(host.registry.listAudit().at(-1), what).toMatchObject({ action: "runtime.install", ok: 1, detail_json: expect.stringContaining('"repaired":true') });
       noLeftovers(host);
     }
     // Other bytes in a file someone else could write are never made root's: the recorded ones go back, from the binary given.
-    const same = script("0.4.0").replace("echo 0.4.0", "echo 6.6.6");
-    expect(same.length).toBe(script("0.4.0").length);
+    const same = script("90.4.0").replace("echo 90.4.0", "echo 66.6.6");
+    expect(same.length).toBe(script("90.4.0").length);
     writeFileSync(path, same);
     host.sys.own(path, 1000, 1000);
-    expect(await ops.installRuntime(host, { version: "0.4.0", binary: bin, sha256 })).toMatchObject({ installed: true });
-    expect(readFileSync(path, "utf8")).toBe(script("0.4.0"));
+    expect(await ops.installRuntime(host, { version: "90.4.0", binary: bin, sha256 })).toMatchObject({ installed: true });
+    expect(readFileSync(path, "utf8")).toBe(script("90.4.0"));
     // Nor is one of another size, which is not even copied.
-    writeFileSync(path, script("0.4.0", "theirs"));
+    writeFileSync(path, script("90.4.0", "theirs"));
     host.sys.own(path, 1000, 1000);
-    await expect(ops.installRuntime(host, { version: "0.4.0", binary: file(host, "b", script("0.4.0", "rebuilt")), sha256: sha256Hex(script("0.4.0", "rebuilt")) })).rejects.toMatchObject({
+    await expect(ops.installRuntime(host, { version: "90.4.0", binary: file(host, "b", script("90.4.0", "rebuilt")), sha256: sha256Hex(script("90.4.0", "rebuilt")) })).rejects.toMatchObject({
       code: "CONFLICT",
     });
-    expect(await ops.installRuntime(host, { version: "0.4.0", binary: bin, sha256 })).toMatchObject({ installed: true });
-    expect(readFileSync(path, "utf8")).toBe(script("0.4.0"));
+    expect(await ops.installRuntime(host, { version: "90.4.0", binary: bin, sha256 })).toMatchObject({ installed: true });
+    expect(readFileSync(path, "utf8")).toBe(script("90.4.0"));
     expect(trusted()).toBe(true);
     noLeftovers(host);
   });
@@ -450,13 +450,13 @@ describe("install from a local file", () => {
 
   test("atomic: the binary appears by one rename, after its checks", async () => {
     const host = await hostWith();
-    const bin = file(host, "incibase", script("0.4.0"));
+    const bin = file(host, "incibase", script("90.4.0"));
     const from = host.sys.log.length;
-    await ops.installRuntime(host, { version: "0.4.0", binary: bin, sha256: sha256Hex(script("0.4.0")) });
-    const path = host.layout.runtimeBinary("0.4.0");
+    await ops.installRuntime(host, { version: "90.4.0", binary: bin, sha256: sha256Hex(script("90.4.0")) });
+    const path = host.layout.runtimeBinary("90.4.0");
     const touching = host.sys.log.slice(from).filter((l) => l.includes(path));
     expect(touching).toHaveLength(1);
-    expect(touching[0]).toMatch(new RegExp(`^rename ${host.layout.runtimeDir("0.4.0")}/\\.incibase-[0-9a-f]{16}\\.partial ${path}$`));
+    expect(touching[0]).toMatch(new RegExp(`^rename ${host.layout.runtimeDir("90.4.0")}/\\.incibase-[0-9a-f]{16}\\.partial ${path}$`));
     const staged = touching[0]!.split(" ")[1]!;
     const log = host.sys.log.slice(from);
     // Copied root-only, made 0755 only after the checksum matched.
@@ -464,13 +464,13 @@ describe("install from a local file", () => {
 
     // A crash just before the rename: nothing installed, nothing recorded; a later install succeeds.
     const crashed = await hostWith();
-    const bin2 = file(crashed, "incibase", script("0.4.0"));
+    const bin2 = file(crashed, "incibase", script("90.4.0"));
     crashed.sys.crashAt = crashed.sys.changeCount + log.indexOf(touching[0]!); // the same changes as above, up to the rename
-    await expect(ops.installRuntime(crashed, { version: "0.4.0", binary: bin2, sha256: sha256Hex(script("0.4.0")) })).rejects.toThrow(/simulated crash before rename/);
+    await expect(ops.installRuntime(crashed, { version: "90.4.0", binary: bin2, sha256: sha256Hex(script("90.4.0")) })).rejects.toThrow(/simulated crash before rename/);
     crashed.sys.crashAt = null;
-    expect(crashed.sys.lstat(crashed.layout.runtimeBinary("0.4.0"))).toBeNull();
-    expect(crashed.registry.getRuntime("0.4.0")).toBeNull();
-    expect(await ops.installRuntime(crashed, { version: "0.4.0", binary: bin2, sha256: sha256Hex(script("0.4.0")) })).toMatchObject({ installed: true });
+    expect(crashed.sys.lstat(crashed.layout.runtimeBinary("90.4.0"))).toBeNull();
+    expect(crashed.registry.getRuntime("90.4.0")).toBeNull();
+    expect(await ops.installRuntime(crashed, { version: "90.4.0", binary: bin2, sha256: sha256Hex(script("90.4.0")) })).toMatchObject({ installed: true });
     noLeftovers(crashed);
   });
 
@@ -478,12 +478,12 @@ describe("install from a local file", () => {
     const host = await hostWith();
     const bin = file(host, "incibase", script(VERSION));
     const sha256 = sha256Hex(script(VERSION));
-    await expect(ops.installRuntime(host, { version: "0.9.0-test", binary: bin, sha256 })).rejects.toThrow(/says it is/);
-    expect(await ops.installRuntime(host, { version: "0.9.0-test", binary: bin, sha256, skipVersionCheck: true })).toMatchObject({ installed: true });
-    expect(host.registry.getRuntime("0.9.0-test")).toMatchObject({ reported: VERSION });
+    await expect(ops.installRuntime(host, { version: "90.9.0-test", binary: bin, sha256 })).rejects.toThrow(/says it is/);
+    expect(await ops.installRuntime(host, { version: "90.9.0-test", binary: bin, sha256, skipVersionCheck: true })).toMatchObject({ installed: true });
+    expect(host.registry.getRuntime("90.9.0-test")).toMatchObject({ reported: VERSION });
     // It must still run.
     const broken = file(host, "broken", "#!/bin/sh\nexit 3\n");
-    await expect(ops.installRuntime(host, { version: "0.9.1", binary: broken, sha256: sha256Hex("#!/bin/sh\nexit 3\n"), skipVersionCheck: true })).rejects.toThrow(/says it is/);
+    await expect(ops.installRuntime(host, { version: "90.9.1", binary: broken, sha256: sha256Hex("#!/bin/sh\nexit 3\n"), skipVersionCheck: true })).rejects.toThrow(/says it is/);
     noLeftovers(host);
   });
 
@@ -492,8 +492,8 @@ describe("install from a local file", () => {
     expect(process.cwd()).not.toBe("/");
     const content = "#!/bin/sh\npwd\n";
     const bin = file(host, "pwd", content);
-    expect(await ops.installRuntime(host, { version: "0.9.2", binary: bin, sha256: sha256Hex(content), skipVersionCheck: true })).toMatchObject({ installed: true });
-    expect(host.registry.getRuntime("0.9.2")).toMatchObject({ reported: "/" });
+    expect(await ops.installRuntime(host, { version: "90.9.2", binary: bin, sha256: sha256Hex(content), skipVersionCheck: true })).toMatchObject({ installed: true });
+    expect(host.registry.getRuntime("90.9.2")).toMatchObject({ reported: "/" });
   });
 });
 
@@ -507,27 +507,27 @@ describe("the CLI link", () => {
   test("points at an installed runtime, atomically, and refuses what is not a link", async () => {
     const host = await hostWith();
     const link = host.layout.cliLink;
-    await expect(ops.useCli(host, { version: "0.4.0" })).rejects.toMatchObject({ code: "NOT_FOUND" });
-    await withRuntime(host, "0.4.0");
-    expect(await ops.useCli(host, { version: "0.4.0" })).toMatchObject({ version: "0.4.0", link, target: host.layout.runtimeBinary("0.4.0"), previous: null });
-    expect(host.sys.readlink(link)).toBe(host.layout.runtimeBinary("0.4.0"));
-    expect(Bun.spawnSync([link, "--version"]).stdout.toString().trim()).toBe("0.4.0");
-    expect(host.registry.getSetting("cli_version")).toBe("0.4.0");
-    expect((await ops.listRuntimes(host)).cli).toBe("0.4.0");
-    expect(await ops.useCli(host, { version: VERSION })).toMatchObject({ previous: host.layout.runtimeBinary("0.4.0") });
+    await expect(ops.useCli(host, { version: "90.4.0" })).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await withRuntime(host, "90.4.0");
+    expect(await ops.useCli(host, { version: "90.4.0" })).toMatchObject({ version: "90.4.0", link, target: host.layout.runtimeBinary("90.4.0"), previous: null });
+    expect(host.sys.readlink(link)).toBe(host.layout.runtimeBinary("90.4.0"));
+    expect(Bun.spawnSync([link, "--version"]).stdout.toString().trim()).toBe("90.4.0");
+    expect(host.registry.getSetting("cli_version")).toBe("90.4.0");
+    expect((await ops.listRuntimes(host)).cli).toBe("90.4.0");
+    expect(await ops.useCli(host, { version: VERSION })).toMatchObject({ previous: host.layout.runtimeBinary("90.4.0") });
     expect((await ops.listRuntimes(host)).cli).toBe(VERSION);
 
     host.sys.remove(link);
     writeFileSync(link, "a binary copied here by hand");
-    await expect(ops.useCli(host, { version: "0.4.0" })).rejects.toMatchObject({ code: "CONFLICT", message: expect.stringContaining("pass replace") });
+    await expect(ops.useCli(host, { version: "90.4.0" })).rejects.toMatchObject({ code: "CONFLICT", message: expect.stringContaining("pass replace") });
     expect(readFileSync(link, "utf8")).toBe("a binary copied here by hand");
-    await ops.useCli(host, { version: "0.4.0", replace: true });
-    expect(host.sys.readlink(link)).toBe(host.layout.runtimeBinary("0.4.0"));
+    await ops.useCli(host, { version: "90.4.0", replace: true });
+    expect(host.sys.readlink(link)).toBe(host.layout.runtimeBinary("90.4.0"));
 
     host.sys.remove(link);
     mkdirSync(link);
-    await expect(ops.useCli(host, { version: "0.4.0", replace: true })).rejects.toMatchObject({ code: "CONFLICT" });
-    await expect(ops.useCli(host, { version: "0.4.0; rm" })).rejects.toMatchObject({ code: "INVALID" });
+    await expect(ops.useCli(host, { version: "90.4.0", replace: true })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(ops.useCli(host, { version: "90.4.0; rm" })).rejects.toMatchObject({ code: "INVALID" });
   });
 
   test("refuses a link where someone other than root can change it, and a runtime that is not root's alone: root runs what it leads to", async () => {
@@ -620,83 +620,83 @@ describe("branch pins and gc", () => {
 
   test("pins only installed runtimes", async () => {
     const host = await shop();
-    await expect(ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "0.4.0" })).rejects.toMatchObject({ code: "NOT_FOUND" });
-    await expect(ops.createBranch(host, { project: "shop", name: "preview", runtimeVersion: "0.4.0" })).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "90.4.0" })).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(ops.createBranch(host, { project: "shop", name: "preview", runtimeVersion: "90.4.0" })).rejects.toMatchObject({ code: "NOT_FOUND" });
     // Recorded but its file gone is not installed either.
-    await withRuntime(host, "0.4.0");
-    host.sys.remove(host.layout.runtimeBinary("0.4.0"));
-    await expect(ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "0.4.0" })).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await withRuntime(host, "90.4.0");
+    host.sys.remove(host.layout.runtimeBinary("90.4.0"));
+    await expect(ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "90.4.0" })).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(pin(host, "dev")).toBe(VERSION);
   });
 
   test("gc removes the runtimes no branch pins, never the CLI's, and the pins move through the gate", async () => {
     const host = await shop();
-    for (const v of ["0.4.0", "0.5.0", "0.6.0"]) await withRuntime(host, v);
-    await ops.useCli(host, { version: "0.5.0" });
-    expect(await ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "0.4.0" })).toMatchObject({ ok: true });
-    expect(pin(host, "dev")).toBe("0.4.0");
+    for (const v of ["90.4.0", "90.5.0", "90.6.0"]) await withRuntime(host, v);
+    await ops.useCli(host, { version: "90.5.0" });
+    expect(await ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "90.4.0" })).toMatchObject({ ok: true });
+    expect(pin(host, "dev")).toBe("90.4.0");
     expect(readFileSync(host.layout.dropIn(host.layout.units.branch(host.registry.findBranch("shop", "dev")!.id)), "utf8")).toContain(
-      `${host.layout.runtimeRoot}/0.4.0/incibase serve`,
+      `${host.layout.runtimeRoot}/90.4.0/incibase serve`,
     );
 
     const listed = await ops.listRuntimes(host);
     expect(listed.runtimes.map((r) => [r.version, r.pinnedBy, r.cli, r.present])).toEqual([
       [VERSION, ["shop/prod"], false, true],
-      ["0.4.0", ["shop/dev"], false, true],
-      ["0.5.0", [], true, true],
-      ["0.6.0", [], false, true],
+      ["90.4.0", ["shop/dev"], false, true],
+      ["90.5.0", [], true, true],
+      ["90.6.0", [], false, true],
     ]);
 
-    expect(await ops.gcRuntimes(host, { dryRun: true })).toMatchObject({ removed: ["0.6.0"], dryRun: true });
-    expect(installed(host)).toContain("0.6.0");
+    expect(await ops.gcRuntimes(host, { dryRun: true })).toMatchObject({ removed: ["90.6.0"], dryRun: true });
+    expect(installed(host)).toContain("90.6.0");
     const result = await ops.gcRuntimes(host);
-    expect(result.removed).toEqual(["0.6.0"]);
+    expect(result.removed).toEqual(["90.6.0"]);
     expect(result.kept).toEqual([
       { version: VERSION, by: ["shop/prod"] },
-      { version: "0.4.0", by: ["shop/dev"] },
-      { version: "0.5.0", by: [host.layout.cliLink] },
+      { version: "90.4.0", by: ["shop/dev"] },
+      { version: "90.5.0", by: [host.layout.cliLink] },
     ]);
-    expect(host.sys.lstat(host.layout.runtimeDir("0.6.0"))).toBeNull();
-    expect(installed(host)).toEqual([VERSION, "0.4.0", "0.5.0"]);
+    expect(host.sys.lstat(host.layout.runtimeDir("90.6.0"))).toBeNull();
+    expect(installed(host)).toEqual([VERSION, "90.4.0", "90.5.0"]);
     expect(host.registry.listAudit().at(-1)).toMatchObject({ action: "runtime.gc", ok: 1 });
-    await expect(ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "0.6.0" })).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(ops.upgradeBranch(host, { project: "shop", branch: "dev", runtimeVersion: "90.6.0" })).rejects.toMatchObject({ code: "NOT_FOUND" });
 
     // A failed upgrade reverts the pin, so gc keeps what the branch still runs.
-    host.driver.behavior = (run) => (run.runtime === "0.5.0" && run.kind === "branch" ? { exit: 64 } : {});
-    expect(await ops.upgradeBranch(host, { project: "shop", branch: "prod", runtimeVersion: "0.5.0" })).toMatchObject({ ok: false });
+    host.driver.behavior = (run) => (run.runtime === "90.5.0" && run.kind === "branch" ? { exit: 64 } : {});
+    expect(await ops.upgradeBranch(host, { project: "shop", branch: "prod", runtimeVersion: "90.5.0" })).toMatchObject({ ok: false });
     expect(pin(host, "prod")).toBe(VERSION);
     host.driver.behavior = () => ({});
-    expect(await ops.upgradeBranch(host, { project: "shop", branch: "prod", runtimeVersion: "0.4.0" })).toMatchObject({ ok: true });
-    await ops.useCli(host, { version: "0.4.0" });
+    expect(await ops.upgradeBranch(host, { project: "shop", branch: "prod", runtimeVersion: "90.4.0" })).toMatchObject({ ok: true });
+    await ops.useCli(host, { version: "90.4.0" });
     // `host gc`: trash, then the runtimes.
-    expect(await ops.gc(host)).toMatchObject({ trash: [], runtimes: { removed: [VERSION, "0.5.0"] } });
-    expect(installed(host)).toEqual(["0.4.0"]);
+    expect(await ops.gc(host)).toMatchObject({ trash: [], runtimes: { removed: [VERSION, "90.5.0"] } });
+    expect(installed(host)).toEqual(["90.4.0"]);
     noLeftovers(host);
   });
 
   test("keeps everything while a branch is being upgraded, and the runtime this process runs from", async () => {
     const host = await shop();
-    await withRuntime(host, "0.4.0");
-    await withRuntime(host, "0.5.0");
+    await withRuntime(host, "90.4.0");
+    await withRuntime(host, "90.5.0");
     const dev = host.registry.findBranch("shop", "dev")!;
     await host.registry.withLock(() => host.registry.claimBusy(dev.id, host.layout.units.job("upgrade", dev.id, 1), 1));
     expect(await ops.gcRuntimes(host)).toMatchObject({ removed: [], skipped: "upgrading shop/dev" });
-    expect(installed(host)).toEqual([VERSION, "0.4.0", "0.5.0"]);
+    expect(installed(host)).toEqual([VERSION, "90.4.0", "90.5.0"]);
     await host.registry.withLock(() => host.registry.releaseBusy(dev.id, host.layout.units.job("upgrade", dev.id, 1), 2));
 
-    host.self = [host.layout.runtimeBinary("0.5.0"), "host"];
+    host.self = [host.layout.runtimeBinary("90.5.0"), "host"];
     const result = await ops.gcRuntimes(host);
-    expect(result.removed).toEqual(["0.4.0"]);
-    expect(result.kept).toContainEqual({ version: "0.5.0", by: ["this process"] });
+    expect(result.removed).toEqual(["90.4.0"]);
+    expect(result.kept).toContainEqual({ version: "90.5.0", by: ["this process"] });
   });
 
   test("a deleted branch's pin no longer counts", async () => {
     const host = await shop();
-    await withRuntime(host, "0.4.0");
-    await ops.createBranch(host, { project: "shop", name: "preview", runtimeVersion: "0.4.0" });
+    await withRuntime(host, "90.4.0");
+    await ops.createBranch(host, { project: "shop", name: "preview", runtimeVersion: "90.4.0" });
     expect((await ops.gcRuntimes(host)).removed).toEqual([]);
     await ops.deleteBranch(host, { project: "shop", branch: "preview" });
-    expect((await ops.gcRuntimes(host)).removed).toEqual(["0.4.0"]);
+    expect((await ops.gcRuntimes(host)).removed).toEqual(["90.4.0"]);
   });
 });
 
@@ -716,28 +716,28 @@ describe("what killed installs leave", () => {
 
   test("an install of the version sweeps its stale staged files, never one still in progress", async () => {
     const host = await hostWith();
-    const stale = staged(host, "0.3.2-st", OLD);
-    const tmp = join(host.layout.runtimeDir("0.3.2-st"), "..incibase-00000000000000aa.partial.tmp"); // a copy killed midway
+    const stale = staged(host, "90.3.2-st", OLD);
+    const tmp = join(host.layout.runtimeDir("90.3.2-st"), "..incibase-00000000000000aa.partial.tmp"); // a copy killed midway
     writeFileSync(tmp, "half a copy");
     utimesSync(tmp, new Date(Date.now() - OLD), new Date(Date.now() - OLD));
-    const fresh = staged(host, "0.3.2-st", 60_000, "00000000000000ff"); // another install, still downloading
-    const bin = file(host, "incibase", script("0.3.2-st"));
-    expect(await ops.installRuntime(host, { version: "0.3.2-st", binary: bin, sha256: sha256Hex(script("0.3.2-st")) })).toMatchObject({ installed: true });
+    const fresh = staged(host, "90.3.2-st", 60_000, "00000000000000ff"); // another install, still downloading
+    const bin = file(host, "incibase", script("90.3.2-st"));
+    expect(await ops.installRuntime(host, { version: "90.3.2-st", binary: bin, sha256: sha256Hex(script("90.3.2-st")) })).toMatchObject({ installed: true });
     expect(existsSync(stale)).toBe(false);
     expect(existsSync(tmp)).toBe(false);
     expect(existsSync(fresh)).toBe(true);
-    expect(readdirSync(host.layout.runtimeDir("0.3.2-st")).sort()).toEqual([".incibase-00000000000000ff.partial", "incibase"]);
+    expect(readdirSync(host.layout.runtimeDir("90.3.2-st")).sort()).toEqual([".incibase-00000000000000ff.partial", "incibase"]);
   });
 
   test("gc sweeps stale staged files, and version directories without a record that held only those", async () => {
     const host = await hostWith();
-    await withRuntime(host, "0.4.0");
-    await ops.useCli(host, { version: "0.4.0" });
-    const inInstalled = staged(host, "0.4.0", OLD);
-    const orphan = staged(host, "0.3.2-st", OLD);
-    const busy = staged(host, "0.3.3", 60_000);
-    mkdirSync(host.layout.runtimeDir("0.3.4")); // made a moment ago by an install that has not staged yet
-    const idleEmpty = host.layout.runtimeDir("0.3.5");
+    await withRuntime(host, "90.4.0");
+    await ops.useCli(host, { version: "90.4.0" });
+    const inInstalled = staged(host, "90.4.0", OLD);
+    const orphan = staged(host, "90.3.2-st", OLD);
+    const busy = staged(host, "90.3.3", 60_000);
+    mkdirSync(host.layout.runtimeDir("90.3.4")); // made a moment ago by an install that has not staged yet
+    const idleEmpty = host.layout.runtimeDir("90.3.5");
     mkdirSync(idleEmpty);
     utimesSync(idleEmpty, new Date(Date.now() - OLD), new Date(Date.now() - OLD));
     const notOurs = join(host.layout.runtimeRoot, "notes");
@@ -750,9 +750,9 @@ describe("what killed installs leave", () => {
 
     const result = await ops.gcRuntimes(host);
     expect(result.removed).toEqual([VERSION]);
-    expect([...result.swept].sort()).toEqual([inInstalled, orphan, host.layout.runtimeDir("0.3.2-st"), idleEmpty].sort());
-    for (const gone of [inInstalled, host.layout.runtimeDir("0.3.2-st"), idleEmpty]) expect(existsSync(gone)).toBe(false);
-    for (const kept of [busy, host.layout.runtimeDir("0.3.4"), join(notOurs, ".incibase-d2427740a93ce360.partial"), host.layout.runtimeBinary("0.4.0")]) {
+    expect([...result.swept].sort()).toEqual([inInstalled, orphan, host.layout.runtimeDir("90.3.2-st"), idleEmpty].sort());
+    for (const gone of [inInstalled, host.layout.runtimeDir("90.3.2-st"), idleEmpty]) expect(existsSync(gone)).toBe(false);
+    for (const kept of [busy, host.layout.runtimeDir("90.3.4"), join(notOurs, ".incibase-d2427740a93ce360.partial"), host.layout.runtimeBinary("90.4.0")]) {
       expect(existsSync(kept)).toBe(true);
     }
     expect(JSON.parse(host.registry.listAudit().at(-1)!.detail_json!)).toMatchObject({ swept: result.swept });
@@ -766,25 +766,25 @@ describe("the runtime root is one host's", () => {
     const host = await hostWith();
     const marker = join(host.layout.runtimeRoot, RUNTIME_OWNER_FILE);
     expect(readFileSync(marker, "utf8")).toBe(`${host.layout.root}\n`);
-    await withRuntime(host, "0.4.0");
+    await withRuntime(host, "90.4.0");
 
     // Another host's registry records these runtimes: this one's pins say nothing about its branches.
     writeFileSync(marker, "/var/lib/incibase-other\n");
     const gh = releases({});
     host.releasesUrl = gh.url;
-    const local = file(host, "b", script("0.5.0"));
+    const local = file(host, "b", script("90.5.0"));
     for (const attempt of [
-      () => ops.installRuntime(host, { version: "0.5.0" }),
-      () => ops.installRuntime(host, { version: "0.5.0", binary: local, sha256: sha256Hex(script("0.5.0")) }),
+      () => ops.installRuntime(host, { version: "90.5.0" }),
+      () => ops.installRuntime(host, { version: "90.5.0", binary: local, sha256: sha256Hex(script("90.5.0")) }),
       () => ops.gcRuntimes(host),
       () => ops.gc(host),
     ]) {
       await expect(attempt()).rejects.toMatchObject({ code: "CONFLICT", message: expect.stringContaining("/var/lib/incibase-other") });
     }
     expect(gh.requests).toEqual([]);
-    expect(installed(host)).toEqual([VERSION, "0.4.0"]);
-    expect(existsSync(host.layout.runtimeBinary("0.4.0"))).toBe(true);
-    expect(existsSync(host.layout.runtimeDir("0.5.0"))).toBe(false);
+    expect(installed(host)).toEqual([VERSION, "90.4.0"]);
+    expect(existsSync(host.layout.runtimeBinary("90.4.0"))).toBe(true);
+    expect(existsSync(host.layout.runtimeDir("90.5.0"))).toBe(false);
 
     host.sys.remove(marker);
     mkdirSync(marker);
@@ -792,9 +792,9 @@ describe("the runtime root is one host's", () => {
 
     // That host is gone: with the marker removed, the next install claims the root again.
     host.sys.remove(marker);
-    expect((await ops.gcRuntimes(host)).removed).toEqual([VERSION, "0.4.0"]);
+    expect((await ops.gcRuntimes(host)).removed).toEqual([VERSION, "90.4.0"]);
     expect(existsSync(marker)).toBe(false);
-    await withRuntime(host, "0.5.0");
+    await withRuntime(host, "90.5.0");
     noLeftovers(host);
   });
 });
