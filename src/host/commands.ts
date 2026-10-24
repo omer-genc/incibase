@@ -85,8 +85,8 @@ export const processIO: CommandIO = {
     // Registry.open creates a registry where there is none: a mistyped --root would become an empty host.
     const fresh = !existsSync(new HostLayout({ root: options.root }).registry);
     if (!create && fresh) throw notSetUp(options.root);
-    // A host init that another host's layout refuses (ops.checkMachineOwner) leaves no registry behind either.
-    if (fresh) ops.checkMachineOwner({ layout: new HostLayout({ root: options.root, ...options.layout }), sys: new LinuxSystem() });
+    // A host init its layout refuses (ops.checkInitLayout) leaves no registry behind either.
+    if (fresh) ops.checkInitLayout({ layout: new HostLayout({ root: options.root, ...options.layout }), sys: new LinuxSystem() });
     const ctx = openHost(options);
     if (!create && ctx.registry.savedLayout() === null) {
       ctx.registry.close();
@@ -399,14 +399,15 @@ function initNext(ctx: OpsContext): string[] {
   if (cli.ok) {
     return [`  check timer: ${off ? "off" : `every 30 s, runs ${link} (runtime ${cli.version})`}`, "Next: sudo incibase host add-admin <you>, then sudo incibase project create <slug>"];
   }
+  const state = cli.skipped && !cli.fix ? `waits for ${link} (host use-cli), skipping every run until then` : `${cli.skipped ? "skips every run of" : "runs"} ${link}, which ${cli.problem}`;
+  const timer = `  check timer: ${off ? "off" : state}`;
+  // The link's directory or the runtime's files: use-cli would only make the same link again.
+  if (cli.fix) return [timer, `Next: ${cli.fix}`];
   const me = ctx.self.join(" ");
   const binary = ctx.self.length === 1 ? ctx.self[0]! : "<incibase-linux-arch>";
   const steps = trustedRuntimes(ctx).includes(VERSION) ? [] : [`sudo ${me} host install-runtime ${binary} --version ${VERSION} --sums SHA256SUMS`];
   steps.push(`sudo ${me} host use-cli ${VERSION}${ctx.sys.lstat(link)?.type === "file" ? " --replace" : ""}`);
-  return [
-    `  check timer: ${off ? "off" : cli.skipped ? `waits for ${link} (host use-cli), skipping every run until then` : `runs ${link}, which ${cli.problem}`}`,
-    `Next: ${steps.join(", then ")}`,
-  ];
+  return [timer, `Next: ${steps.join(", then ")}`];
 }
 
 /** `host set <key> <value>`, checked: which setting, and its value. */

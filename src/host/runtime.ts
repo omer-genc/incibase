@@ -30,8 +30,9 @@ import { VERSION } from "../engine/version.ts";
 import { defaults, type OpsContext } from "./context.ts";
 import { checkRuntimeVersion, RUNTIME_VERSION_REGEX } from "./layout.ts";
 import { randomBytes } from "./names.ts";
-import { audited, gcTrash, OpError, parse } from "./ops.ts";
+import { audited, checkCliLinkPlace, foreignCliLink, gcTrash, OpError, parse, type ForeignPath } from "./ops.ts";
 import { currentActor, type RuntimeRow } from "./registry.ts";
+import { trustedRuntimes } from "./render.ts";
 import type { FileInfo, HostSystem } from "./system.ts";
 
 /** Where `v<version>/incibase-linux-<arch>` and `v<version>/SHA256SUMS` are published. */
@@ -501,7 +502,13 @@ const useCliSchema = z.strictObject({
   replace: z.boolean().default(false),
 });
 
-/** Points the CLI link (/usr/local/bin/incibase) at an installed runtime, atomically. */
+/**
+ * Points the CLI link (/usr/local/bin/incibase) at an installed runtime,
+ * atomically. Root runs what it leads to (the check timer every 30 s), so
+ * it refuses a runtime someone else can change (trustedRuntimes), a link
+ * directory someone else can change (checkCliLinkPlace), and a link that
+ * is another host's (foreignCliLink): it would move that host's check.
+ */
 export async function useCli(ctx: OpsContext, input: z.input<typeof useCliSchema>) {
   const data = parse(useCliSchema, input);
   return audited(ctx, "runtime.use_cli", null, () =>
@@ -511,6 +518,19 @@ export async function useCli(ctx: OpsContext, input: z.input<typeof useCliSchema
       const link = layout.cliLink;
       const target = layout.runtimeBinary(data.version);
       if (sys.lstat(dirname(link))?.type !== "dir") throw new OpError("NOT_FOUND", `${dirname(link)} does not exist`);
+      checkCliLinkPlace(ctx, false);
+      const foreign = foreignCliLink(ctx);
+      if (foreign.length) {
+        const [first] = foreign as [ForeignPath];
+        throw new OpError(
+          "CONFLICT",
+          `${link} is the CLI link of ${first.owner === null ? "another incibase host" : `the incibase host at ${first.owner}`} (${foreign.map((f) => (f.note ? `${f.path}: ${f.note}` : f.path)).join("; ")}): ` +
+            `moving it would move that host's check. Give this host a CLI link of its own`,
+        );
+      }
+      if (!trustedRuntimes(ctx).includes(data.version)) {
+        throw new OpError("CONFLICT", `The runtime ${data.version} (${target}) is not root's alone, and root runs what ${link} leads to: make it, its directory and ${layout.runtimeRoot} root's and writable by root alone`);
+      }
       const info = sys.lstat(link);
       const previous = info?.type === "symlink" ? sys.readlink(link) : null;
       if (info && info.type !== "symlink" && !(info.type === "file" && data.replace)) {

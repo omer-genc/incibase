@@ -5,6 +5,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { sha256Hex } from "../src/engine/manifest.ts";
+import { VERSION } from "../src/engine/version.ts";
 import { processIO } from "../src/host/commands.ts";
 import { FakeDriver } from "../src/host/fake-driver.ts";
 import { HostLayout, type LayoutOptions } from "../src/host/layout.ts";
@@ -561,6 +563,73 @@ describe("one machine, one host", () => {
     await ops.initHost(second, { domain: DOMAIN });
     expect(recordedRoot(readFileSync(second.layout.unitFile("incibase-s2-check.service"), "utf8"))).toBe(second.layout.root);
     expect(recordedRoot(readFileSync(host.layout.unitFile("incibase-check.service"), "utf8"))).toBe(host.layout.root);
+  });
+
+  test("a CLI link another host's check runs: init refuses it before that host's use-cli, use-cli refuses it after", async () => {
+    // Host A between host init and use-cli: its check unit names the link, which does not exist yet.
+    const host = await fakeOpsHost({ cli: false });
+    const own = (name: string) => ({
+      root: join(host.dir, name),
+      unitPrefix: `incibase-${name}`,
+      groups: { proxy: `incibase-${name}-proxy`, admin: `incibase-${name}-admin` },
+      runtimeRoot: join(host.dir, `runtime-${name}`),
+    });
+    const ownNginx = (name: string) => ({ ...host.nginx, confDir: join(host.dir, `conf-${name}`) });
+    const link = host.layout.cliLink;
+    const b = secondHost(host, own("b"), ownNginx("b"));
+    const before = machineState(host);
+    const err = await refusedInit(b);
+    expect(err.message).toStartWith(`This machine already has the incibase host at ${host.layout.root}: `);
+    expect(err.message).toEndWith(`remove these first: ${host.layout.unitFile("incibase-check.service")} (its check runs ${link})`);
+    expect(machineState(host)).toEqual(before);
+    // Its own link: side by side.
+    const c = secondHost(host, { ...own("c"), cliLink: join(host.dir, "bin", "incibase-c") }, ownNginx("c"));
+    await ops.initHost(c, { domain: DOMAIN });
+
+    // Once A's use-cli made the link, a host that shares it (here one whose units are elsewhere, so its init did not see A's) cannot move it.
+    await ops.useCli(host, { version: VERSION });
+    const d = secondHost(host, { ...own("d"), systemdDir: join(host.dir, "systemd-d") }, ownNginx("d"));
+    // The link into A's runtime root refuses its init too; past that (a link made after it), use-cli refuses.
+    expect((await refusedInit(d)).message).toEndWith(`remove these first: ${link} (a link into the runtime root ${host.layout.runtimeRoot})`);
+    host.sys.remove(link);
+    await ops.initHost(d, { domain: DOMAIN });
+    await ops.useCli(host, { version: VERSION });
+    const binary = join(host.dir, "incibase-bin");
+    await ops.installRuntime(d, { binary, version: VERSION, sha256: sha256Hex(readFileSync(binary)) });
+    await expect(ops.useCli(d, { version: VERSION })).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: `${link} is the CLI link of the incibase host at ${host.layout.root} (${link}: a link into the runtime root ${host.layout.runtimeRoot}): moving it would move that host's check. Give this host a CLI link of its own`,
+    });
+    expect(readlinkSync(link)).toBe(host.layout.runtimeBinary(VERSION));
+  });
+
+  test("host init refuses a CLI link where someone other than root can change it: the check timer runs it as root", async () => {
+    const host = await fakeOpsHost();
+    const own = (name: string, cliLink: string) =>
+      secondHost(
+        host,
+        { root: join(host.dir, name), unitPrefix: `incibase-${name}`, groups: { proxy: `incibase-${name}-p`, admin: `incibase-${name}-a` }, runtimeRoot: join(host.dir, `runtime-${name}`), cliLink },
+        { ...host.nginx, confDir: join(host.dir, `conf-${name}`) },
+      );
+    const users = join(host.dir, "users");
+    mkdirSync(users);
+    host.sys.own(users, 1000, 1000, 0o755);
+    const userLink = join(users, "incibase");
+    const err = await refusedInit(own("u", userLink));
+    expect(err.message).toBe(
+      `The CLI link ${userLink}, which the check timer runs as root, would be in ${users}, which someone other than root can change: ${users} belongs to uid 1000, not root. ` +
+        `Make ${users} root's and writable by root alone (chown root:root ${users}; chmod go-w ${users}), or give the host a CLI link in a directory only root can write`,
+    );
+    // Not there yet: fine where only root can create it, not in a directory anyone can write (sticky or not).
+    const shared = join(host.dir, "tmp");
+    mkdirSync(shared);
+    host.sys.own(shared, 0, 0, 0o1777);
+    expect((await refusedInit(own("t", join(shared, "bin", "incibase")))).message).toContain(`${join(shared, "bin")} does not exist, and someone other than root can create it in ${shared}`);
+    // Above the link's directory, a sticky one is fine: no one else can rename root's directory in it.
+    mkdirSync(join(shared, "bin"));
+    await ops.initHost(own("s", join(shared, "bin", "incibase")), { domain: DOMAIN });
+    await ops.initHost(own("m", join(host.dir, "opt", "bin", "incibase")), { domain: DOMAIN });
+    expect(existsSync(join(host.dir, "opt"))).toBe(false);
   });
 
   test("re-running host init on the same root writes nothing; host render keeps working; files without a record are its own", async () => {

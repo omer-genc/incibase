@@ -288,6 +288,17 @@ describe("host", () => {
     writeFileSync(link, "#!/bin/sh\n", { mode: 0o755 });
     expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
     expect(s.last().out).toContain(`  check timer: runs ${link}, which is a file, not a link to an installed runtime\nNext: sudo ${download} host use-cli ${VERSION} --replace`);
+    // What use-cli cannot put right (it would make the same link again): Next is the fix itself.
+    const binary = s.host.layout.runtimeBinary(VERSION);
+    s.host.sys.remove(link);
+    s.host.sys.symlink(binary, link);
+    s.host.sys.own(binary, 1000, 1000);
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toContain(
+      `  check timer: runs ${link}, which points at ${binary}, a runtime in ${s.host.layout.runtimeRoot} that someone other than root can change\n` +
+        `Next: make ${binary}, ${s.host.layout.runtimeDir(VERSION)} and ${s.host.layout.runtimeRoot} root's and writable by root alone`,
+    );
+    s.host.sys.own(binary, 0, 0);
     s.host.sys.remove(link);
     expect(await s.run("host", "init", "--domain", "incibase.example.net", "--no-check-timer")).toBe(0);
     expect(s.last().out).toContain(`  check timer: off\nNext: sudo ${download} host use-cli ${VERSION}`);

@@ -394,13 +394,14 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
   const link = layout.cliLink;
   const cli = cliLinkRuntime(ctx);
   if (cli.ok) add("cli link", "OK", `${link} runs the installed runtime ${cli.version}`);
-  else if (cli.skipped) {
+  else {
+    // What use-cli cannot put right (the link's directory, the runtime's files) has a fix of its own.
     const installed = hostRuntime(ctx, null)?.version;
-    const fix = installed ? `point it at an installed runtime (host use-cli ${installed})` : "install a runtime and point it there (host install-runtime, then host use-cli <version>)";
-    add("cli link", timerOff ? "WARN" : "FAIL", `${link} ${cli.problem}: ${fix}${timerOff ? "" : "; until then the check timer skips every run"}`);
-  } else {
     const replace = sys.lstat(link)?.type === "file" ? " --replace" : "";
-    add("cli link", "FAIL", `${link} ${cli.problem}, and root runs it (the check timer, sudo incibase): point it at an installed runtime (host use-cli <version>${replace})`);
+    const fix =
+      cli.fix ?? (installed ? `point it at an installed runtime (host use-cli ${installed}${replace})` : `install a runtime and point it there (host install-runtime, then host use-cli <version>${replace})`);
+    if (cli.skipped) add("cli link", timerOff ? "WARN" : "FAIL", `${link} ${cli.problem}: ${fix}${timerOff ? "" : "; until then the check timer skips every run"}`);
+    else add("cli link", "FAIL", `${link} ${cli.problem}, and root runs it (the check timer, sudo incibase): ${fix}`);
   }
   const unitFile = layout.unitFile(checkService);
   const rendered = sys.lstat(unitFile)?.type === "file" ? sys.readFile(unitFile) : null;

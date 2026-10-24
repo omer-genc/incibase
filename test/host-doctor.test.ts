@@ -326,20 +326,62 @@ describe("host doctor", () => {
     const file = await runDoctor(host);
     expect(verdicts(file)).toMatchObject({ "cli link": "FAIL", "check timer": "OK" });
     expect(detail(file, "cli link")).toBe(
-      `${link} is a file, not a link to an installed runtime, and root runs it (the check timer, sudo incibase): point it at an installed runtime (host use-cli <version> --replace)`,
+      `${link} is a file, not a link to an installed runtime, and root runs it (the check timer, sudo incibase): point it at an installed runtime (host use-cli ${VERSION} --replace)`,
     );
+    // What systemd's ConditionFileIsExecutable skips (stat(), every link followed): no executable regular file at the end.
+    const skips = async (what: string, problem: string) => {
+      const report = await runDoctor(host);
+      expect(verdicts(report), what).toMatchObject({ "cli link": "FAIL", "check timer": "FAIL" });
+      expect(detail(report, "check timer"), what).toBe(`every run of ${checkService} is skipped: ${link} ${problem} (see cli link)`);
+    };
+    chmodSync(link, 0o644);
+    await skips("a file no one can execute", "is a file no one can execute, not a link to an installed runtime");
+    host.sys.remove(link);
+    const inner = join(host.dir, "inner");
+    symlinkSync(join(host.dir, "gone"), inner);
+    symlinkSync(inner, link);
+    await skips("a link to a link to nothing", `points at ${inner}, which leads to ${join(host.dir, "gone")}, where there is nothing`);
+    host.sys.remove(link);
+    symlinkSync(host.layout.runtimeDir(VERSION), link);
+    await skips("a link to a directory", `points at ${host.layout.runtimeDir(VERSION)}, which is a dir`);
+    host.sys.remove(link);
+    const plain = join(host.dir, "plain");
+    writeFileSync(plain, "", { mode: 0o644 });
+    symlinkSync(plain, link);
+    await skips("a link to a file no one can execute", `points at ${plain}, which is a file no one can execute`);
     // A link to a file someone else may own: the binary install-runtime copied from.
     host.sys.remove(link);
     symlinkSync(join(host.dir, "incibase-bin"), link);
-    expect(detail(await runDoctor(host), "cli link")).toStartWith(`${link} points at ${join(host.dir, "incibase-bin")}, not at a runtime installed in ${host.layout.runtimeRoot} that only root can write, and root runs it`);
-    // An installed runtime someone else can write is no better; nor is a link others can replace.
+    expect(detail(await runDoctor(host), "cli link")).toBe(
+      `${link} points at ${join(host.dir, "incibase-bin")}, not at a runtime installed in ${host.layout.runtimeRoot} that only root can write, and root runs it (the check timer, sudo incibase): point it at an installed runtime (host use-cli ${VERSION})`,
+    );
+    // An installed runtime someone else can write is no better, and use-cli would only link it again: its files are the fix.
     await ops.useCli(host, { version: VERSION });
     host.sys.own(binary, 1000, 1000, 0o755);
-    expect(verdicts(await runDoctor(host))["cli link"]).toBe("FAIL");
+    const runtime = await runDoctor(host);
+    expect(verdicts(runtime)["cli link"]).toBe("FAIL");
+    expect(detail(runtime, "cli link")).toBe(
+      `${link} points at ${binary}, a runtime in ${host.layout.runtimeRoot} that someone other than root can change, and root runs it (the check timer, sudo incibase): ` +
+        `make ${binary}, ${host.layout.runtimeDir(VERSION)} and ${host.layout.runtimeRoot} root's and writable by root alone (chown root:root ${binary}; chmod go-w ${binary}, and the same for the two directories), ` +
+        "or point it at another installed runtime (host use-cli <version>)",
+    );
     host.sys.own(binary, 0, 0, 0o755);
-    host.sys.own(dirname(link), 1000, 1000);
-    expect(detail(await runDoctor(host), "cli link")).toStartWith(`${link} is in ${dirname(link)}, which someone other than root can write`);
-    host.sys.own(dirname(link), 0, 0);
+    // Nor is a link others can replace: its directory, or any directory above it, someone else can change.
+    const dir = dirname(link);
+    const dirFix = (path: string) => `make ${path} root's and writable by root alone (chown root:root ${path}; chmod go-w ${path}), or give the host a CLI link in a directory only root can write`;
+    host.sys.own(dir, 1000, 1000);
+    expect(detail(await runDoctor(host), "cli link")).toBe(
+      `${link} is in ${dir}, which someone other than root can change (${dir} belongs to uid 1000, not root), and root runs it (the check timer, sudo incibase): ${dirFix(dir)}`,
+    );
+    host.sys.own(dir, 0, 0, 0o775);
+    expect(detail(await runDoctor(host), "cli link")).toStartWith(`${link} is in ${dir}, which someone other than root can change (${dir} is writable by someone other than root), and root runs it`);
+    host.sys.own(dir, 0, 0, 0o755);
+    // A user's grandparent: they rename the parent away and put their own incibase in its place.
+    host.sys.own(host.dir, 1000, 1000);
+    expect(detail(await runDoctor(host), "cli link")).toBe(
+      `${link} is in ${dir}, which someone other than root can change (${host.dir} belongs to uid 1000, not root), and root runs it (the check timer, sudo incibase): ${dirFix(host.dir)}`,
+    );
+    host.sys.own(host.dir, 0, 0);
     expect(verdicts(await runDoctor(host))).toMatchObject({ "cli link": "OK", "check timer": "OK" });
   });
 

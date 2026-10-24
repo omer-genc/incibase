@@ -11,7 +11,7 @@
 // Long work (a release, a rollback, a runtime upgrade) runs in a transient
 // unit; the op follows its journal and returns its result from the registry.
 import { totalmem } from "node:os";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { VERSION } from "../engine/version.ts";
 import { newServiceKey } from "../engine/service-keys.ts";
@@ -34,7 +34,7 @@ import * as nginx from "./nginx.ts";
 import * as provision from "./provision.ts";
 import { currentActor, RegistryLockedError, type BranchRow, type Registry, type ReleaseRow, type ServiceKeyRow } from "./registry.ts";
 import { cleanupPreflight, followJob, gateBranch, newGeneration, recoverSwitchedBranch, stageRelease, startJob, type GateResult } from "./release.ts";
-import { branchUrl, recordedRoot, removeIfPresent } from "./render.ts";
+import { branchUrl, cliCondition, recordedRoot, removeIfPresent, rootOnlyDir } from "./render.ts";
 import { setSetting } from "./alerts.ts";
 import { check, ensureCheckTimer } from "./check.ts";
 import { doctor } from "./doctor.ts";
@@ -188,12 +188,13 @@ async function frontDoor<T>(fn: () => Promise<T>): Promise<T> {
  * The registry settings, host tree and units of `host init` (the parts this
  * layer owns), and the front door with TLS; safe to run again. Refused
  * before anything is written (a refusal's audit row included) when another
- * host has this layout's machine-wide files (checkMachineOwner).
+ * host has this layout's machine-wide files, or the CLI link would be where
+ * someone other than root can change it (checkInitLayout).
  */
 export async function initHost(ctx: OpsContext, input: z.input<typeof initSchema>) {
   const { tlsCert, tlsKey, trustProxy, httpsPort, ...settings } = parse(initSchema, input);
   if ((tlsCert === undefined) !== (tlsKey === undefined)) throw new OpError("INVALID", "tlsCert and tlsKey go together");
-  checkMachineOwner(ctx);
+  checkInitLayout(ctx);
   return audited(ctx, "host.init", null, async () => {
     const { checkTimer, ...init } = settings;
     const sliceMemoryMax = init.sliceMemoryMax ?? Math.max(512 * MiB, Math.floor((totalmem() - 1024 * MiB) / MiB) * MiB);
@@ -236,7 +237,8 @@ export interface ForeignPath {
  *   - the runtime root's marker (runtime.runtimeRootOwner) unless it names
  *     this root, as install-runtime and gc refuse it;
  *   - the CLI link when it points into another runtime root, unless that
- *     runtime root's marker names this root.
+ *     runtime root's marker names this root, or when another root's check
+ *     service runs it (foreignCliLink).
  */
 export function foreignPaths(ctx: MachineContext): ForeignPath[] {
   const { layout, sys } = ctx;
@@ -259,6 +261,21 @@ export function foreignPaths(ctx: MachineContext): ForeignPath[] {
   if (runtime && runtime.owner !== layout.root) {
     found.push({ path: runtime.marker, owner: runtime.owner, ...(runtime.owner === null ? { note: `a ${runtime.type} that names no host root` } : {}) });
   }
+  found.push(...foreignCliLink(ctx));
+  return found;
+}
+
+/**
+ * Whether the CLI link is another host's: it points into another runtime
+ * root, unless that root's marker names this root, or another prefix's
+ * check service, rendered for another root, runs it (cliCondition), which
+ * is so from that host's init on, before its use-cli makes the link. Two
+ * hosts' checks would run one link, and each one's use-cli would move the
+ * other's. host init and use-cli refuse it.
+ */
+export function foreignCliLink(ctx: MachineContext): ForeignPath[] {
+  const { layout, sys } = ctx;
+  const found: ForeignPath[] = [];
   if (sys.lstat(layout.cliLink)?.type === "symlink") {
     const target = resolve(dirname(layout.cliLink), sys.readlink(layout.cliLink) ?? "");
     const runtimeRoot = dirname(dirname(target));
@@ -267,7 +284,45 @@ export function foreignPaths(ctx: MachineContext): ForeignPath[] {
       if (owner !== layout.root) found.push({ path: layout.cliLink, owner, note: `a link into the runtime root ${runtimeRoot}` });
     }
   }
+  const own = layout.unitFile(layout.units.checkService);
+  const condition = cliCondition(layout);
+  for (const name of sys.lstat(layout.systemdDir)?.type === "dir" ? sys.readdir(layout.systemdDir) : []) {
+    const path = join(layout.systemdDir, name);
+    if (!name.endsWith("-check.service") || path === own) continue;
+    const info = sys.lstat(path);
+    if (info?.type !== "file" || info.size > MAX_RENDERED_BYTES) continue;
+    const text = sys.readFile(path) ?? "";
+    if (!text.split("\n").includes(condition)) continue;
+    const owner = recordedRoot(text);
+    if (owner !== layout.root) found.push({ path, owner, note: `its check runs ${layout.cliLink}` });
+  }
   return found;
+}
+
+/**
+ * What `host init` checks before it writes anything: no other host has this
+ * layout's machine-wide files (checkMachineOwner), and root alone controls
+ * where the CLI link goes (checkCliLinkPlace).
+ */
+export function checkInitLayout(ctx: MachineContext): void {
+  checkMachineOwner(ctx);
+  checkCliLinkPlace(ctx);
+}
+
+/**
+ * CONFLICT unless root alone controls the CLI link's directory, all the way
+ * from / (render.rootOnlyDir): the check service runs whatever is there as
+ * root every 30 s. Not there yet is fine while only root can create it.
+ */
+export function checkCliLinkPlace(ctx: Pick<MachineContext, "layout" | "sys">, missing = true): void {
+  const dir = dirname(ctx.layout.cliLink);
+  const bad = rootOnlyDir(ctx.sys, dir, missing);
+  if (!bad) return;
+  throw new OpError(
+    "CONFLICT",
+    `The CLI link ${ctx.layout.cliLink}, which the check timer runs as root, would be in ${dir}, which someone other than root can change: ${bad.path} ${bad.why}. ` +
+      `Make ${bad.path} root's and writable by root alone (chown root:root ${bad.path}; chmod go-w ${bad.path}), or give the host a CLI link in a directory only root can write`,
+  );
 }
 
 /**

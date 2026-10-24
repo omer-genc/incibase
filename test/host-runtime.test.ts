@@ -2,7 +2,7 @@
 // server stands in for GitHub), the CLI link, branch pins and gc.
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 // runtime.ts first: its import cycle with ops.ts must work from either side.
 import { MAX_RUNTIME_BYTES, parseSums, releasesBase, RUNTIME_OWNER_FILE, runtimeAsset, STALE_STAGED_MS, type RuntimeContext } from "../src/host/runtime.ts";
 import { sha256Hex } from "../src/engine/manifest.ts";
@@ -466,6 +466,40 @@ describe("the CLI link", () => {
     mkdirSync(link);
     await expect(ops.useCli(host, { version: "0.4.0", replace: true })).rejects.toMatchObject({ code: "CONFLICT" });
     await expect(ops.useCli(host, { version: "0.4.0; rm" })).rejects.toMatchObject({ code: "INVALID" });
+  });
+
+  test("refuses a link where someone other than root can change it, and a runtime that is not root's alone: root runs what it leads to", async () => {
+    const host = await hostWith();
+    const link = host.layout.cliLink;
+    const dir = dirname(link);
+    const refused = async (what: string, message: string) => {
+      const marks = host.sys.log.length;
+      await expect(ops.useCli(host, { version: VERSION }), what).rejects.toMatchObject({ code: "CONFLICT", message });
+      expect(host.sys.lstat(link), what).toBeNull();
+      expect(host.sys.log.slice(marks), what).toEqual([]);
+    };
+    const place = (path: string, why: string) =>
+      `The CLI link ${link}, which the check timer runs as root, would be in ${dir}, which someone other than root can change: ${path} ${why}. ` +
+      `Make ${path} root's and writable by root alone (chown root:root ${path}; chmod go-w ${path}), or give the host a CLI link in a directory only root can write`;
+    host.sys.own(dir, 1000, 1000);
+    await refused("a user's directory", place(dir, "belongs to uid 1000, not root"));
+    host.sys.own(dir, 0, 0, 0o775);
+    await refused("a group-writable directory", place(dir, "is writable by someone other than root"));
+    host.sys.own(dir, 0, 0, 0o755);
+    // An ancestor is enough: its owner renames the directory away and makes their own.
+    const above = dirname(dir);
+    host.sys.own(above, 1000, 1000);
+    await refused("a user's grandparent", place(above, "belongs to uid 1000, not root"));
+    host.sys.own(above, 0, 0);
+    // A runtime someone else can write.
+    const binary = host.layout.runtimeBinary(VERSION);
+    host.sys.own(binary, 1000, 1000, 0o755);
+    await refused(
+      "a runtime that is not root's",
+      `The runtime ${VERSION} (${binary}) is not root's alone, and root runs what ${link} leads to: make it, its directory and ${host.layout.runtimeRoot} root's and writable by root alone`,
+    );
+    host.sys.own(binary, 0, 0, 0o755);
+    expect(await ops.useCli(host, { version: VERSION })).toMatchObject({ target: binary });
   });
 
   test("the layout keeps it, and a default one is not saved", () => {
