@@ -29,7 +29,8 @@ const UID_BASE = Number(process.env.INCIBASE_TEST_UID_BASE ?? 72000);
 const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const REQUIRE_SANDBOX = process.env.INCIBASE_TEST_REQUIRE_SANDBOX === "1";
 const MARKER = ".incibase-test-root";
-const LABEL = basename(ROOT).slice(0, 24);
+// No hyphens: systemd puts a-b.slice under a.slice, so incibase-x.slice would count against the owner's incibase.slice.
+const LABEL = basename(ROOT).replace(/[^a-z0-9]/g, "").slice(0, 24);
 const APPS = `/tmp/${LABEL}-apps`;
 const BIN = `/usr/local/lib/${LABEL}-bin`;
 const LAYOUT = {
@@ -62,8 +63,8 @@ function cleanup() {
     .split("\n")
     .map((l) => l.trim().split(/\s+/)[0])
     .filter((u): u is string => !!u && u.startsWith(`${prefix}-`));
-  // The slice last: systemd keeps it active after its units are gone. (Its implicit parent, incibase.slice
-  // for a prefix like incibase-s10, may hold other hosts' slices and is left alone.)
+  // The slice last: systemd keeps it active after its units are gone. (The prefix has no hyphen, so the
+  // slice has no implicit parent to leave behind.)
   for (const unit of [...units, `${prefix}.slice`]) {
     run(["systemctl", "stop", unit], { ok: [0, 1, 5] });
     run(["systemctl", "reset-failed", unit], { ok: [0, 1, 5] });

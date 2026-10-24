@@ -26,7 +26,8 @@ const ROOT = process.env.INCIBASE_TEST_HOST_ROOT ?? "/var/lib/incibase-runtime-t
 const UID_BASE = Number(process.env.INCIBASE_TEST_UID_BASE ?? 79000);
 const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const MARKER = ".incibase-test-root";
-const LABEL = basename(ROOT).slice(0, 24);
+// No hyphens: systemd puts a-b.slice under a.slice, so incibase-x.slice would count against the owner's incibase.slice.
+const LABEL = basename(ROOT).replace(/[^a-z0-9]/g, "").slice(0, 24);
 const APPS = `/tmp/${LABEL}-apps`;
 const BIN = `/usr/local/lib/${LABEL}-bin`;
 const LAYOUT = {

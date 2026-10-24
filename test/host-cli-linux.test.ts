@@ -30,7 +30,8 @@ const PORT = Number(process.env.INCIBASE_TEST_HTTPS_PORT ?? 18543);
 const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const TUNNEL_DIR = process.env.INCIBASE_TEST_TUNNEL_DIR ?? "";
 const MARKER = ".incibase-test-root";
-const LABEL = basename(ROOT).slice(0, 24);
+// No hyphens: systemd puts a-b.slice under a.slice, so incibase-x.slice would count against the owner's incibase.slice.
+const LABEL = basename(ROOT).replace(/[^a-z0-9]/g, "").slice(0, 24);
 const LAYOUT = {
   unitPrefix: LABEL,
   groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` },

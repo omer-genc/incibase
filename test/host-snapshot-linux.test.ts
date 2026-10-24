@@ -74,7 +74,8 @@ const UID_BASE = Number(process.env.INCIBASE_TEST_UID_BASE ?? 84000);
 const BINARY = process.env.INCIBASE_TEST_BINARY ?? "";
 const MARKER = `incibase-secret-${process.pid}-${Date.now().toString(36)}`;
 const MARKER2 = `${MARKER}-other-branch`;
-const LABEL = basename(ROOT).slice(0, 24);
+// No hyphens: systemd puts a-b.slice under a.slice, so incibase-x.slice would count against the owner's incibase.slice.
+const LABEL = basename(ROOT).replace(/[^a-z0-9]/g, "").slice(0, 24);
 const LAYOUT = {
   unitPrefix: LABEL,
   groups: { proxy: `${LABEL}-proxy`, admin: `${LABEL}-admin` },

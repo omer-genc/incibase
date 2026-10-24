@@ -29,7 +29,8 @@ const enabled = process.env.INCIBASE_TEST_HOST === "1" && process.platform === "
 const ROOT = process.env.INCIBASE_TEST_HOST_ROOT ?? "/var/lib/incibase-test";
 const UID_BASE = Number(process.env.INCIBASE_TEST_UID_BASE ?? 71000);
 const MARKER = ".incibase-test-root";
-const label = basename(ROOT).slice(0, 24);
+// No hyphens: systemd puts a-b.slice under a.slice, so incibase-x.slice would count against the owner's incibase.slice.
+const label = basename(ROOT).replace(/[^a-z0-9]/g, "").slice(0, 24);
 const GROUPS = { proxy: `${label}-proxy`, admin: `${label}-admin` };
 /** No units or runtimes here (no driver), but a layout of its own all the same: never the machine's defaults. */
 const LAYOUT = { groups: GROUPS, unitPrefix: label, runtimeRoot: `/usr/local/lib/${label}`, cliLink: `/usr/local/lib/${label}-bin/incibase` };
