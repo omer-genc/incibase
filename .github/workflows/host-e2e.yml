@@ -12,6 +12,7 @@ on:
     paths:
       - "src/**"
       - "test/**"
+      - "scripts/**"
       - ".github/workflows/host-e2e.yml"
   workflow_dispatch: {}
 
@@ -70,6 +71,7 @@ jobs:
               test/host-nginx-linux.test.ts \
               test/host-runtime-linux.test.ts \
               test/host-isolation.test.ts \
+              test/binary-autoload.test.ts \
             2>&1 | tee artifacts/host-e2e.log
 
       - name: host doctor on this machine

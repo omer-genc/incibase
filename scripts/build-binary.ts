@@ -47,7 +47,9 @@ try {
     const outfile = join(root, "dist", target ? `incibase-${target.replace(/^bun-/, "")}` : "incibase");
     const result = await Bun.build({
       entrypoints: [join(root, "src", "cli.ts")],
-      compile: { outfile, ...(target ? { target: target as any } : {}) },
+      // Never read bunfig.toml (its preload runs code) or .env from the cwd: `sudo incibase …` keeps the cwd,
+      // often the login user's home, so either would let that user's files steer a root process.
+      compile: { outfile, autoloadBunfig: false, autoloadDotenv: false, ...(target ? { target: target as any } : {}) },
       minify: true,
     });
     if (!result.success) throw new AggregateError(result.logs, `compile failed for ${target ?? "host"}`);
