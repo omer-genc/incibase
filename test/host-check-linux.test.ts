@@ -1,5 +1,7 @@
 // `host check`, its timer and `host doctor` on a real Linux machine with
-// systemd, as root: the check's units load and run, a branch stopped with
+// systemd, as root: the check's units load, every run is skipped (not
+// failed) until the CLI link leads to an executable file while the timer
+// goes on firing, then they run the check through it, a branch stopped with
 // SIGSTOP is killed within 3 runs and restarted by systemd (with the alert
 // sent to a local webhook and resolved), and doctor's sandbox probe reports
 // what this machine applies. Skipped unless INCIBASE_TEST_HOST=1 on Linux as
@@ -9,7 +11,7 @@
 // groups, runtime root and CLI link named after the root (never the
 // machine's own /usr/local/bin/incibase), and removes all it created.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { DataDirLock } from "../src/engine/store.ts";
 import { VERSION } from "../src/engine/version.ts";
@@ -133,8 +135,6 @@ describe.skipIf(!enabled)("host check and doctor on systemd", () => {
     ctx.log = (line) => console.log(`  | ${line}`);
     await ops.initHost(ctx, { domain: "incibase.example.net", timezone: "Europe/Istanbul", uidBase: UID_BASE, sliceMemoryMax: 2 * 1024 ** 3, checkTimer: false });
     await ops.installRuntime(ctx, { binary: BINARY, version: VERSION, sha256: new Bun.CryptoHasher("sha256").update(readFileSync(BINARY)).digest("hex") });
-    // The check service runs the CLI link.
-    await ops.useCli(ctx, { version: VERSION });
     await ops.createProject(ctx, { slug: "shop", branches: ["dev"] });
     const { release } = await ops.addRelease(ctx, { project: "shop", branch: "dev", file: bundleExample() });
     expect(release.status).toBe("live");
@@ -156,28 +156,80 @@ describe.skipIf(!enabled)("host check and doctor on systemd", () => {
     if (enabled) cleanup();
   });
 
+  /** Properties of a unit as `systemctl show` prints them. */
+  const props = (unit: string, ...names: string[]) =>
+    Object.fromEntries(
+      run(["systemctl", "show", `--property=${names.join(",")}`, unit])
+        .stdout.trim()
+        .split("\n")
+        .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
+    );
+  /** Completed checks of shop/dev in the check service's journal after `cursor`. */
+  const checks = (cursor: string | null) =>
+    ctx.driver.journal({ unit: ctx.layout.units.checkService, ...(cursor ? { afterCursor: cursor } : {}) }).filter((e) => /^ok +shop\/dev: healthy$/.test(e.message)).length;
+  const verdict = async (name: string) => {
+    const quick = { ...ctx, doctor: { sandboxProbe: async () => ({ ran: false as const, reason: "not needed here" }) } };
+    return (await runDoctor(quick)).checks.find((c) => c.name === name)!;
+  };
+
+  test("until the CLI link leads to an executable file, systemd skips every run of the check instead of failing it, and the timer goes on firing", async () => {
+    const { checkService, checkTimer } = ctx.layout.units;
+    const link = ctx.layout.cliLink;
+    // The service runs the link's own path, never the command that ran host init (here bun with src/cli.ts).
+    const unit = readFileSync(ctx.layout.unitFile(checkService), "utf8");
+    expect(unit).toContain(`\nExecStart=${link} host check --root ${ROOT}\n`);
+    expect(unit).not.toContain(process.execPath);
+    // Earlier runs of this test used the same unit name: only lines from here on count.
+    const cursor = ctx.driver.journalCursor();
+    const skipped = { ConditionResult: "no", ActiveState: "inactive", Result: "success" };
+    // No link yet (host init ran from a download), then a link to nothing: path conditions follow links.
+    expect(existsSync(link)).toBe(false);
+    for (const make of [() => {}, () => symlinkSync(join(APPS, "gone"), link)]) {
+      make();
+      run(["systemctl", "start", checkService]);
+      expect(props(checkService, "ConditionResult", "ActiveState", "Result")).toEqual(skipped);
+    }
+    // The timer's runs are skipped alike, and it fires again after each: once OnActiveSec=10s has fired, only
+    // OnUnitActiveSec=30s (counted from the last trigger) can keep it waiting.
+    await ops.initHost(ctx, { domain: "incibase.example.net", checkTimer: true });
+    const started = Number(props(checkTimer, "ActiveEnterTimestampMonotonic").ActiveEnterTimestampMonotonic);
+    const lastRun = () => Number(props(checkService, "ConditionTimestampMonotonic").ConditionTimestampMonotonic);
+    await waitFor("the timer's run 10 s after it started", () => lastRun() >= started + 9_000_000, 30_000);
+    expect(props(checkService, "ConditionResult", "ActiveState", "Result")).toEqual(skipped);
+    expect(props(checkTimer, "ActiveState", "SubState")).toEqual({ ActiveState: "active", SubState: "waiting" });
+    // Nothing failed and nothing was checked: doctor says so.
+    expect(await verdict("check timer")).toMatchObject({ status: "FAIL", detail: `every run of ${checkService} is skipped: ${link} points at ${join(APPS, "gone")}, which does not exist (see cli link)` });
+    expect(await verdict("cli link")).toMatchObject({ status: "FAIL" });
+    expect(checks(cursor)).toBe(0);
+    // host use-cli: the timer's next run checks, with nothing rendered again.
+    rmSync(link);
+    await ops.useCli(ctx, { version: VERSION });
+    expect(readFileSync(ctx.layout.unitFile(checkService), "utf8")).toBe(unit);
+    await waitFor("the timer to run the check", () => checks(cursor) >= 1, 45_000);
+    await waitFor("that run to end", () => props(checkService, "ActiveState").ActiveState === "inactive");
+    expect(props(checkService, "ConditionResult", "Result")).toEqual({ ConditionResult: "yes", Result: "success" });
+    expect(await verdict("cli link")).toMatchObject({ status: "OK", detail: `${link} runs the installed runtime ${VERSION}` });
+    await ops.initHost(ctx, { domain: "incibase.example.net", checkTimer: false });
+    expect(ctx.driver.isActive(checkTimer)).toBe(false);
+  }, SLOW);
+
   test("the check's service and timer load, the service runs a check as root through the CLI link, and the timer fires it", async () => {
     const { checkService, checkTimer } = ctx.layout.units;
-    // The link's own path, never the command that ran host init (here bun with src/cli.ts).
-    expect(readFileSync(ctx.layout.unitFile(checkService), "utf8")).toContain(`\nExecStart=${ctx.layout.cliLink} host check --root ${ROOT}\n`);
     expect(verifyUnit(checkService)).toEqual({ code: 0, ours: [] });
     expect(verifyUnit(checkTimer)).toEqual({ code: 0, ours: [] });
-    // Earlier runs of this test used the same unit name: only lines from here on count.
     const cursor = ctx.driver.journalCursor();
     run(["systemctl", "start", checkService]);
     // A finished oneshot shows Result=success but no exec status or invocation any more (systemd 255).
     expect(ctx.driver.show(checkService)).toMatchObject({ result: "success", activeState: "inactive" });
-    const checks = () => ctx.driver.journal({ unit: checkService, ...(cursor ? { afterCursor: cursor } : {}) }).filter((e) => /^ok +shop\/dev: healthy$/.test(e.message)).length;
-    expect(checks()).toBe(1);
+    expect(checks(cursor)).toBe(1);
 
     await ops.initHost(ctx, { domain: "incibase.example.net", checkTimer: true });
     expect(ctx.driver.isActive(checkTimer)).toBe(true);
     expect(existsSync(ctx.layout.timerWantsLink().path)).toBe(true);
     // OnActiveSec=10s: the timer runs the service by itself.
-    await waitFor("the timer to run the check", () => checks() >= 2, 45_000);
+    await waitFor("the timer to run the check", () => checks(cursor) >= 2, 45_000);
     expect(ctx.driver.show(checkService).result).toBe("success");
-    const quick = { ...ctx, doctor: { sandboxProbe: async () => ({ ran: false as const, reason: "not needed here" }) } };
-    const timerVerdict = async () => (await runDoctor(quick)).checks.find((c) => c.name === "check timer")!;
+    const timerVerdict = () => verdict("check timer");
     expect(await timerVerdict()).toMatchObject({ status: "OK", detail: expect.stringContaining("the last one completed") });
     // A run that fails (here: ExecStart replaced by /bin/false) leaves the timer active and the service failed: doctor FAILs.
     const dropIn = join(LAYOUT.systemdDir, `${checkService}.d`);

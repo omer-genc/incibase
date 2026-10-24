@@ -5,6 +5,7 @@
 // write a file atomically (temp file, fsync, rename, via HostSystem) and only
 // when its content, owner or mode differ, and say whether a unit file changed,
 // so the caller runs `systemctl daemon-reload` once, and only then.
+import { dirname, resolve } from "node:path";
 import { VERSION } from "../engine/version.ts";
 import type { BranchConfig, ResolvedLimits } from "./config.ts";
 import { authConcurrency, drainMs, durationText, parseConfig, parseLimits, resolveLimits, stopTimeoutSec, systemdSize, timeoutsFlag } from "./config.ts";
@@ -367,6 +368,31 @@ export function hostRuntime(ctx: HostContext, pinned: string | null): HostRuntim
   return version ? { version, binary: ctx.layout.runtimeBinary(version) } : null;
 }
 
+/** What the CLI link runs: a trusted installed runtime, or why not (`skipped`: nothing runs there, so the check service skips its runs). */
+export type CliLinkRuntime = { ok: true; version: string } | { ok: false; skipped: boolean; problem: string };
+
+/**
+ * What root runs when it runs the CLI link (the check service every 30 s,
+ * `sudo incibase`): fine only when the link is a symlink, in a directory
+ * only root can write, straight to the binary of a trusted runtime
+ * (trustedRuntimes). `problem` completes "<link> …".
+ */
+export function cliLinkRuntime(ctx: HostContext): CliLinkRuntime {
+  const { sys, layout } = ctx;
+  const link = layout.cliLink;
+  const info = sys.lstat(link);
+  if (!info) return { ok: false, skipped: true, problem: "does not exist" };
+  // A file there runs; anything else is no regular file, and the check service skips it.
+  if (info.type !== "symlink") return { ok: false, skipped: info.type !== "file", problem: `is a ${info.type}, not a link to an installed runtime` };
+  const target = resolve(dirname(link), sys.readlink(link) ?? "");
+  if (!sys.lstat(target)) return { ok: false, skipped: true, problem: `points at ${target}, which does not exist` };
+  const version = trustedRuntimes(ctx).find((v) => layout.runtimeBinary(v) === target);
+  if (version === undefined) return { ok: false, skipped: false, problem: `points at ${target}, not at a runtime installed in ${layout.runtimeRoot} that only root can write` };
+  const dir = sys.lstat(dirname(link));
+  if (dir?.type !== "dir" || dir.uid !== 0 || (dir.mode & 0o022) !== 0) return { ok: false, skipped: false, problem: `is in ${dirname(link)}, which someone other than root can write` };
+  return { ok: true, version };
+}
+
 /** `incibase-snapshot@<id>.service.d/10-incibase.conf`: the branch's user and limits, `_snapshot` of the runtime hostRuntime picked. */
 export function snapshotDropIn(layout: HostLayout, branch: BranchRow, runtimeBinary: string): string {
   const limits = resolveLimits(parseLimits(branch.limits_json));
@@ -446,7 +472,8 @@ export function renderHostUnits(ctx: HostContext): boolean {
  * the link's runtime). Until the link points at an executable file, systemd
  * skips each run instead of failing it: path conditions follow symlinks, so
  * a missing link and one to nothing are both unmet; the service stays
- * inactive and the timer goes on firing (systemd 255).
+ * inactive and the timer goes on firing (systemd 255). `host doctor` says
+ * so (cliLinkRuntime).
  */
 export function checkServiceUnit(layout: HostLayout): string {
   const cli = word(layout.cliLink);

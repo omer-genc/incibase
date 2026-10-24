@@ -11,10 +11,14 @@
 // The check timer is judged by what its runs leave behind (the check cannot
 // alert about itself): a failed check service, or no completed run for two
 // minutes, is a FAIL; so are alerts waiting more than 5 minutes to reach the
-// webhook. The journal's effective Storage= comes from journald.conf and its
-// drop-ins. The probe is incibase's own script run by an
-// installed runtime (BUN_BE_BUN=1 makes the standalone binary act as bun);
-// root runs no tenant code.
+// webhook. So is a check unit other than the one this incibase renders, and
+// a missing CLI link (what the check service runs): systemd then skips every
+// run, and a skipped run is no failure. A CLI link that leads anywhere but a
+// trusted installed runtime FAILs on its own line, as root runs it. The
+// journal's effective Storage= comes from journald.conf and its drop-ins.
+// The probe is incibase's own script run by an installed runtime
+// (BUN_BE_BUN=1 makes the standalone binary act as bun); root runs no tenant
+// code.
 //
 // Everything outside the host's own files goes through DoctorHooks, so the
 // macOS tests feed it the machine they want.
@@ -26,7 +30,7 @@ import { printable } from "./driver.ts";
 import { branchRef } from "./names.ts";
 import { OpError } from "./ops.ts";
 import { verifyBranch, verifyHostTree } from "./provision.ts";
-import { hostRuntime } from "./render.ts";
+import { checkServiceUnit, cliLinkRuntime, hostRuntime } from "./render.ts";
 import { checkUnitName } from "./systemd.ts";
 import type { FileInfo } from "./system.ts";
 
@@ -381,14 +385,35 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
     add("disk", "WARN", `cannot read the free space: ${printable((err as Error).message, 200)}`);
   }
 
-  // the check and its alerts
+  // the CLI link (what the check service runs), the check and its alerts
   const at = (ctx.now ?? Date.now)();
   const checkState = readCheckState(ctx);
   const { checkService, checkTimer } = layout.units;
   const ago = (t: number) => `${Math.max(0, Math.round((at - t) / 1000))} s ago`;
-  if (registry.getSetting("check_timer") === "off") add("check timer", "WARN", "turned off (check_timer = off): nothing kills a stalled branch or raises alerts");
+  const timerOff = registry.getSetting("check_timer") === "off";
+  const link = layout.cliLink;
+  const cli = cliLinkRuntime(ctx);
+  if (cli.ok) add("cli link", "OK", `${link} runs the installed runtime ${cli.version}`);
+  else if (cli.skipped) {
+    const installed = hostRuntime(ctx, null)?.version;
+    const fix = installed ? `point it at an installed runtime (host use-cli ${installed})` : "install a runtime and point it there (host install-runtime, then host use-cli <version>)";
+    add("cli link", timerOff ? "WARN" : "FAIL", `${link} ${cli.problem}: ${fix}${timerOff ? "" : "; until then the check timer skips every run"}`);
+  } else {
+    const replace = sys.lstat(link)?.type === "file" ? " --replace" : "";
+    add("cli link", "FAIL", `${link} ${cli.problem}, and root runs it (the check timer, sudo incibase): point it at an installed runtime (host use-cli <version>${replace})`);
+  }
+  const unitFile = layout.unitFile(checkService);
+  const rendered = sys.lstat(unitFile)?.type === "file" ? sys.readFile(unitFile) : null;
+  if (timerOff) add("check timer", "WARN", "turned off (check_timer = off): nothing kills a stalled branch or raises alerts");
   else if (!ctx.driver.isActive(checkTimer)) add("check timer", "WARN", `${checkTimer} is not running (incibase host render starts it)`);
-  else {
+  else if (rendered !== checkServiceUnit(layout)) {
+    // One an older incibase rendered ran the binary host init ran from, often a download its owner can replace.
+    const exec = rendered === null ? null : /^ExecStart=(.*)$/m.exec(rendered)?.[1];
+    add("check timer", "FAIL", `${unitFile} ${rendered === null ? "is missing" : `is not what this incibase renders${exec ? ` (it runs ${printable(exec, 200)})` : ""}`}: incibase host render writes it`);
+  } else if (!cli.ok && cli.skipped) {
+    // systemd skips the run (ConditionFileIsExecutable): the service stays inactive, never failed, and no check completes.
+    add("check timer", "FAIL", `every run of ${checkService} is skipped: ${link} ${cli.problem} (see cli link)`);
+  } else {
     const service = ctx.driver.show(checkService);
     const last = checkState.lastRunAt;
     if (service.activeState === "failed") {
