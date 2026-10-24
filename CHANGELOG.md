@@ -1,6 +1,8 @@
 # Değişiklikler
 
-## 0.4.0
+## 0.4.1
+
+`v0.4.0` tag'i yayınlanmadı: sürüm 0.4.0 olunca testlerin örnek runtime sürümleri kurulu sürümle çakıştı ve release workflow'u npm'e yayından önce durdu. 0.4.1 aynı içeriği ve testlerin düzeltmesini taşır.
 
 M1 Faz B: tek sunucuda birden fazla proje ve branch barındıran host katmanı. Tasarım: [docs/m1-mimari.md](docs/m1-mimari.md), kurulum ve işletim rehberi: [docs/host.md](docs/host.md). Tek uygulama `serve`/`dev` değişmedi.
 

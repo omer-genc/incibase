@@ -4,7 +4,7 @@ Temiz bir Ubuntu 24.04 VPS'ten çalışan bir `prod` ve `dev` branch'ine kadar k
 
 Örneklerde laptoptan sunucuya `ssh vps` ile bağlanılır (`~/.ssh/config`'te bir alias), sunucudaki giriş hesabı `omer`, proje `shop`.
 
-> Host katmanı (`host`, `project`, `branch`, `release`, `env`, `service-key`, `status`, `logs`, `tunnel` komutları) 0.4.0 ile gelir ([CHANGELOG](../CHANGELOG.md)); 0.3.1 ve öncesinin binary'lerinde bu komutlar yok. Aşağıda `V=0.4.0` gördüğün yere [yayınlanan](https://github.com/omer-genc/incibase/releases) en yeni sürümü yazabilirsin.
+> Host katmanı (`host`, `project`, `branch`, `release`, `env`, `service-key`, `status`, `logs`, `tunnel` komutları) 0.4.1 ile gelir ([CHANGELOG](../CHANGELOG.md)); 0.3.1 ve öncesinin binary'lerinde bu komutlar yok. Aşağıda `V=0.4.1` gördüğün yere [yayınlanan](https://github.com/omer-genc/incibase/releases) en yeni sürümü yazabilirsin.
 
 ## Ne elde edersin
 
@@ -117,7 +117,7 @@ Sıra: binary'yi GitHub release'inden indir ve `SHA256SUMS` ile doğrula, onunla
 ### 1. İndirmek ve doğrulamak
 
 ```bash
-V=0.4.0                                    # ya da daha yeni bir sürüm (yukarıdaki not)
+V=0.4.1                                    # ya da daha yeni bir sürüm (yukarıdaki not)
 ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')
 cd ~
 curl -fsSLO https://github.com/omer-genc/incibase/releases/download/v$V/incibase-linux-$ARCH
@@ -144,7 +144,7 @@ sudo ./incibase-linux-$ARCH host init \
   units incibase-*, groups incibase-admin and incibase-proxy
   front door: certificate installed, nginx restart
   check timer: waits for /usr/local/bin/incibase (host use-cli), skipping every run until then
-Next: sudo /home/omer/incibase-linux-x64 host install-runtime /home/omer/incibase-linux-x64 --version 0.4.0 --sums SHA256SUMS, then sudo /home/omer/incibase-linux-x64 host use-cli 0.4.0
+Next: sudo /home/omer/incibase-linux-x64 host install-runtime /home/omer/incibase-linux-x64 --version 0.4.1 --sums SHA256SUMS, then sudo /home/omer/incibase-linux-x64 host use-cli 0.4.1
 ```
 
 Ne yapar: registry (`/var/lib/incibase/control/registry.db`), `incibase-proxy` (www-data üyesi) ve `incibase-admin` grupları, `incibase.slice`, branch/preflight/snapshot unit şablonları, `incibase-check.timer`, nginx config'i (`/etc/nginx/conf.d/incibase.conf`) ve nginx drop-in'i (`OOMScoreAdjust=-900`). Tekrar çalıştırmak güvenlidir.
@@ -440,7 +440,7 @@ sudo incibase project delete shop
 ## incibase'i yükseltmek
 
 ```bash
-V=0.4.1                                     # geçmek istediğin yeni sürüm
+V=0.4.2                                     # geçmek istediğin yeni sürüm
 sudo incibase host install-runtime --version $V     # GitHub'dan indirir, SHA256SUMS ile doğrular
 sudo incibase host use-cli $V                       # /usr/local/bin/incibase artık $V
 sudo incibase host render                           # unit'ler ve nginx config'i yeni sürümle yeniden yazılır
