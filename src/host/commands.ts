@@ -28,7 +28,7 @@ import * as ops from "./ops.ts";
 import { OpError } from "./ops.ts";
 import type { AlertRow, BranchRow, ReleaseRow } from "./registry.ts";
 import { MAX_BUNDLE_BYTES, type GateResult } from "./release.ts";
-import { cliLinkRuntime, runtimeFilesFix, trustedRuntimes, untrustedRuntime } from "./render.ts";
+import { cliLinkRuntime, runtimeRootPlaceFix, trustedRuntimes } from "./render.ts";
 import { LinuxSystem } from "./system.ts";
 
 /** A command line that cannot mean anything: exit 2 with the command's usage. */
@@ -411,9 +411,11 @@ function initNext(ctx: OpsContext, root: string): string[] {
   const me = ctx.self.join(" ");
   const binary = ctx.self.length === 1 ? ctx.self[0]! : "<incibase-linux-arch>";
   const steps = cli.createDir ? [`sudo install -d -m 0755 ${cli.createDir}`] : [];
-  // Installed but not root's alone: install-runtime of the same bytes leaves it as it is, and use-cli refuses it.
-  if (untrustedRuntime(ctx, VERSION)) steps.push(runtimeFilesFix(ctx.layout, VERSION));
-  else if (!trustedRuntimes(ctx).includes(VERSION)) steps.push(`sudo ${me} host install-runtime ${binary} --version ${VERSION} --sums SHA256SUMS${rootFlag(root)}`);
+  // No runtime is trusted while the way to the runtime root is not root's alone.
+  const place = runtimeRootPlaceFix(ctx.sys, ctx.layout);
+  if (place) steps.push(place);
+  // Not installed, or installed but not root's alone: install-runtime installs it, or makes its files root's alone again.
+  if (!trustedRuntimes(ctx).includes(VERSION)) steps.push(`sudo ${me} host install-runtime ${binary} --version ${VERSION} --sums SHA256SUMS${rootFlag(root)}`);
   steps.push(`sudo ${me} host use-cli ${VERSION}${ctx.sys.lstat(link)?.type === "file" ? " --replace" : ""}${rootFlag(root)}`);
   return [timer, `Next: ${steps.join(", then ")}`];
 }
@@ -679,7 +681,7 @@ const SPECS: Spec[] = [
         ...(values.sha256 === undefined ? {} : { sha256: str(values, "sha256") }),
         skipVersionCheck: bool(values, "skip-version-check"),
       });
-      return { json: r, text: [`${r.installed ? "Installed" : "Already installed:"} runtime ${r.version} at ${r.path} (sha256 ${r.sha256.slice(0, 16)}...)`] };
+      return { json: r, text: [`${r.installed ? "Installed" : r.repaired ? "Already installed, its files made root's alone again:" : "Already installed:"} runtime ${r.version} at ${r.path} (sha256 ${r.sha256.slice(0, 16)}...)`] };
     },
   },
   {

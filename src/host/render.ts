@@ -366,15 +366,31 @@ ${limitLines(limits, config)}
  */
 export function trustedRuntimes(ctx: HostContext): string[] {
   const { sys, layout } = ctx;
-  const rootOnly = (path: string, type: "dir" | "file", mustAllow = 0) => {
-    const info = sys.lstat(path);
-    return info?.type === type && info.uid === 0 && (info.mode & 0o022) === 0 && (info.mode & mustAllow) === mustAllow;
-  };
-  if (!rootOnly(layout.runtimeRoot, "dir") || rootOnlyDir(sys, dirname(layout.runtimeRoot))) return [];
+  if (!rootOnlyPath(sys, layout.runtimeRoot, "dir") || rootOnlyDir(sys, dirname(layout.runtimeRoot))) return [];
   return sys
     .readdir(layout.runtimeRoot)
-    .filter((v) => RUNTIME_VERSION_REGEX.test(v) && rootOnly(layout.runtimeDir(v), "dir") && rootOnly(layout.runtimeBinary(v), "file", 0o005))
+    .filter((v) => RUNTIME_VERSION_REGEX.test(v) && runtimeFilesRootOnly(sys, layout, v))
     .sort(Bun.semver.order);
+}
+
+/** `path` (lstat, so never a symlink) is a `type` of root's that no one else can write, with the `mustAllow` mode bits. */
+function rootOnlyPath(sys: HostSystem, path: string, type: "dir" | "file", mustAllow = 0): boolean {
+  const info = sys.lstat(path);
+  return info?.type === type && info.uid === 0 && (info.mode & 0o022) === 0 && (info.mode & mustAllow) === mustAllow;
+}
+
+/**
+ * The files of the runtime `version` as trustedRuntimes needs them, what is
+ * above the runtime root aside: its binary, version directory and the
+ * runtime root itself root's and writable by root alone, the binary
+ * world-executable. What install-runtime puts back (installRuntime).
+ */
+export function runtimeFilesRootOnly(sys: HostSystem, layout: HostLayout, version: string): boolean {
+  return (
+    rootOnlyPath(sys, layout.runtimeRoot, "dir") &&
+    rootOnlyPath(sys, layout.runtimeDir(version), "dir") &&
+    rootOnlyPath(sys, layout.runtimeBinary(version), "file", 0o005)
+  );
 }
 
 export interface HostRuntime {
@@ -501,16 +517,39 @@ export function cliLinkPlaceFix(sys: HostSystem, bad: NotRootOnly): string {
   return info?.type === "dir" && (info.mode & 0o1000) === 0 ? `make ${bad.path} root's and writable by root alone (${rootOnlyFix(bad.path)}), or ${elsewhere}` : elsewhere;
 }
 
-/** What makes the installed runtime `version` root's alone (trustedRuntimes), as use-cli needs. */
-export function runtimeFilesFix(layout: HostLayout, version: string): string {
-  const target = layout.runtimeBinary(version);
-  return `make ${target}, ${dirname(target)} and ${layout.runtimeRoot} root's and writable by root alone (${rootOnlyFix(target)}, and the same for the two directories)`;
+/**
+ * What puts right a part of the way to the runtime root that root does not
+ * control alone, as cliLinkPlaceFix does for the CLI link; null when there
+ * is none. No runtime is trusted until then, whatever its own files are.
+ */
+export function runtimeRootPlaceFix(sys: HostSystem, layout: HostLayout): string | null {
+  // Not there yet is fine when only root can create it: install-runtime does.
+  const bad = rootOnlyDir(sys, dirname(layout.runtimeRoot), true);
+  if (!bad) return null;
+  const elsewhere = "give the host a runtime root in a directory only root can write";
+  const info = sys.lstat(bad.path);
+  return info?.type === "dir" && (info.mode & 0o1000) === 0
+    ? `make ${bad.path}, on the way to ${layout.runtimeRoot}, root's and writable by root alone (${rootOnlyFix(bad.path)}), or ${elsewhere}`
+    : `${elsewhere} (${bad.path}, on the way to ${layout.runtimeRoot}, ${bad.why})`;
+}
+
+/**
+ * What makes the installed runtime `version` trusted (trustedRuntimes), as
+ * use-cli needs: the way to the runtime root (runtimeRootPlaceFix), then
+ * install-runtime of it again, which makes its files root's alone once a
+ * root-only copy of their bytes is the recorded ones, and puts those back
+ * otherwise. Never chown by hand: whoever could write the binary may have
+ * changed it, and chown would make their bytes root's.
+ */
+export function runtimeFix(sys: HostSystem, layout: HostLayout, version: string): string {
+  const steps = [runtimeRootPlaceFix(sys, layout)];
+  if (!runtimeFilesRootOnly(sys, layout, version)) steps.push(`install it again (host install-runtime --version ${version}), which makes its files root's alone`);
+  return steps.filter((s) => s !== null).join(", then ");
 }
 
 /**
  * Whether the runtime `version` is installed (recorded, its binary there)
- * but not root's alone: use-cli refuses it, and install-runtime of the same
- * bytes leaves its files as they are, so runtimeFilesFix is what to do.
+ * but not trusted: use-cli refuses it, so runtimeFix is what to do.
  */
 export function untrustedRuntime(ctx: HostContext, version: string): boolean {
   const { sys, layout, registry } = ctx;
@@ -556,7 +595,7 @@ export function cliLinkRuntime(ctx: HostContext): CliLinkRuntime {
     ok: false,
     skipped,
     problem: `points at ${target}, a runtime in ${layout.runtimeRoot} that someone other than root can change`,
-    fix: `${runtimeFilesFix(layout, basename(dirname(target)))}, or point it at another installed runtime (host use-cli <version>)`,
+    fix: `${runtimeFix(sys, layout, basename(dirname(target)))}, or point it at another installed runtime (host use-cli <version>)`,
   };
 }
 

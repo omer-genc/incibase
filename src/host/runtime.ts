@@ -32,7 +32,7 @@ import { checkRuntimeVersion, RUNTIME_VERSION_REGEX } from "./layout.ts";
 import { randomBytes } from "./names.ts";
 import { audited, checkCliLinkPlace, foreignCliLink, gcTrash, OpError, parse, type ForeignPath } from "./ops.ts";
 import { currentActor, type RuntimeRow } from "./registry.ts";
-import { trustedRuntimes } from "./render.ts";
+import { runtimeFilesRootOnly, runtimeFix, trustedRuntimes } from "./render.ts";
 import type { FileInfo, HostSystem } from "./system.ts";
 
 /** Where `v<version>/incibase-linux-<arch>` and `v<version>/SHA256SUMS` are published. */
@@ -261,6 +261,8 @@ export interface InstallResult {
   sha256: string;
   /** False when these bytes were installed already. */
   installed: boolean;
+  /** Installed already, but its files were not root's alone: a root-only copy of them, found to be the recorded bytes, took their place. */
+  repaired?: boolean;
   source: string;
 }
 
@@ -375,11 +377,19 @@ export async function installRuntime(ctx: RuntimeContext, input: z.input<typeof 
     const existing = registry.getRuntime(data.version);
     if (existing) {
       if (expected !== null && expected !== existing.sha256) throw conflict(data.version, existing.sha256, expected);
-      if (sys.lstat(path)?.type === "file" && (await sha256File(path)).sha256 === existing.sha256) {
+      const present = sys.lstat(path)?.type === "file";
+      if (present && runtimeFilesRootOnly(sys, layout, data.version) && (await sha256File(path)).sha256 === existing.sha256) {
         await registry.withLock(() =>
           registry.audit({ actor: actor(ctx), action: "runtime.install", detail: { version: data.version, sha256: existing.sha256, unchanged: true }, ok: true }, now(ctx)),
         );
         return { version: data.version, path, sha256: existing.sha256, installed: false, source: existing.source };
+      }
+      // Its files are not root's alone, so whoever could write them may have changed the bytes: keep them only as a root-only copy found to be the recorded ones.
+      if (present && (await reclaimRuntime(ctx, existing))) {
+        await registry.withLock(() =>
+          registry.audit({ actor: actor(ctx), action: "runtime.install", detail: { version: data.version, sha256: existing.sha256, repaired: true }, ok: true }, now(ctx)),
+        );
+        return { version: data.version, path, sha256: existing.sha256, installed: false, repaired: true, source: existing.source };
       }
       // Its file is missing or damaged: put the recorded bytes back.
       expected ??= existing.sha256;
@@ -461,6 +471,41 @@ export async function installRuntime(ctx: RuntimeContext, input: z.input<typeof 
   });
 }
 
+/**
+ * Makes the installed runtime `version` root's alone again without
+ * trusting the bytes in place: its directories root's 0755 first (no one
+ * else can rename what is in them after that), then a root-only copy of the
+ * binary, hashed, takes its place when it is the recorded bytes. Hashing
+ * and chowning the file in place would not do: whoever owned it may hold
+ * it open for writing past the chown. False, with nothing but the
+ * directories changed, when the bytes are not the recorded ones.
+ */
+async function reclaimRuntime(ctx: OpsContext, row: RuntimeRow): Promise<boolean> {
+  const { sys, layout } = ctx;
+  const { version, sha256 } = row;
+  const dir = layout.runtimeDir(version);
+  checkRuntimeOwner(ctx, true);
+  for (const d of [layout.runtimeRoot, dir]) {
+    if (sys.lstat(d)?.type !== "dir") return false;
+    sys.chown(d, 0, 0);
+    sys.chmod(d, 0o755);
+  }
+  // Not the recorded size: not the recorded bytes either, and never a copy of whatever size its owner made it.
+  const info = sys.lstat(layout.runtimeBinary(version));
+  if (info?.type !== "file" || info.size !== row.bytes) return false;
+  sweepStaged(ctx, dir);
+  const staged = join(dir, `.incibase-${Buffer.from((ctx.random ?? randomBytes)(8)).toString("hex")}.partial`);
+  try {
+    sys.copyFile(layout.runtimeBinary(version), staged, { uid: 0, gid: 0, mode: 0o700 });
+    if ((await sha256File(staged)).sha256 !== sha256) return false;
+    sys.chmod(staged, 0o755);
+    sys.rename(staged, layout.runtimeBinary(version));
+    return true;
+  } finally {
+    if (sys.lstat(staged)) sys.remove(staged);
+  }
+}
+
 function conflict(version: string, installed: string, given: string) {
   return new OpError("CONFLICT", `The runtime ${version} is installed with sha256 ${installed}, not ${given}: a version is never replaced by other bytes`);
 }
@@ -514,9 +559,9 @@ const useCliSchema = z.strictObject({
 export async function useCli(ctx: OpsContext, input: z.input<typeof useCliSchema>) {
   const data = parse(useCliSchema, input);
   return audited(ctx, "runtime.use_cli", null, () =>
-    ctx.registry.withLock(() => {
+    ctx.registry.withLock(async () => {
       const { sys, layout, registry } = ctx;
-      requireInstalled(ctx, data.version);
+      const row = requireInstalled(ctx, data.version);
       const link = layout.cliLink;
       const target = layout.runtimeBinary(data.version);
       if (sys.lstat(dirname(link))?.type !== "dir") throw new OpError("NOT_FOUND", `${dirname(link)} does not exist`);
@@ -531,7 +576,16 @@ export async function useCli(ctx: OpsContext, input: z.input<typeof useCliSchema
         );
       }
       if (!trustedRuntimes(ctx).includes(data.version)) {
-        throw new OpError("CONFLICT", `The runtime ${data.version} (${target}) is not root's alone, and root runs what ${link} leads to: make it, its directory and ${layout.runtimeRoot} root's and writable by root alone`);
+        throw new OpError("CONFLICT", `The runtime ${data.version} (${target}) is not root's alone, and root runs what ${link} leads to: ${runtimeFix(sys, layout, data.version)}`);
+      }
+      // Root's alone now, but it may not have been since it was recorded (chowned back by hand): only the recorded bytes.
+      const found = (await sha256File(target)).sha256;
+      if (found !== row.sha256) {
+        throw new OpError(
+          "CONFLICT",
+          `${target} has sha256 ${found}, not ${row.sha256} as the runtime ${data.version} was installed with, and root runs what ${link} leads to: ` +
+            `put the recorded bytes back (host install-runtime --version ${data.version})`,
+        );
       }
       const info = sys.lstat(link);
       const previous = info?.type === "symlink" ? sys.readlink(link) : null;

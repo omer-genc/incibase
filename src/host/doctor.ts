@@ -31,7 +31,8 @@ import { printable } from "./driver.ts";
 import { branchRef } from "./names.ts";
 import { OpError } from "./ops.ts";
 import { verifyBranch, verifyHostTree } from "./provision.ts";
-import { checkServiceUnit, cliLinkRuntime, hostRuntime, runtimeFilesFix, untrustedRuntime } from "./render.ts";
+import { checkServiceUnit, cliLinkRuntime, hostRuntime, runtimeFix, untrustedRuntime } from "./render.ts";
+import { sha256File } from "./runtime.ts";
 import { checkUnitName } from "./systemd.ts";
 import type { FileInfo } from "./system.ts";
 
@@ -394,11 +395,21 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
   const timerOff = registry.getSetting("check_timer") === "off";
   const link = layout.cliLink;
   const cli = cliLinkRuntime(ctx);
-  if (cli.ok) add("cli link", "OK", `${link} runs the installed runtime ${cli.version}`);
+  // Root's alone now, which says nothing of the time it was not (chowned back by hand): the recorded bytes too.
+  const recorded = cli.ok ? registry.getRuntime(cli.version)?.sha256 : undefined;
+  const found = cli.ok && recorded !== undefined ? await sha256File(layout.runtimeBinary(cli.version)).then((r) => r.sha256, () => "(unreadable)") : recorded;
+  if (cli.ok && found !== recorded) {
+    add(
+      "cli link",
+      "FAIL",
+      `${link} runs ${layout.runtimeBinary(cli.version)}, which has sha256 ${found}, not ${recorded} as the runtime ${cli.version} was installed with: ` +
+        `put the recorded bytes back (host install-runtime --version ${cli.version})`,
+    );
+  } else if (cli.ok) add("cli link", "OK", `${link} runs the installed runtime ${cli.version}`);
   else {
     // What use-cli cannot put right (the link's directory, the runtime's files) has a fix of its own.
     const installed = hostRuntime(ctx, null)?.version;
-    // Installed but not root's alone: use-cli refuses it, and install-runtime of the same bytes leaves it as it is.
+    // Installed but not trusted: use-cli refuses it until runtimeFix.
     const untrusted = installed ? undefined : untrustedRuntime(ctx, VERSION) ? VERSION : registry.listRuntimes().map((r) => r.version).filter((v) => untrustedRuntime(ctx, v)).sort(Bun.semver.order).at(-1);
     const replace = sys.lstat(link)?.type === "file" ? " --replace" : "";
     const create = cli.createDir ? `create ${cli.createDir}, root's alone (install -d -m 0755 ${cli.createDir}), then ` : "";
@@ -408,7 +419,7 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
         (installed
           ? `point it at an installed runtime (host use-cli ${installed}${replace})`
           : untrusted
-            ? `${runtimeFilesFix(layout, untrusted)}, then point it there (host use-cli ${untrusted}${replace})`
+            ? `${runtimeFix(sys, layout, untrusted)}, then point it there (host use-cli ${untrusted}${replace})`
             : `install a runtime and point it there (host install-runtime, then host use-cli <version>${replace})`);
     if (cli.skipped) add("cli link", timerOff ? "WARN" : "FAIL", `${link} ${cli.problem}: ${fix}${timerOff ? "" : "; until then the check timer skips every run"}`);
     else add("cli link", "FAIL", `${link} ${cli.problem}, and root runs it (the check timer, sudo incibase): ${fix}`);

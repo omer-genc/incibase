@@ -6,6 +6,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { sha256Hex } from "../src/engine/manifest.ts";
 import { VERSION } from "../src/engine/version.ts";
 import { runCheck, type CheckContext } from "../src/host/check.ts";
 import {
@@ -303,13 +304,13 @@ describe("host doctor", () => {
     expect(detail(missing, "cli link")).toBe(`${link} does not exist: point it at an installed runtime (host use-cli ${VERSION}); until then the check timer skips every run`);
     expect(detail(missing, "check timer")).toBe(`every run of ${checkService} is skipped: ${link} does not exist (see cli link)`);
     expect(missing.ok).toBe(false);
-    // An installed runtime someone else can write: use-cli refuses it and install-runtime of the same bytes leaves it as it is,
-    // so its files are the fix.
+    // An installed runtime someone else can write: use-cli refuses it, and install-runtime (never chown: they may have changed it)
+    // makes it root's alone again once its bytes are the recorded ones.
     const binary = host.layout.runtimeBinary(VERSION);
     host.sys.own(binary, 0, 0, 0o775);
     expect(detail(await runDoctor(host), "cli link")).toBe(
-      `${link} does not exist: make ${binary}, ${host.layout.runtimeDir(VERSION)} and ${host.layout.runtimeRoot} root's and writable by root alone ` +
-        `(chown root:root ${binary}; chmod go-w ${binary}, and the same for the two directories), then point it there (host use-cli ${VERSION}); until then the check timer skips every run`,
+      `${link} does not exist: install it again (host install-runtime --version ${VERSION}), which makes its files root's alone, ` +
+        `then point it there (host use-cli ${VERSION}); until then the check timer skips every run`,
     );
     host.sys.own(binary, 0, 0, 0o755);
     // No runtime at all (its file gone): install one first.
@@ -370,10 +371,20 @@ describe("host doctor", () => {
     expect(verdicts(runtime)["cli link"]).toBe("FAIL");
     expect(detail(runtime, "cli link")).toBe(
       `${link} points at ${binary}, a runtime in ${host.layout.runtimeRoot} that someone other than root can change, and root runs it (the check timer, sudo incibase): ` +
-        `make ${binary}, ${host.layout.runtimeDir(VERSION)} and ${host.layout.runtimeRoot} root's and writable by root alone (chown root:root ${binary}; chmod go-w ${binary}, and the same for the two directories), ` +
+        `install it again (host install-runtime --version ${VERSION}), which makes its files root's alone, ` +
         "or point it at another installed runtime (host use-cli <version>)",
     );
+    // Root's alone again, chowned back by hand after someone else could write it: the bytes must be the recorded ones too.
     host.sys.own(binary, 0, 0, 0o755);
+    const recorded = readFileSync(binary);
+    writeFileSync(binary, "#!/bin/sh\necho theirs\n");
+    expect(verdicts(await runDoctor(host))["cli link"]).toBe("FAIL");
+    expect(detail(await runDoctor(host), "cli link")).toBe(
+      `${link} runs ${binary}, which has sha256 ${sha256Hex("#!/bin/sh\necho theirs\n")}, not ${host.registry.getRuntime(VERSION)!.sha256} as the runtime ${VERSION} was installed with: ` +
+        `put the recorded bytes back (host install-runtime --version ${VERSION})`,
+    );
+    writeFileSync(binary, recorded);
+    expect(verdicts(await runDoctor(host))["cli link"]).toBe("OK");
     // Nor is a link others can replace: its directory, or any directory above it, someone else can change.
     const dir = dirname(link);
     const dirFix = (path: string) => `make ${path} root's and writable by root alone (chown root:root ${path}; chmod go-w ${path}), or give the host a CLI link in a directory only root can write`;

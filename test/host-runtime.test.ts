@@ -8,6 +8,7 @@ import { MAX_RUNTIME_BYTES, parseSums, releasesBase, RUNTIME_OWNER_FILE, runtime
 import { sha256Hex } from "../src/engine/manifest.ts";
 import { VERSION } from "../src/engine/version.ts";
 import { HostLayout } from "../src/host/layout.ts";
+import { runtimeFilesRootOnly, runtimeFix, runtimeRootPlaceFix, trustedRuntimes } from "../src/host/render.ts";
 import * as ops from "../src/host/ops.ts";
 import { closeOpsHosts, fakeBundle, fakeOpsHost, type OpsTestHost } from "./host-helpers.ts";
 
@@ -355,6 +356,58 @@ describe("install from a local file", () => {
     expect(readFileSync(host.layout.runtimeBinary("0.4.0"), "utf8")).toBe(script("0.4.0"));
   });
 
+  test("again, with its files someone else's: a root-only copy of the recorded bytes takes their place; other bytes are put back", async () => {
+    const host = await hostWith();
+    const bin = file(host, "a", script("0.4.0"));
+    const sha256 = sha256Hex(script("0.4.0"));
+    await ops.installRuntime(host, { version: "0.4.0", binary: bin, sha256 });
+    const path = host.layout.runtimeBinary("0.4.0");
+    const dir = host.layout.runtimeDir("0.4.0");
+    const trusted = () => runtimeFilesRootOnly(host.sys, host.layout, "0.4.0");
+    // The same bytes, someone else's: the directories become root's first, then a checked copy replaces the file (a new inode: an fd they hold open writes elsewhere).
+    for (const [what, mess] of [
+      ["the binary", () => host.sys.own(path, 1000, 1000)],
+      ["a world-writable binary", () => host.sys.own(path, 0, 0, 0o777)],
+      ["a binary no one else can run", () => host.sys.own(path, 0, 0, 0o700)],
+      ["its directory", () => host.sys.own(dir, 1000, 1000)],
+      ["the runtime root", () => host.sys.own(host.layout.runtimeRoot, 0, 0, 0o775)],
+    ] as const) {
+      mess();
+      expect(trusted(), what).toBe(false);
+      const before = statSync(path).ino;
+      const marks = host.sys.log.length;
+      expect(await ops.installRuntime(host, { version: "0.4.0" }), what).toMatchObject({ installed: false, repaired: true, sha256 });
+      expect(trusted(), what).toBe(true);
+      expect(statSync(path).ino, what).not.toBe(before);
+      expect(host.sys.log.slice(marks).filter((l) => l.startsWith("chown ") || l.startsWith("chmod ")).slice(0, 4), what).toEqual([
+        `chown ${host.layout.runtimeRoot} 0:0`,
+        `chmod ${host.layout.runtimeRoot} 755`,
+        `chown ${dir} 0:0`,
+        `chmod ${dir} 755`,
+      ]);
+      expect(readFileSync(path, "utf8"), what).toBe(script("0.4.0"));
+      expect(host.registry.listAudit().at(-1), what).toMatchObject({ action: "runtime.install", ok: 1, detail_json: expect.stringContaining('"repaired":true') });
+      noLeftovers(host);
+    }
+    // Other bytes in a file someone else could write are never made root's: the recorded ones go back, from the binary given.
+    const same = script("0.4.0").replace("echo 0.4.0", "echo 6.6.6");
+    expect(same.length).toBe(script("0.4.0").length);
+    writeFileSync(path, same);
+    host.sys.own(path, 1000, 1000);
+    expect(await ops.installRuntime(host, { version: "0.4.0", binary: bin, sha256 })).toMatchObject({ installed: true });
+    expect(readFileSync(path, "utf8")).toBe(script("0.4.0"));
+    // Nor is one of another size, which is not even copied.
+    writeFileSync(path, script("0.4.0", "theirs"));
+    host.sys.own(path, 1000, 1000);
+    await expect(ops.installRuntime(host, { version: "0.4.0", binary: file(host, "b", script("0.4.0", "rebuilt")), sha256: sha256Hex(script("0.4.0", "rebuilt")) })).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
+    expect(await ops.installRuntime(host, { version: "0.4.0", binary: bin, sha256 })).toMatchObject({ installed: true });
+    expect(readFileSync(path, "utf8")).toBe(script("0.4.0"));
+    expect(trusted()).toBe(true);
+    noLeftovers(host);
+  });
+
   test("a runtime on disk without a record is never replaced by other bytes, and is recorded given its own", async () => {
     const host = await hostWith();
     const path = host.layout.runtimeBinary("5.0.0");
@@ -500,15 +553,52 @@ describe("the CLI link", () => {
     host.sys.own(above, 1000, 1000);
     await refused("a user's grandparent", place(above, "belongs to uid 1000, not root"));
     host.sys.own(above, 0, 0);
-    // A runtime someone else can write.
+    // A runtime someone else can write: install-runtime, not chown, since its owner may have changed the bytes.
     const binary = host.layout.runtimeBinary(VERSION);
+    const notRootOnly = `The runtime ${VERSION} (${binary}) is not root's alone, and root runs what ${link} leads to: `;
+    const reinstall = `install it again (host install-runtime --version ${VERSION}), which makes its files root's alone`;
     host.sys.own(binary, 1000, 1000, 0o755);
-    await refused(
-      "a runtime that is not root's",
-      `The runtime ${VERSION} (${binary}) is not root's alone, and root runs what ${link} leads to: make it, its directory and ${host.layout.runtimeRoot} root's and writable by root alone`,
-    );
+    await refused("a runtime that is not root's", notRootOnly + reinstall);
     host.sys.own(binary, 0, 0, 0o755);
+    // Root's alone again, chowned back by hand after someone else could write it: only the recorded bytes are linked.
+    const recorded = readFileSync(binary);
+    writeFileSync(binary, script(VERSION, "theirs"));
+    await refused(
+      "other bytes",
+      `${binary} has sha256 ${sha256Hex(script(VERSION, "theirs"))}, not ${host.registry.getRuntime(VERSION)!.sha256} as the runtime ${VERSION} was installed with, ` +
+        `and root runs what ${link} leads to: put the recorded bytes back (host install-runtime --version ${VERSION})`,
+    );
+    writeFileSync(binary, recorded);
     expect(await ops.useCli(host, { version: VERSION })).toMatchObject({ target: binary });
+  });
+
+  test("a runtime root below a directory someone else can change trusts no runtime: that directory is the fix", async () => {
+    const host = await hostWith();
+    // The fake host's runtime root shares its parent with the CLI link: one a level further down.
+    const above = join(host.dir, "lib");
+    const layout = new HostLayout({ root: host.layout.root, runtimeRoot: join(above, "runtime"), cliLink: host.layout.cliLink });
+    host.sys.mkdir(above, 0o755);
+    host.sys.mkdir(layout.runtimeRoot, 0o755);
+    host.sys.mkdir(layout.runtimeDir(VERSION), 0o755);
+    host.sys.copyFile(host.layout.runtimeBinary(VERSION), layout.runtimeBinary(VERSION), { uid: 0, gid: 0, mode: 0o755 });
+    const ctx = { ...host, layout };
+    expect(trustedRuntimes(ctx)).toEqual([VERSION]);
+    expect(runtimeRootPlaceFix(host.sys, layout)).toBeNull();
+    const reinstall = `install it again (host install-runtime --version ${VERSION}), which makes its files root's alone`;
+    host.sys.own(above, 0, 0, 0o2775);
+    expect(trustedRuntimes(ctx)).toEqual([]);
+    const make = `make ${above}, on the way to ${layout.runtimeRoot}, root's and writable by root alone (chown root:root ${above}; chmod go-w ${above}), or give the host a runtime root in a directory only root can write`;
+    expect(runtimeFix(host.sys, layout, VERSION)).toBe(make);
+    host.sys.own(layout.runtimeBinary(VERSION), 1000, 1000);
+    expect(runtimeFix(host.sys, layout, VERSION)).toBe(`${make}, then ${reinstall}`);
+    host.sys.own(layout.runtimeBinary(VERSION), 0, 0, 0o755);
+    // A sticky one (/tmp) is never chmodded: another runtime root.
+    host.sys.own(above, 0, 0, 0o1777);
+    expect(runtimeFix(host.sys, layout, VERSION)).toBe(`give the host a runtime root in a directory only root can write (${above}, on the way to ${layout.runtimeRoot}, is writable by someone other than root)`);
+    host.sys.own(above, 1000, 1000, 0o755);
+    expect(runtimeRootPlaceFix(host.sys, layout)).toStartWith(`make ${above}, on the way to`);
+    // Not there yet, with only root able to create it: install-runtime does.
+    expect(runtimeRootPlaceFix(host.sys, new HostLayout({ root: host.layout.root, runtimeRoot: join(host.dir, "new", "runtime") }))).toBeNull();
   });
 
   test("the layout keeps it, and a default one is not saved", () => {

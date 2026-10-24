@@ -293,12 +293,12 @@ describe("host", () => {
       `Next: sudo ${download} host install-runtime ${download} --version ${VERSION} --sums SHA256SUMS --root ${other}, then sudo ${download} host use-cli ${VERSION} --root ${other}`,
     );
     renameSync(`${installed}.away`, installed);
-    // Installed but someone else's: install-runtime of the same bytes would leave it so, and use-cli refuses it.
+    // Installed but someone else's: use-cli refuses it, and installing it again (never chown: they may have changed it)
+    // makes it root's alone once its bytes are the recorded ones.
     s.host.sys.own(installed, 1000, 1000);
     expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
     expect(s.last().out).toContain(
-      `Next: make ${installed}, ${s.host.layout.runtimeDir(VERSION)} and ${s.host.layout.runtimeRoot} root's and writable by root alone ` +
-        `(chown root:root ${installed}; chmod go-w ${installed}, and the same for the two directories), then sudo ${download} host use-cli ${VERSION}`,
+      `Next: sudo ${download} host install-runtime ${download} --version ${VERSION} --sums SHA256SUMS, then sudo ${download} host use-cli ${VERSION}`,
     );
     // Installed: only use-cli is left; a file in the link's place needs --replace.
     s.host.sys.own(installed, 0, 0);
@@ -313,7 +313,7 @@ describe("host", () => {
     expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
     expect(s.last().out).toContain(
       `  check timer: runs ${link}, which points at ${binary}, a runtime in ${s.host.layout.runtimeRoot} that someone other than root can change\n` +
-        `Next: make ${binary}, ${s.host.layout.runtimeDir(VERSION)} and ${s.host.layout.runtimeRoot} root's and writable by root alone`,
+        `Next: install it again (host install-runtime --version ${VERSION}), which makes its files root's alone, or point it at another installed runtime (host use-cli <version>)`,
     );
     s.host.sys.own(binary, 0, 0);
     s.host.sys.remove(link);
@@ -430,6 +430,11 @@ describe("host", () => {
     const sha = sha256Hex(readFileSync(binary));
     expect(await s.run("host", "install-runtime", "--version", VERSION, binary, "--sha256", sha)).toBe(0);
     expect(s.last().out).toBe(`Already installed: runtime ${VERSION} at ${s.host.layout.runtimeBinary(VERSION)} (sha256 ${sha.slice(0, 16)}...)`);
+    // Its file someone else's: the same bytes are made root's alone again.
+    s.host.sys.own(s.host.layout.runtimeBinary(VERSION), 1000, 1000);
+    expect(await s.run("host", "install-runtime", "--version", VERSION)).toBe(0);
+    expect(s.last().out).toBe(`Already installed, its files made root's alone again: runtime ${VERSION} at ${s.host.layout.runtimeBinary(VERSION)} (sha256 ${sha.slice(0, 16)}...)`);
+    expect(s.host.sys.lstat(s.host.layout.runtimeBinary(VERSION))).toMatchObject({ uid: 0, mode: 0o755 });
     expect(await s.run("host", "install-runtime", "--version", VERSION, binary, "--sha256", "0".repeat(64))).toBe(1);
     expect(await s.run("host", "install-runtime", binary, "extra")).toBe(2);
     expect(await s.run("host", "use-cli", VERSION)).toBe(0);
