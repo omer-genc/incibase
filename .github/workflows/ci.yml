@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A branch can run the suite on Linux, as a non-root user, before it merges.
+  workflow_dispatch: {}
 
 jobs:
   test:
