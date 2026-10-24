@@ -21,7 +21,9 @@
 // and www-data joins the proxy group, which is what lets it traverse hosts/
 // and connect to http.sock (both 0750/0770 to that group). The host's two
 // logs are created www-data:adm 0640 before nginx first opens them (nginx
-// would make them root 0644, readable by every branch user).
+// would make them root 0644, readable by every branch user). The config and
+// the drop-in name the host root they belong to (render.ownerRecord), so
+// `host init` of another root refuses them.
 //
 // Names nginx keeps globally (zones, maps, the log format) come from the unit
 // prefix, so two hosts can share one nginx, but only on different ports: each
@@ -32,7 +34,7 @@ import type { OpsContext } from "./context.ts";
 import type { HostLayout } from "./layout.ts";
 import { checkDomain } from "./names.ts";
 import { currentActor, type Registry } from "./registry.ts";
-import { removeIfPresent, writeIfChanged } from "./render.ts";
+import { ownerRecord, removeIfPresent, writeIfChanged } from "./render.ts";
 import { checkAccountName, SystemCommandError } from "./system.ts";
 
 export const NGINX_SERVICE = "nginx.service";
@@ -283,7 +285,7 @@ export function nginxConfig(input: NginxConfigInput): string {
         CLOUDFLARE_RANGES.map((range) => `    set_real_ip_from ${range};`).join("\n") +
         "\n    real_ip_header CF-Connecting-IP;\n"
       : "";
-  return `${HEADER}# The front door of the incibase host at ${checkNginxPath(layout.root)}: https://<branch>--<project>.${input.domain}
+  return `${HEADER}${ownerRecord(layout)}# The front door of the incibase host at ${checkNginxPath(layout.root)}: https://<branch>--<project>.${input.domain}
 # goes to ${hosts}/<branch>--<project>/http.sock. Nothing here is per branch: the hosts/ links route.
 
 map $http_upgrade $${s}_connection {
@@ -430,8 +432,8 @@ ${listen(" default_server")}
 }
 
 /** `nginx.service.d/50-<prefix>.conf`: under memory pressure the kernel kills branches before the front door. */
-export function nginxDropIn(): string {
-  return `${HEADER}[Service]
+export function nginxDropIn(layout: HostLayout): string {
+  return `${HEADER}${ownerRecord(layout)}[Service]
 OOMScoreAdjust=-900
 MemoryMin=64M
 `;
@@ -592,7 +594,7 @@ export async function renderNginx(ctx: OpsContext): Promise<NginxReport> {
 
     const dropInDir = files.dropIn.slice(0, files.dropIn.lastIndexOf("/"));
     if (!ctx.sys.lstat(dropInDir)) ctx.sys.mkdir(dropInDir, 0o755);
-    report.dropInChanged = writeIfChanged(ctx, files.dropIn, nginxDropIn(), { uid: 0, gid: 0, mode: 0o644 });
+    report.dropInChanged = writeIfChanged(ctx, files.dropIn, nginxDropIn(ctx.layout), { uid: 0, gid: 0, mode: 0o644 });
 
     if (report.dropInChanged) ctx.driver.daemonReload();
     const active = ctx.driver.isActive(NGINX_SERVICE);

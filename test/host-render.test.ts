@@ -37,6 +37,8 @@ const branch: BranchRow = {
   generation: "7.0a1b2c3d4e5f",
 };
 const HEADER = "# Rendered by incibase from control/registry.db; changes here are overwritten.\n";
+/** The host's own units also name the host root they belong to. */
+const HOST_HEADER = `${HEADER}# host root: /var/lib/incibase\n`;
 const SANDBOX = (writable: string) => `UMask=0007
 TemporaryFileSystem=/tmp:size=64M,mode=1777
 SocketBindDeny=any
@@ -58,7 +60,7 @@ const SERVE_TAIL =
 
 describe("unit files", () => {
   test("the branch template has the whole sandbox and restart policy", () => {
-    expect(branchTemplateUnit(layout)).toBe(`${HEADER}[Unit]
+    expect(branchTemplateUnit(layout)).toBe(`${HOST_HEADER}[Unit]
 Description=incibase branch %i
 Wants=network-online.target
 After=network-online.target
@@ -87,7 +89,7 @@ WantedBy=multi-user.target
   });
 
   test("the preflight template: the same sandbox, only preflight/ writable", () => {
-    expect(preflightTemplateUnit(layout)).toBe(`${HEADER}[Unit]
+    expect(preflightTemplateUnit(layout)).toBe(`${HOST_HEADER}[Unit]
 Description=incibase preflight %i
 RequiresMountsFor=/var/lib/incibase
 
@@ -104,7 +106,7 @@ ${SANDBOX("/var/lib/incibase/branches/%i/preflight")}`);
   });
 
   test("the snapshot template: the same sandbox, no env file, only data/ and snapshot/ writable", () => {
-    expect(snapshotTemplateUnit(layout)).toBe(`${HEADER}[Unit]
+    expect(snapshotTemplateUnit(layout)).toBe(`${HOST_HEADER}[Unit]
 Description=incibase snapshot %i
 RequiresMountsFor=/var/lib/incibase
 
@@ -121,8 +123,8 @@ ${SANDBOX("/var/lib/incibase/branches/%i/data /var/lib/incibase/branches/%i/snap
   });
 
   test("the slice caps all branches together", () => {
-    expect(sliceUnit(3 * 1024 * MiB)).toBe(`${HEADER}[Unit]\nDescription=incibase branches\n\n[Slice]\nMemoryMax=3G\n`);
-    expect(sliceUnit(null)).toBe(`${HEADER}[Unit]\nDescription=incibase branches\n\n[Slice]\n`);
+    expect(sliceUnit(layout, 3 * 1024 * MiB)).toBe(`${HOST_HEADER}[Unit]\nDescription=incibase branches\n\n[Slice]\nMemoryMax=3G\n`);
+    expect(sliceUnit(layout, null)).toBe(`${HOST_HEADER}[Unit]\nDescription=incibase branches\n\n[Slice]\n`);
   });
 
   test("the branch drop-in: user, pinned runtime, release, generation and limits", () => {

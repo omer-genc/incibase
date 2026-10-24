@@ -147,6 +147,7 @@ describe("the rendered config", () => {
 
   test("routes every <branch>--<project> label through hosts/, with no line per branch", () => {
     expect(nginxConfig(input)).toBe(`# Rendered by incibase from control/registry.db; changes here are overwritten.
+# host root: /var/lib/incibase
 # The front door of the incibase host at /var/lib/incibase: https://<branch>--<project>.incibase.omergenc.net
 # goes to /var/lib/incibase/hosts/<branch>--<project>/http.sock. Nothing here is per branch: the hosts/ links route.
 
@@ -396,7 +397,9 @@ server {
   });
 
   test("the nginx drop-in keeps the front door alive under memory pressure", () => {
-    expect(nginxDropIn()).toBe("# Rendered by incibase from control/registry.db; changes here are overwritten.\n[Service]\nOOMScoreAdjust=-900\nMemoryMin=64M\n");
+    expect(nginxDropIn(new HostLayout())).toBe(
+      "# Rendered by incibase from control/registry.db; changes here are overwritten.\n# host root: /var/lib/incibase\n[Service]\nOOMScoreAdjust=-900\nMemoryMin=64M\n",
+    );
   });
 
   test("nothing that nginx would read as syntax reaches the file", () => {
@@ -451,7 +454,7 @@ describe("the front door on a host", () => {
     expect(text).toContain(`set $ib ${host.layout.hosts}/$ib_label;`);
     expect(host.sys.lstat(host.conf)).toMatchObject({ uid: 0, gid: 0, mode: 0o644 });
     expect(host.sys.getgrnam(host.layout.groups.proxy)!.members).toEqual(["www-data"]);
-    expect(readFileSync(join(host.layout.systemdDir, "nginx.service.d", "50-incibase.conf"), "utf8")).toBe(nginxDropIn());
+    expect(readFileSync(join(host.layout.systemdDir, "nginx.service.d", "50-incibase.conf"), "utf8")).toBe(nginxDropIn(host.layout));
     // Tested alone (the harness), then with the rest of nginx's config, before nginx was told.
     expect(host.fake.tests.map((t) => (t.config.endsWith("harness.conf") ? "candidate" : "whole"))).toEqual(["candidate", "candidate", "whole"]);
     expect(host.fake.tests.every((t) => t.text.includes(`ssl_certificate ${cert};`))).toBe(true);

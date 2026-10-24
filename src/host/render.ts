@@ -4,7 +4,10 @@
 // `incibase-snapshot@.service`, `incibase.slice` and each branch's drop-ins. The text builders here are pure; the writers
 // write a file atomically (temp file, fsync, rename, via HostSystem) and only
 // when its content, owner or mode differ, and say whether a unit file changed,
-// so the caller runs `systemctl daemon-reload` once, and only then.
+// so the caller runs `systemctl daemon-reload` once, and only then. The
+// host's own units (the templates, the slice and the check timer's two) name
+// the host root they belong to (ownerRecord), so `host init` of another root
+// refuses them: one machine runs one host.
 import { dirname, resolve } from "node:path";
 import { VERSION } from "../engine/version.ts";
 import type { BranchConfig, ResolvedLimits } from "./config.ts";
@@ -73,6 +76,31 @@ export function adminIndexContent(branches: BranchRow[], domain: string | null):
 // ---- systemd units ---------------------------------------------------------
 
 const HEADER = "# Rendered by incibase from control/registry.db; changes here are overwritten.\n";
+/** What an owner record says: `# host root: <root>`. */
+const OWNER_RECORD = /^# host root: (\/[A-Za-z0-9_./:=,@+-]*)$/;
+
+/**
+ * The owner record of a file every host of a layout would write in the same
+ * place (its units, the nginx front door): the host root it belongs to. One
+ * machine runs one host, and `host init` of another root refuses a file
+ * that names someone else (ops.checkMachineOwner).
+ */
+export function ownerRecord(layout: HostLayout): string {
+  return `# host root: ${word(layout.root)}\n`;
+}
+
+/** The host root a rendered file's leading comments name; null when they name none (or not readably). */
+export function recordedRoot(text: string): string | null {
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("#")) break;
+    const match = OWNER_RECORD.exec(line);
+    if (match) return match[1]!;
+  }
+  return null;
+}
+
+/** The header of a host unit: rendered, and whose. */
+const hostHeader = (layout: HostLayout) => `${HEADER}${ownerRecord(layout)}`;
 /**
  * Network the sandbox denies: loopback, private ranges (IPv4 and IPv6
  * unique-local), the shared/CGNAT range an overlay such as Tailscale uses,
@@ -127,7 +155,7 @@ function sandbox(layout: HostLayout, writable: string[]): string {
 /** `incibase-branch@.service`: what every branch shares. The per-branch drop-in adds the user, command and limits. */
 export function branchTemplateUnit(layout: HostLayout): string {
   const writable = ["/data", "/run/http", "/run/admin"].map((rest) => instancePath(layout.branches, rest));
-  return `${HEADER}[Unit]
+  return `${hostHeader(layout)}[Unit]
 Description=incibase branch %i
 Wants=network-online.target
 After=network-online.target
@@ -158,7 +186,7 @@ WantedBy=multi-user.target
 
 /** `incibase-preflight@.service`: the same sandbox, where only the branch's preflight dir is writable. */
 export function preflightTemplateUnit(layout: HostLayout): string {
-  return `${HEADER}[Unit]
+  return `${hostHeader(layout)}[Unit]
 Description=incibase preflight %i
 RequiresMountsFor=${word(layout.root)}
 
@@ -187,7 +215,7 @@ export const SNAPSHOT_RUNTIME_MAX_SEC = 900;
  * maps data.db-shm; nothing else is. No EnvironmentFile: the copy needs no secret.
  */
 export function snapshotTemplateUnit(layout: HostLayout): string {
-  return `${HEADER}[Unit]
+  return `${hostHeader(layout)}[Unit]
 Description=incibase snapshot %i
 RequiresMountsFor=${word(layout.root)}
 
@@ -203,8 +231,8 @@ ${sandbox(layout, [instancePath(layout.branches, "/data"), instancePath(layout.b
 }
 
 /** `incibase.slice`: all branches together stay under this much memory. */
-export function sliceUnit(memoryMax: number | null): string {
-  return `${HEADER}[Unit]
+export function sliceUnit(layout: HostLayout, memoryMax: number | null): string {
+  return `${hostHeader(layout)}[Unit]
 Description=incibase branches
 
 [Slice]
@@ -455,7 +483,7 @@ export function renderHostUnits(ctx: HostContext): boolean {
   let changed = writeIfChanged(ctx, layout.unitFile(layout.units.branchTemplate), branchTemplateUnit(layout), UNIT_FILE);
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.preflightTemplate), preflightTemplateUnit(layout), UNIT_FILE) || changed;
   changed = writeIfChanged(ctx, layout.unitFile(layout.units.snapshotTemplate), snapshotTemplateUnit(layout), UNIT_FILE) || changed;
-  changed = writeIfChanged(ctx, layout.unitFile(layout.units.slice), sliceUnit(Number.isSafeInteger(sliceMax) && sliceMax > 0 ? sliceMax : null), UNIT_FILE) || changed;
+  changed = writeIfChanged(ctx, layout.unitFile(layout.units.slice), sliceUnit(layout, Number.isSafeInteger(sliceMax) && sliceMax > 0 ? sliceMax : null), UNIT_FILE) || changed;
   changed = renderCheckUnits(ctx) || changed;
   return changed;
 }
@@ -477,7 +505,7 @@ export function renderHostUnits(ctx: HostContext): boolean {
  */
 export function checkServiceUnit(layout: HostLayout): string {
   const cli = word(layout.cliLink);
-  return `${HEADER}[Unit]
+  return `${hostHeader(layout)}[Unit]
 Description=incibase health check of ${word(layout.root)}
 After=network-online.target
 # Skipped, not failed, until host use-cli points the link at an installed runtime.
@@ -494,7 +522,7 @@ TimeoutStartSec=120
 
 /** `<prefix>-check.timer`: the check every 30 s; a oneshot never runs twice at once. */
 export function checkTimerUnit(layout: HostLayout): string {
-  return `${HEADER}[Unit]
+  return `${hostHeader(layout)}[Unit]
 Description=incibase health check every 30 s
 
 [Timer]
