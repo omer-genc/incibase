@@ -243,6 +243,31 @@ describe("host", () => {
     expect(await s.run("host", "init", "--domain", "incibase.example.net", "--layout", "{nope")).toBe(2);
   });
 
+  test("init names the next step while the CLI link, which the check timer runs, leads to no installed runtime", async () => {
+    const s = await session();
+    const link = s.host.layout.cliLink;
+    const download = "/home/omer/incibase-linux-x64";
+    s.host.self = [download];
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toContain(`  check timer: every 30 s, runs ${link} (runtime ${VERSION})\nNext: sudo incibase host add-admin <you>`);
+    // The first init, from a download: no link yet, the runtime not installed.
+    s.host.sys.remove(link);
+    s.host.sys.own(s.host.layout.runtimeBinary(VERSION), 1000, 1000);
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toContain(
+      `  check timer: waits for ${link} (host use-cli), skipping every run until then\n` +
+        `Next: sudo ${download} host install-runtime ${download} --version ${VERSION} --sums SHA256SUMS, then sudo ${download} host use-cli ${VERSION}`,
+    );
+    // Installed: only use-cli is left; a file in the link's place needs --replace.
+    s.host.sys.own(s.host.layout.runtimeBinary(VERSION), 0, 0);
+    writeFileSync(link, "#!/bin/sh\n", { mode: 0o755 });
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toContain(`  check timer: runs ${link}, which is a file, not a link to an installed runtime\nNext: sudo ${download} host use-cli ${VERSION} --replace`);
+    s.host.sys.remove(link);
+    expect(await s.run("host", "init", "--domain", "incibase.example.net", "--no-check-timer")).toBe(0);
+    expect(s.last().out).toContain(`  check timer: off\nNext: sudo ${download} host use-cli ${VERSION}`);
+  });
+
   test("add-admin adds login accounts to the admin group, once; never system accounts", async () => {
     const s = await session();
     const sys = s.host.sys;

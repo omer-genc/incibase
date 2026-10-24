@@ -14,6 +14,7 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { parseDrainTimeout } from "../engine/drain.ts";
 import { parseTimeouts } from "../engine/timeouts.ts";
+import { VERSION } from "../engine/version.ts";
 import { MiB, parseSize, resolveLimits, type BranchConfig, type BranchLimits } from "./config.ts";
 import { openHost, type OpsContext } from "./context.ts";
 import { ALERT_WEBHOOK } from "./alerts.ts";
@@ -26,6 +27,7 @@ import * as ops from "./ops.ts";
 import { OpError } from "./ops.ts";
 import type { AlertRow, BranchRow, ReleaseRow } from "./registry.ts";
 import { MAX_BUNDLE_BYTES, type GateResult } from "./release.ts";
+import { cliLinkRuntime, trustedRuntimes } from "./render.ts";
 
 /** A command line that cannot mean anything: exit 2 with the command's usage. */
 export class UsageError extends Error {
@@ -375,6 +377,29 @@ function initInput(values: Values) {
   };
 }
 
+/**
+ * `host init`'s check timer line and next step. The check service runs the
+ * CLI link, which the first init (from a download) cannot have made yet:
+ * until it leads to an installed runtime, the next step is install-runtime
+ * and use-cli, with this binary as the owner ran it.
+ */
+function initNext(ctx: OpsContext): string[] {
+  const link = ctx.layout.cliLink;
+  const cli = cliLinkRuntime(ctx);
+  const off = ctx.registry.getSetting("check_timer") === "off";
+  if (cli.ok) {
+    return [`  check timer: ${off ? "off" : `every 30 s, runs ${link} (runtime ${cli.version})`}`, "Next: sudo incibase host add-admin <you>, then sudo incibase project create <slug>"];
+  }
+  const me = ctx.self.join(" ");
+  const binary = ctx.self.length === 1 ? ctx.self[0]! : "<incibase-linux-arch>";
+  const steps = trustedRuntimes(ctx).includes(VERSION) ? [] : [`sudo ${me} host install-runtime ${binary} --version ${VERSION} --sums SHA256SUMS`];
+  steps.push(`sudo ${me} host use-cli ${VERSION}${ctx.sys.lstat(link)?.type === "file" ? " --replace" : ""}`);
+  return [
+    `  check timer: ${off ? "off" : cli.skipped ? `waits for ${link} (host use-cli), skipping every run until then` : `runs ${link}, which ${cli.problem}`}`,
+    `Next: ${steps.join(", then ")}`,
+  ];
+}
+
 /** `host set <key> <value>`, checked: which setting, and its value. */
 function hostSetting(args: string[], values: Values): { key: "alert_webhook"; value: string | null } | { key: "trust_proxy"; value: (typeof TRUST_PROXY)[number] } | { key: "https_port"; value: number } {
   const [key, value] = args as [string, string];
@@ -459,7 +484,7 @@ const SPECS: Spec[] = [
           front
             ? `  front door: ${front.certificate ? `certificate ${clean((front.certificate as { sha256?: string }).sha256 ?? "installed")}, ` : ""}nginx ${front.nginx.skipped ? `skipped (${clean(front.nginx.skipped)})` : (front.nginx.action ?? "unchanged")}`
             : "  front door: not configured yet (pass --tls-cert and --tls-key)",
-          `Next: sudo incibase host add-admin <you>, then sudo incibase project create <slug>`,
+          ...initNext(ctx),
         ],
       };
     },
