@@ -274,7 +274,11 @@ describe("host", () => {
     const download = "/home/omer/incibase-linux-x64";
     s.host.self = [download];
     expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
-    expect(s.last().out).toContain(`  check timer: every 30 s, runs ${link} (runtime ${VERSION})\nNext: sudo incibase host add-admin <you>`);
+    // Next goes through this host's link (not the machine's own incibase), with --root unless it is the default.
+    expect(s.last().out).toEndWith(`  check timer: every 30 s, runs ${link} (runtime ${VERSION})\nNext: sudo ${link} host add-admin <you>, then sudo ${link} project create <slug>`);
+    const other = "/var/lib/incibase-ck";
+    expect(await s.run("host", "init", "--domain", "incibase.example.net", "--root", other)).toBe(0);
+    expect(s.last().out).toEndWith(`Next: sudo ${link} host add-admin <you> --root ${other}, then sudo ${link} project create <slug> --root ${other}`);
     // The first init, from a download: no link yet, the runtime not installed (its file gone).
     const installed = s.host.layout.runtimeBinary(VERSION);
     s.host.sys.remove(link);
@@ -283,6 +287,10 @@ describe("host", () => {
     expect(s.last().out).toContain(
       `  check timer: waits for ${link} (host use-cli), skipping every run until then\n` +
         `Next: sudo ${download} host install-runtime ${download} --version ${VERSION} --sums SHA256SUMS, then sudo ${download} host use-cli ${VERSION}`,
+    );
+    expect(await s.run("host", "init", "--domain", "incibase.example.net", "--root", other)).toBe(0);
+    expect(s.last().out).toEndWith(
+      `Next: sudo ${download} host install-runtime ${download} --version ${VERSION} --sums SHA256SUMS --root ${other}, then sudo ${download} host use-cli ${VERSION} --root ${other}`,
     );
     renameSync(`${installed}.away`, installed);
     // Installed but someone else's: install-runtime of the same bytes would leave it so, and use-cli refuses it.
@@ -317,6 +325,12 @@ describe("host", () => {
     s.host.sys.mkdir(dir, 0o755);
     expect(await s.run("host", "init", "--domain", "incibase.example.net", "--no-check-timer")).toBe(0);
     expect(s.last().out).toContain(`  check timer: off\nNext: sudo ${download} host use-cli ${VERSION}`);
+    // A host in use, run again: once the link runs the check, nothing is next.
+    s.host.sys.symlink(s.host.layout.runtimeBinary(VERSION), link);
+    await ops.createProject(s.host, { slug: "shop", branches: [] });
+    expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    expect(s.last().out).toEndWith("  check timer: off");
+    expect(s.last().out).not.toContain("Next:");
   });
 
   test("add-admin adds login accounts to the admin group, once; never system accounts", async () => {
@@ -443,9 +457,11 @@ describe("projects and branches", () => {
     const s = await session();
     expect(await s.run("project", "list")).toBe(0);
     expect(s.last().out).toContain("No projects yet");
+    expect(s.last().out).toBe(`No projects yet: sudo ${s.host.layout.cliLink} project create <slug>`);
     expect(await s.run("project", "create", "shop", "--branches", "prod,dev", "--name", "The shop")).toBe(0);
     expect(s.last().out).toContain("Created project shop:");
     expect(s.last().out).toContain("shop/prod                prod    https://prod--shop.incibase.example.net");
+    expect(s.last().out).toEndWith(`Next: incibase bundle --out app.ib, copy it here, then sudo ${s.host.layout.cliLink} release add shop/prod app.ib`);
     expect(await s.run("project", "create", "shop")).toBe(1);
     expect(s.last().err).toBe("incibase project create: Project shop already exists");
     expect(await s.run("project", "create", "empty", "--branches", "", "--json")).toBe(0);

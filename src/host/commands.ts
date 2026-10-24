@@ -21,7 +21,7 @@ import { openHost, type OpsContext } from "./context.ts";
 import { ALERT_WEBHOOK } from "./alerts.ts";
 import { formatDoctor } from "./doctor.ts";
 import { printable } from "./driver.ts";
-import { DEFAULT_ROOT, HostLayout, type LayoutOptions } from "./layout.ts";
+import { DEFAULT_CLI_LINK, DEFAULT_ROOT, HostLayout, type LayoutOptions } from "./layout.ts";
 import { BRANCH_KINDS, branchRef, checkProjectSlug, NameError, parseBranchRef } from "./names.ts";
 import { TRUST_PROXY } from "./nginx.ts";
 import * as ops from "./ops.ts";
@@ -394,12 +394,15 @@ function initInput(values: Values) {
  * link's directory, or instead of install-runtime making root's alone a
  * runtime that is installed but not, when need be).
  */
-function initNext(ctx: OpsContext): string[] {
+function initNext(ctx: OpsContext, root: string): string[] {
   const link = ctx.layout.cliLink;
   const cli = cliLinkRuntime(ctx);
   const off = ctx.registry.getSetting("check_timer") === "off";
   if (cli.ok) {
-    return [`  check timer: ${off ? "off" : `every 30 s, runs ${link} (runtime ${cli.version})`}`, "Next: sudo incibase host add-admin <you>, then sudo incibase project create <slug>"];
+    const timer = `  check timer: ${off ? "off" : `every 30 s, runs ${link} (runtime ${cli.version})`}`;
+    // Run again on a host in use: nothing is next.
+    if (ctx.registry.listProjects().length) return [timer];
+    return [timer, `Next: ${sudoCli(ctx, root, "host add-admin <you>")}, then ${sudoCli(ctx, root, "project create <slug>")}`];
   }
   const state = cli.skipped && !cli.fix ? `waits for ${link} (host use-cli), skipping every run until then` : `${cli.skipped ? "skips every run of" : "runs"} ${link}, which ${cli.problem}`;
   const timer = `  check timer: ${off ? "off" : state}`;
@@ -410,9 +413,21 @@ function initNext(ctx: OpsContext): string[] {
   const steps = cli.createDir ? [`sudo install -d -m 0755 ${cli.createDir}`] : [];
   // Installed but not root's alone: install-runtime of the same bytes leaves it as it is, and use-cli refuses it.
   if (untrustedRuntime(ctx, VERSION)) steps.push(runtimeFilesFix(ctx.layout, VERSION));
-  else if (!trustedRuntimes(ctx).includes(VERSION)) steps.push(`sudo ${me} host install-runtime ${binary} --version ${VERSION} --sums SHA256SUMS`);
-  steps.push(`sudo ${me} host use-cli ${VERSION}${ctx.sys.lstat(link)?.type === "file" ? " --replace" : ""}`);
+  else if (!trustedRuntimes(ctx).includes(VERSION)) steps.push(`sudo ${me} host install-runtime ${binary} --version ${VERSION} --sums SHA256SUMS${rootFlag(root)}`);
+  steps.push(`sudo ${me} host use-cli ${VERSION}${ctx.sys.lstat(link)?.type === "file" ? " --replace" : ""}${rootFlag(root)}`);
   return [timer, `Next: ${steps.join(", then ")}`];
+}
+
+/** ` --root <root>` unless it is the default: sudo drops $INCIBASE_HOST_ROOT, and the layout comes from the root. */
+const rootFlag = (root: string) => (root === DEFAULT_ROOT ? "" : ` --root ${root}`);
+
+/**
+ * A command a Next: line names, as the owner types it: through this host's
+ * CLI link (`incibase` for the machine's own), with --root when need be.
+ */
+function sudoCli(ctx: OpsContext, root: string, command: string): string {
+  const cli = ctx.layout.cliLink === DEFAULT_CLI_LINK ? "incibase" : ctx.layout.cliLink;
+  return `sudo ${cli} ${command}${rootFlag(root)}`;
 }
 
 /** `host set <key> <value>`, checked: which setting, and its value. */
@@ -521,7 +536,7 @@ const SPECS: Spec[] = [
           front
             ? `  front door: ${front.certificate ? `certificate ${clean((front.certificate as { sha256?: string }).sha256 ?? "installed")}, ` : ""}nginx ${front.nginx.skipped ? `skipped (${clean(front.nginx.skipped)})` : (front.nginx.action ?? "unchanged")}`
             : "  front door: not configured yet (pass --tls-cert and --tls-key)",
-          ...initNext(ctx),
+          ...initNext(ctx, root),
         ],
       };
     },
@@ -754,7 +769,7 @@ const SPECS: Spec[] = [
       name: { type: "string", value: "<text>", help: "A display name (default the slug)" },
     },
     check: (_values, args) => void checkProjectSlug(args[0]),
-    async run({ ctx, values, args }) {
+    async run({ ctx, values, args, root }) {
       const list = str(values, "branches");
       const branches = list === undefined ? undefined : list.split(",").map((b) => b.trim()).filter(Boolean);
       const r = await ops.createProject(ctx, { slug: checkProjectSlug(args[0]), ...(str(values, "name") ? { name: str(values, "name") } : {}), ...(branches ? { branches } : {}) });
@@ -764,7 +779,7 @@ const SPECS: Spec[] = [
         text: [
           `Created project ${r.project.slug}${r.branches.length ? ":" : " (no branches)"}`,
           ...r.branches.map((b) => `  ${branchRef(b.project, b.name).padEnd(24)} ${b.kind.padEnd(7)} ${domain ? `https://${b.label}.${domain}` : b.label}`),
-          ...(r.branches.length ? [`Next: incibase bundle --out app.ib, copy it here, then sudo incibase release add ${branchRef(r.project.slug, r.branches[0]!.name)} app.ib`] : []),
+          ...(r.branches.length ? [`Next: incibase bundle --out app.ib, copy it here, then ${sudoCli(ctx, root, `release add ${branchRef(r.project.slug, r.branches[0]!.name)} app.ib`)}`] : []),
         ],
       };
     },
@@ -774,9 +789,9 @@ const SPECS: Spec[] = [
     args: "",
     summary: "The projects and their branches",
     positionals: [0, 0],
-    async run({ ctx }) {
+    async run({ ctx, root }) {
       const r = await ops.listProjects(ctx);
-      return { json: r, text: r.length ? table(["PROJECT", "NAME", "CREATED", "BRANCHES"], r.map((p) => [p.slug, p.name, formatTime(p.created_at), p.branches.join(", ") || "-"])) : ["No projects yet: sudo incibase project create <slug>"] };
+      return { json: r, text: r.length ? table(["PROJECT", "NAME", "CREATED", "BRANCHES"], r.map((p) => [p.slug, p.name, formatTime(p.created_at), p.branches.join(", ") || "-"])) : [`No projects yet: ${sudoCli(ctx, root, "project create <slug>")}`] };
     },
   },
   {
