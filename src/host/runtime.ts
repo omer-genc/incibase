@@ -21,8 +21,8 @@
 //
 // A runtime root belongs to one host (`.incibase-host` in it names the host
 // root): gc counts only its own registry's pins, so two hosts sharing one
-// would remove each other's runtimes. Installs and gc refuse a root another
-// host claimed.
+// would remove each other's runtimes. Installs, gc and `host init`
+// (ops.checkMachineOwner) refuse a root another host claimed.
 import { closeSync, fsyncSync, openSync, realpathSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
@@ -32,6 +32,7 @@ import { checkRuntimeVersion, RUNTIME_VERSION_REGEX } from "./layout.ts";
 import { randomBytes } from "./names.ts";
 import { audited, gcTrash, OpError, parse } from "./ops.ts";
 import { currentActor, type RuntimeRow } from "./registry.ts";
+import type { FileInfo, HostSystem } from "./system.ts";
 
 /** Where `v<version>/incibase-linux-<arch>` and `v<version>/SHA256SUMS` are published. */
 export const DEFAULT_RELEASES_URL = "https://github.com/omer-genc/incibase/releases/download";
@@ -268,23 +269,35 @@ export interface InstallResult {
 export const RUNTIME_OWNER_FILE = ".incibase-host";
 
 /**
+ * The marker of the runtime root `runtimeRoot` and the host root it names:
+ * `owner` is null when the marker is no regular file of at most 4 KiB, or is
+ * empty. Null when there is no marker.
+ */
+export function runtimeRootOwner(sys: HostSystem, runtimeRoot: string): { marker: string; type: FileInfo["type"]; owner: string | null } | null {
+  const marker = join(runtimeRoot, RUNTIME_OWNER_FILE);
+  const info = sys.lstat(marker);
+  if (!info) return null;
+  const owner = info.type === "file" && info.size <= 4096 ? (sys.readFile(marker) ?? "").trim() : "";
+  return { marker, type: info.type, owner: owner || null };
+}
+
+/**
  * Checks that the runtime root is this host's, and with `claim` marks it so
  * when it is no one's yet. Two hosts never share one: each one's gc counts
  * only its own branches' pins, so it would remove what the other's run.
  */
 function checkRuntimeOwner(ctx: OpsContext, claim: boolean): void {
   const { sys, layout } = ctx;
-  const marker = join(layout.runtimeRoot, RUNTIME_OWNER_FILE);
-  const info = sys.lstat(marker);
-  if (!info) {
-    if (claim) sys.writeFile(marker, `${layout.root}\n`, { uid: 0, gid: 0, mode: 0o644 });
+  const found = runtimeRootOwner(sys, layout.runtimeRoot);
+  if (!found) {
+    if (claim) sys.writeFile(join(layout.runtimeRoot, RUNTIME_OWNER_FILE), `${layout.root}\n`, { uid: 0, gid: 0, mode: 0o644 });
     return;
   }
-  const owner = info.type === "file" && info.size <= 4096 ? (sys.readFile(marker) ?? "").trim() : null;
+  const { marker, owner, type } = found;
   if (owner === layout.root) return;
   throw new OpError(
     "CONFLICT",
-    `${layout.runtimeRoot} holds the runtimes of the host at ${JSON.stringify(owner ?? `(a ${info.type})`)}, not ${layout.root} (${marker}): ` +
+    `${layout.runtimeRoot} holds the runtimes of the host at ${JSON.stringify(owner ?? `(a ${type})`)}, not ${layout.root} (${marker}): ` +
       `hosts never share a runtime root, since one's gc would remove what the other's branches run. Give this host its own runtime root, or remove ${marker} if that host is gone`,
   );
 }

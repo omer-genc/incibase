@@ -28,6 +28,7 @@ import { OpError } from "./ops.ts";
 import type { AlertRow, BranchRow, ReleaseRow } from "./registry.ts";
 import { MAX_BUNDLE_BYTES, type GateResult } from "./release.ts";
 import { cliLinkRuntime, trustedRuntimes } from "./render.ts";
+import { LinuxSystem } from "./system.ts";
 
 /** A command line that cannot mean anything: exit 2 with the command's usage. */
 export class UsageError extends Error {
@@ -81,7 +82,10 @@ export const processIO: CommandIO = {
   isRoot: () => process.getuid?.() === 0,
   open({ create, ...options }) {
     // Registry.open creates a registry where there is none: a mistyped --root would become an empty host.
-    if (!create && !existsSync(new HostLayout({ root: options.root }).registry)) throw notSetUp(options.root);
+    const fresh = !existsSync(new HostLayout({ root: options.root }).registry);
+    if (!create && fresh) throw notSetUp(options.root);
+    // A host init that another host's layout refuses (ops.checkMachineOwner) leaves no registry behind either.
+    if (fresh) ops.checkMachineOwner({ layout: new HostLayout({ root: options.root, ...options.layout }), sys: new LinuxSystem() });
     const ctx = openHost(options);
     if (!create && ctx.registry.savedLayout() === null) {
       ctx.registry.close();
@@ -461,7 +465,7 @@ const SPECS: Spec[] = [
       "tunnel-port-base": { type: "string", value: "<n>", help: "The first laptop port for incibase tunnel (default 7101)" },
       "slice-memory": { type: "string", value: "<size>", help: "MemoryMax of all branches together (default: the machine's memory less 1G)" },
       "no-check-timer": { type: "boolean", help: "Do not run host check every 30 s" },
-      layout: { type: "string", value: "<json>", help: "Unit prefix, groups and directories of a second host on one machine (tests)" },
+      layout: { type: "string", value: "<json>", help: "The unit prefix, groups, runtime root and CLI link a second host on one machine needs of its own (tests)" },
     },
     layout(values) {
       const text = str(values, "layout");

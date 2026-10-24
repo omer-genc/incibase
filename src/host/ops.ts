@@ -11,13 +11,14 @@
 // Long work (a release, a rollback, a runtime upgrade) runs in a transient
 // unit; the op follows its journal and returns its result from the registry.
 import { totalmem } from "node:os";
+import { basename, dirname, resolve } from "node:path";
 import { z } from "zod";
 import { VERSION } from "../engine/version.ts";
 import { newServiceKey } from "../engine/service-keys.ts";
 import { limitsSchema, configSchema, MiB, parseConfig, parseLimits, resolveLimits, type BranchConfig, type BranchLimits } from "./config.ts";
 import { defaults, type OpsContext } from "./context.ts";
 import { settled, type UnitStatus } from "./driver.ts";
-import { checkRuntimeVersion } from "./layout.ts";
+import { checkRuntimeVersion, RUNTIME_VERSION_REGEX } from "./layout.ts";
 import {
   BRANCH_KINDS,
   branchRef,
@@ -31,16 +32,16 @@ import {
 } from "./names.ts";
 import * as nginx from "./nginx.ts";
 import * as provision from "./provision.ts";
-import { currentActor, RegistryLockedError, type BranchRow, type ReleaseRow, type ServiceKeyRow } from "./registry.ts";
+import { currentActor, RegistryLockedError, type BranchRow, type Registry, type ReleaseRow, type ServiceKeyRow } from "./registry.ts";
 import { cleanupPreflight, followJob, gateBranch, newGeneration, recoverSwitchedBranch, stageRelease, startJob, type GateResult } from "./release.ts";
-import { branchUrl, removeIfPresent } from "./render.ts";
+import { branchUrl, recordedRoot, removeIfPresent } from "./render.ts";
 import { setSetting } from "./alerts.ts";
 import { check, ensureCheckTimer } from "./check.ts";
 import { doctor } from "./doctor.ts";
 
 export { check, doctor, setSetting };
 // runtime.ts uses this module's helpers inside its functions only, so the import cycle is safe either way round.
-import { gc, gcRuntimes, installRuntime, listRuntimes, requireInstalled, useCli } from "./runtime.ts";
+import { gc, gcRuntimes, installRuntime, listRuntimes, requireInstalled, runtimeRootOwner, useCli } from "./runtime.ts";
 
 export { gc, gcRuntimes, installRuntime, listRuntimes, useCli };
 
@@ -183,10 +184,16 @@ async function frontDoor<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-/** The registry settings, host tree and units of `host init` (the parts this layer owns), and the front door with TLS; safe to run again. */
+/**
+ * The registry settings, host tree and units of `host init` (the parts this
+ * layer owns), and the front door with TLS; safe to run again. Refused
+ * before anything is written (a refusal's audit row included) when another
+ * host has this layout's machine-wide files (checkMachineOwner).
+ */
 export async function initHost(ctx: OpsContext, input: z.input<typeof initSchema>) {
   const { tlsCert, tlsKey, trustProxy, httpsPort, ...settings } = parse(initSchema, input);
   if ((tlsCert === undefined) !== (tlsKey === undefined)) throw new OpError("INVALID", "tlsCert and tlsKey go together");
+  checkMachineOwner(ctx);
   return audited(ctx, "host.init", null, async () => {
     const { checkTimer, ...init } = settings;
     const sliceMemoryMax = init.sliceMemoryMax ?? Math.max(512 * MiB, Math.floor((totalmem() - 1024 * MiB) / MiB) * MiB);
@@ -197,6 +204,93 @@ export async function initHost(ctx: OpsContext, input: z.input<typeof initSchema
     const front = await frontDoor(() => nginx.initFrontDoor(ctx, { tlsCert, tlsKey, trustProxy, httpsPort }));
     return { domain: ctx.registry.getSetting("domain"), layout: ctx.layout.saved(), ...(front ? { frontDoor: front } : {}) };
   });
+}
+
+// ---- one machine, one host ------------------------------------------------------------
+
+/** A file larger than this is none incibase rendered: its owner record is not read. */
+const MAX_RENDERED_BYTES = 1 * MiB;
+
+/** What the owner check reads: the layout, the machine, nginx's paths and, once there is one, the host's registry. */
+type MachineContext = Pick<OpsContext, "layout" | "sys" | "nginx"> & { registry?: Registry };
+
+/** A machine-wide path of this layout that is another host's: `owner` when it says whose, `note` when there is more to say. */
+export interface ForeignPath {
+  path: string;
+  owner: string | null;
+  note?: string;
+}
+
+/**
+ * The machine-wide paths of this host's layout that another host has. The
+ * host root (--root) moves only a host's data: its units, nginx config and
+ * drop-in, runtime root and CLI link are where the layout puts them, so a
+ * second host with the same layout would overwrite the first one's. Listed:
+ *
+ *   - a unit of the prefix (templates, slice, check timer's two) or the
+ *     nginx config or drop-in whose owner record (render.ownerRecord) names
+ *     another root. One without a readable record (rendered before records,
+ *     a link, more than a rendered file) is listed only while this root is
+ *     not set up with this layout: on a host that is, it is its own file,
+ *     which init renders again;
+ *   - the runtime root's marker (runtime.runtimeRootOwner) unless it names
+ *     this root, as install-runtime and gc refuse it;
+ *   - the CLI link when it points into another runtime root, unless that
+ *     runtime root's marker names this root.
+ */
+export function foreignPaths(ctx: MachineContext): ForeignPath[] {
+  const { layout, sys } = ctx;
+  const saved = ctx.registry?.savedLayout() ?? null;
+  const setUp = saved !== null && JSON.stringify(saved) === JSON.stringify(layout.saved());
+  const front = nginx.nginxFiles(layout, ctx.nginx);
+  const { units } = layout;
+  const rendered = [units.branchTemplate, units.preflightTemplate, units.snapshotTemplate, units.slice, units.checkService, units.checkTimer].map((name) => layout.unitFile(name));
+  const found: ForeignPath[] = [];
+  for (const path of [...rendered, front.conf, front.dropIn]) {
+    const info = sys.lstat(path);
+    if (!info) continue;
+    const readable = info.type === "file" && info.size <= MAX_RENDERED_BYTES;
+    const owner = readable ? recordedRoot(sys.readFile(path) ?? "") : null;
+    if (owner === layout.root || (owner === null && setUp)) continue;
+    if (owner !== null) found.push({ path, owner });
+    else found.push({ path, owner, note: info.type !== "file" ? `a ${info.type}` : readable ? "names no host root" : `${info.size} bytes, more than a rendered file` });
+  }
+  const runtime = runtimeRootOwner(sys, layout.runtimeRoot);
+  if (runtime && runtime.owner !== layout.root) {
+    found.push({ path: runtime.marker, owner: runtime.owner, ...(runtime.owner === null ? { note: `a ${runtime.type} that names no host root` } : {}) });
+  }
+  if (sys.lstat(layout.cliLink)?.type === "symlink") {
+    const target = resolve(dirname(layout.cliLink), sys.readlink(layout.cliLink) ?? "");
+    const runtimeRoot = dirname(dirname(target));
+    if (basename(target) === "incibase" && RUNTIME_VERSION_REGEX.test(basename(dirname(target))) && runtimeRoot !== layout.runtimeRoot) {
+      const owner = runtimeRootOwner(sys, runtimeRoot)?.owner ?? null;
+      if (owner !== layout.root) found.push({ path: layout.cliLink, owner, note: `a link into the runtime root ${runtimeRoot}` });
+    }
+  }
+  return found;
+}
+
+/**
+ * One machine, one host: CONFLICT when another host has a machine-wide path
+ * of this layout (foreignPaths). `host init` runs it before it writes
+ * anything; a second host on one machine needs a layout of its own.
+ */
+export function checkMachineOwner(ctx: MachineContext): void {
+  const found = foreignPaths(ctx);
+  if (!found.length) return;
+  const owner = found.find((f) => f.owner !== null)?.owner ?? null;
+  const list = found.map((f) => {
+    const why = [f.owner !== null && f.owner !== owner ? `the host at ${f.owner}` : null, f.note ?? null].filter(Boolean).join(", ");
+    return why ? `${f.path} (${why})` : f.path;
+  });
+  // The list last: a long one is what gets cut short.
+  throw new OpError(
+    "CONFLICT",
+    `This machine already has ${owner === null ? "another incibase host" : `the incibase host at ${owner}`}: one machine runs one host, and --root moves ` +
+      `only a host's data, so ${ctx.layout.root} would take over that host's files. A second host needs a layout of its own ` +
+      `(host init --layout '{"unitPrefix":"…","groups":{"proxy":"…","admin":"…"},"runtimeRoot":"…","cliLink":"…"}'). ` +
+      `If that host is gone, remove these first: ${list.join(", ")}`,
+  );
 }
 
 const tlsSchema = z.strictObject({ cert: z.string().min(1).max(4096), key: z.string().min(1).max(4096) });

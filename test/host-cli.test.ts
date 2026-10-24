@@ -10,7 +10,10 @@ import { manifestLine, sha256Hex, type BundleManifest } from "../src/engine/mani
 import { VERSION } from "../src/engine/version.ts";
 import { hostedAdminKey } from "../src/cli.ts";
 import { formatBytes, parseEnvImport, processIO, runCommand, table, type CommandIO } from "../src/host/commands.ts";
+import type { OpsContext } from "../src/host/context.ts";
 import type { DoctorContext } from "../src/host/doctor.ts";
+import { HostLayout } from "../src/host/layout.ts";
+import { Registry } from "../src/host/registry.ts";
 import { indexEntry } from "../src/host/tunnel.ts";
 import * as ops from "../src/host/ops.ts";
 import { SystemdDriver } from "../src/host/systemd.ts";
@@ -37,6 +40,8 @@ interface Session {
   execStderr: string;
   /** Whether each open was allowed to create a host. */
   creates: boolean[];
+  /** What open gives for these roots; `host` for any other. */
+  contexts: Record<string, OpsContext>;
   /** Output of the last run only. */
   last(): { out: string; err: string };
 }
@@ -56,6 +61,7 @@ async function session(): Promise<Session> {
     execOutput: [],
     execStderr: "",
     creates: [],
+    contexts: {},
     async run(...argv) {
       mark = { out: s.out.length, err: s.err.length };
       return runCommand(argv, io);
@@ -73,7 +79,7 @@ async function session(): Promise<Session> {
     open({ root, create }) {
       s.opened.push(root);
       s.creates.push(create === true);
-      return { ctx: host, close() {} };
+      return { ctx: s.contexts[root] ?? host, close() {} };
     },
     async exec(argv, line) {
       s.execs.push(argv);
@@ -241,6 +247,25 @@ describe("host", () => {
     expect(await s.run("host", "init", "--domain", "Bad_Domain")).toBe(2);
     expect(await s.run("host", "init", "--domain", "incibase.example.net", "--trust-proxy", "akamai")).toBe(2);
     expect(await s.run("host", "init", "--domain", "incibase.example.net", "--layout", "{nope")).toBe(2);
+  });
+
+  test("init of a second root with this host's layout is refused, exit 1: one machine, one host", async () => {
+    const s = await session();
+    const { layout: first } = s.host;
+    const layout = new HostLayout({ root: join(s.host.dir, "second"), runtimeRoot: first.runtimeRoot, systemdDir: first.systemdDir, cliLink: first.cliLink });
+    const registry = Registry.open(layout);
+    s.contexts[layout.root] = { ...s.host, layout, registry };
+    try {
+      expect(await s.run("host", "init", "--domain", "incibase.example.net", "--root", layout.root)).toBe(1);
+      expect(s.last().err).toStartWith(`incibase host init: This machine already has the incibase host at ${first.root}: one machine runs one host`);
+      expect(await s.run("host", "init", "--domain", "incibase.example.net", "--root", layout.root, "--json")).toBe(1);
+      expect(JSON.parse(s.last().err)).toMatchObject({ error: { code: "CONFLICT" } });
+      expect(registry.getSetting("layout")).toBeNull();
+      // The host itself inits again.
+      expect(await s.run("host", "init", "--domain", "incibase.example.net")).toBe(0);
+    } finally {
+      registry.close();
+    }
   });
 
   test("init names the next step while the CLI link, which the check timer runs, leads to no installed runtime", async () => {
