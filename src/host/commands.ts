@@ -75,7 +75,7 @@ export const processIO: CommandIO = {
     let total = 0;
     for await (const chunk of Bun.stdin.stream()) {
       total += chunk.byteLength;
-      if (total > maxBytes) throw new OpError("INVALID", `stdin is larger than ${Math.floor(maxBytes / MiB)} MiB`);
+      if (total > maxBytes) throw new OpError("INVALID", `stdin is larger than ${maxBytes >= MiB ? `${Math.floor(maxBytes / MiB)} MiB` : `${maxBytes} bytes`}`);
       chunks.push(chunk);
     }
     return Buffer.concat(chunks);
@@ -422,6 +422,28 @@ function hostSetting(args: string[], values: Values): { key: "alert_webhook"; va
   throw new UsageError(`Unknown setting ${JSON.stringify(key)}: use alert_webhook, trust_proxy or https_port`);
 }
 
+/** The most `host set alert_webhook -` reads: a URL (at most 2048 characters) and a line break. */
+const MAX_WEBHOOK_STDIN = 4096;
+
+/**
+ * `host set alert_webhook -`: the URL from stdin, so the topic (its secret)
+ * stays out of the sudo log, the journal and ps. One line, trimmed; the
+ * value itself is checked like one from the command line.
+ */
+async function webhookFromStdin(io: CommandIO): Promise<string> {
+  const bytes = await io.readStdin(MAX_WEBHOOK_STDIN);
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new OpError("INVALID", "stdin is not UTF-8 text");
+  }
+  const lines = text.split(/\r?\n/).filter((line) => line.trim());
+  if (!lines.length) throw new OpError("INVALID", "stdin is empty: pipe the URL in, e.g. < ntfy-url.txt ('' removes the setting)");
+  if (lines.length > 1) throw new OpError("INVALID", "stdin has more than one line: give just the URL");
+  return lines[0]!.trim();
+}
+
 /** `branch set`'s flags: the limits, settings and protection to change. */
 function branchChanges(values: Values): { limits: Partial<BranchLimits>; config: BranchConfig; protect: boolean | undefined } {
   const limits: Partial<BranchLimits> = {};
@@ -669,15 +691,20 @@ const SPECS: Spec[] = [
   {
     path: ["host", "set"],
     args: "<key> <value>",
-    summary: "Change a host setting: alert_webhook <https url|''>, trust_proxy <none|cloudflare>, https_port <n>",
+    summary: "Change a host setting: alert_webhook <-|https url|''>, trust_proxy <none|cloudflare>, https_port <n>",
     positionals: [2, 2],
     flags: { test: { type: "boolean", help: "alert_webhook: send a test notification" } },
-    details: "alert_webhook is where alerts go, e.g. an ntfy.sh topic; '' removes it.",
+    details:
+      "alert_webhook is where alerts go, e.g. an ntfy.sh topic; '' removes it. The topic is a secret: with -\n" +
+      "the URL is read from stdin (one line), not the command line, which the sudo log, the journal and ps show:\n" +
+      "  sudo incibase host set alert_webhook - --test < ntfy-url.txt\n" +
+      "or run it without < and type the URL, then Enter and Ctrl-D.",
     check: (values, args) => void hostSetting(args, values),
-    async run({ ctx, values, args }) {
+    async run({ ctx, values, args, io }) {
       const setting = hostSetting(args, values);
       if (setting.key === "alert_webhook") {
-        const r = await ops.setSetting(ctx, { key: setting.key, value: setting.value, test: bool(values, "test") });
+        const value = setting.value === "-" ? await webhookFromStdin(io) : setting.value;
+        const r = await ops.setSetting(ctx, { key: setting.key, value, test: bool(values, "test") });
         return { json: r, text: [r.set ? `alert_webhook set (${clean(r.host)})${r.tested ? "; the test notification was sent" : ""}` : "alert_webhook removed"] };
       }
       if (setting.key === "trust_proxy") {

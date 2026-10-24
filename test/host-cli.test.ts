@@ -349,6 +349,41 @@ describe("host", () => {
     expect(s.last().out).toBe("alert_webhook removed");
   });
 
+  test("host set alert_webhook - reads the URL from stdin: one line, trimmed, checked like an argument", async () => {
+    const s = await session();
+    const stdin = (text: string) => void (s.stdin = new TextEncoder().encode(text));
+    stdin("  https://ntfy.sh/incibase-Xk3q9  \r\n\n");
+    expect(await s.run("host", "set", "alert_webhook", "-")).toBe(0);
+    expect(s.last().out).toBe("alert_webhook set (ntfy.sh)");
+    expect(s.host.registry.getSetting("alert_webhook")).toBe("https://ntfy.sh/incibase-Xk3q9");
+    // Every refusal leaves the saved URL as it was, and none repeats what stdin held.
+    for (const [text, said] of [
+      ["", "stdin is empty"],
+      [" \n\n", "stdin is empty"],
+      ["https://ntfy.sh/a\nhttps://ntfy.sh/b\n", "more than one line"],
+      ["http://ntfy.sh/incibase-plain\n", "must be an https URL"],
+      ["https://ntfy.sh/incibase a\n", "without spaces"],
+    ] as const) {
+      stdin(text);
+      expect(await s.run("host", "set", "alert_webhook", "-")).toBe(2);
+      expect(s.last().err).toContain(said);
+      expect(s.last().err).not.toContain("incibase-plain");
+      expect(s.host.registry.getSetting("alert_webhook")).toBe("https://ntfy.sh/incibase-Xk3q9");
+    }
+    s.stdin = new Uint8Array([0x68, 0xff, 0x0a]);
+    expect(await s.run("host", "set", "alert_webhook", "-")).toBe(2);
+    expect(s.last().err).toContain("not UTF-8");
+    // The size cap is the command's, before anything is decoded.
+    stdin(`https://ntfy.sh/${"x".repeat(5000)}\n`);
+    expect(await s.run("host", "set", "alert_webhook", "-")).toBe(2);
+    expect(s.last().err).toContain("stdin is too large");
+    // '' still removes it; - is never taken as the value.
+    expect(await s.run("host", "set", "alert_webhook", "")).toBe(0);
+    expect(s.host.registry.getSetting("alert_webhook")).toBeNull();
+    expect(await s.run("host", "set", "alert_webhook", "--help")).toBe(0);
+    expect(s.last().out).toContain("the URL is read from stdin");
+  });
+
   test("install-runtime and use-cli", async () => {
     const s = await session();
     const binary = join(s.host.dir, "incibase-bin");

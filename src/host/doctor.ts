@@ -429,7 +429,7 @@ export async function runDoctor(ctx: DoctorContext): Promise<{ ok: boolean; chec
   } catch {
     // Reported below as not set.
   }
-  if (!webhookHost) add("alerts", "WARN", "no alert_webhook: alerts only show in incibase host status (incibase host set alert_webhook https://ntfy.sh/<topic>)");
+  if (!webhookHost) add("alerts", "WARN", "no alert_webhook: alerts only show in incibase host status (sudo incibase host set alert_webhook - --test, with https://ntfy.sh/<topic> on stdin)");
   else {
     const delivery = checkState.delivery;
     const lastError = delivery && !delivery.ok && !delivery.unconfigured ? printable(delivery.error ?? "failed", 300) : null;
